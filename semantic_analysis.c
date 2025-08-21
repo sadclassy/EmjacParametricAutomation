@@ -16,8 +16,8 @@ static const char* command_names[] = {
 	[COMMAND_USER_INPUT_PARAM] = "USER_INPUT_PARAM",
 	[COMMAND_CHECKBOX_PARAM] = "CHECKBOX_PARAM",
 	[COMMAND_USER_SELECT] = "USER_SELECT",
+	[COMMAND_USER_SELECT_MULTIPLE] = "USER_SELECT_MULTIPLE",
 	[COMMAND_RADIOBUTTON_PARAM] = "RADIOBUTTON_PARAM",
-	[COMMAND_BEGIN_TABLE] = "BEGIN_TABLE",
 	[COMMAND_IF] = "IF",
 	[COMMAND_FOR] = "FOR",
 	[COMMAND_WHILE] = "WHILE",
@@ -219,6 +219,15 @@ int evaluate_to_int(ExpressionNode* expr, SymbolTable* st, long* result) {
 	case EXPR_ARRAY_INDEX: {
 		// Existing code...
 	}
+	case EXPR_UNARY_OP: {
+		if (expr->data.unary.op == UNOP_NEG) {
+			long v;
+			if (evaluate_to_int(expr->data.unary.operand, st, &v) != 0) return -1;
+			*result = -v;
+			return 0;
+		}
+		return -1; /* unsupported unary op for int */
+	}
 	case EXPR_BINARY_OP: {  // New: Handle arithmetic ops recursively
 		long left_val, right_val;
 		int status = evaluate_to_int(expr->data.binary.left, st, &left_val);
@@ -263,7 +272,16 @@ int evaluate_to_double(ExpressionNode* expr, SymbolTable* st, double* result) {
 		}
 		return -1;
 	}
-						  // ... (add EXPR_ARRAY_INDEX if needed)
+	case EXPR_UNARY_OP: {
+		if (expr->data.unary.op == UNOP_NEG) {
+			double v;
+			if (evaluate_to_double(expr->data.unary.operand, st, &v) != 0) return -1;
+			*result = -v;
+			return 0;
+		}
+		return -1; /* unsupported unary op for double */
+	}
+		 // ... (add EXPR_ARRAY_INDEX if needed)
 	case EXPR_BINARY_OP: {  // New: Handle recursively
 		double left_val, right_val;
 		int status = evaluate_to_double(expr->data.binary.left, st, &left_val);
@@ -753,64 +771,86 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 
 		/* comparisons -> boolean */
 		(*result)->type = TYPE_BOOL;
-		switch (expr->data.binary.op) {
-		case BINOP_EQ:
-			if (left_val->type == TYPE_DOUBLE)
-				(*result)->data.int_value = (left_val->data.double_value == right_val->data.double_value);
-			else if (left_val->type == TYPE_INTEGER)
-				(*result)->data.int_value = (left_val->data.int_value == right_val->data.int_value);
-			else if (left_val->type == TYPE_STRING)
-				(*result)->data.int_value = (strcmp(left_val->data.string_value, right_val->data.string_value) == 0);
-			else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
-			break;
+		{
+			const double eps = 1e-9; /* tolerance for doubles */
+			switch (expr->data.binary.op) {
+			case BINOP_EQ:
+				if (left_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value =
+						(fabs(left_val->data.double_value - right_val->data.double_value) <= eps);
+				}
+				else if (left_val->type == TYPE_INTEGER) {
+					(*result)->data.int_value = (left_val->data.int_value == right_val->data.int_value);
+				}
+				else if (left_val->type == TYPE_STRING) {
+					(*result)->data.int_value = (strcmp(left_val->data.string_value,
+						right_val->data.string_value) == 0);
+				}
+				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				break;
 
-		case BINOP_NE:
-			if (left_val->type == TYPE_DOUBLE)
-				(*result)->data.int_value = (left_val->data.double_value != right_val->data.double_value);
-			else if (left_val->type == TYPE_INTEGER)
-				(*result)->data.int_value = (left_val->data.int_value != right_val->data.int_value);
-			else if (left_val->type == TYPE_STRING)
-				(*result)->data.int_value = (strcmp(left_val->data.string_value, right_val->data.string_value) != 0);
-			else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
-			break;
+			case BINOP_NE:
+				if (left_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value =
+						(fabs(left_val->data.double_value - right_val->data.double_value) > eps);
+				}
+				else if (left_val->type == TYPE_INTEGER) {
+					(*result)->data.int_value = (left_val->data.int_value != right_val->data.int_value);
+				}
+				else if (left_val->type == TYPE_STRING) {
+					(*result)->data.int_value = (strcmp(left_val->data.string_value,
+						right_val->data.string_value) != 0);
+				}
+				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				break;
 
-		case BINOP_LT:
-			if (left_val->type == TYPE_DOUBLE)
-				(*result)->data.int_value = (left_val->data.double_value < right_val->data.double_value);
-			else if (left_val->type == TYPE_INTEGER)
-				(*result)->data.int_value = (left_val->data.int_value < right_val->data.int_value);
-			else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
-			break;
+			case BINOP_LT:
+				if (left_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value =
+						(left_val->data.double_value < right_val->data.double_value - eps);
+				}
+				else if (left_val->type == TYPE_INTEGER) {
+					(*result)->data.int_value = (left_val->data.int_value < right_val->data.int_value);
+				}
+				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				break;
 
-		case BINOP_GT:
-			if (left_val->type == TYPE_DOUBLE)
-				(*result)->data.int_value = (left_val->data.double_value > right_val->data.double_value);
-			else if (left_val->type == TYPE_INTEGER)
-				(*result)->data.int_value = (left_val->data.int_value > right_val->data.int_value);
-			else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
-			break;
+			case BINOP_GT:
+				if (left_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value =
+						(left_val->data.double_value > right_val->data.double_value + eps);
+				}
+				else if (left_val->type == TYPE_INTEGER) {
+					(*result)->data.int_value = (left_val->data.int_value > right_val->data.int_value);
+				}
+				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				break;
 
-		case BINOP_LE:
-			if (left_val->type == TYPE_DOUBLE)
-				(*result)->data.int_value = (left_val->data.double_value <= right_val->data.double_value);
-			else if (left_val->type == TYPE_INTEGER)
-				(*result)->data.int_value = (left_val->data.int_value <= right_val->data.int_value);
-			else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
-			break;
+			case BINOP_LE:
+				if (left_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value =
+						(left_val->data.double_value <= right_val->data.double_value + eps);
+				}
+				else if (left_val->type == TYPE_INTEGER) {
+					(*result)->data.int_value = (left_val->data.int_value <= right_val->data.int_value);
+				}
+				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				break;
 
-		case BINOP_GE:
-			if (left_val->type == TYPE_DOUBLE)
-				(*result)->data.int_value = (left_val->data.double_value >= right_val->data.double_value);
-			else if (left_val->type == TYPE_INTEGER)
-				(*result)->data.int_value = (left_val->data.int_value >= right_val->data.int_value);
-			else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
-			break;
+			case BINOP_GE:
+				if (left_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value =
+						(left_val->data.double_value >= right_val->data.double_value - eps);
+				}
+				else if (left_val->type == TYPE_INTEGER) {
+					(*result)->data.int_value = (left_val->data.int_value >= right_val->data.int_value);
+				}
+				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				break;
 
-		default:
-			free_variable(left_val);
-			free_variable(right_val);
-			free(*result);
-			return -1;
+			default:
+				free_variable(left_val); free_variable(right_val); free(*result); return -1;
+			}
 		}
 
 		free_variable(left_val);
@@ -2551,6 +2591,698 @@ cleanup:
 
 }
 
+int check_user_select_optional_semantics(UserSelectOptionalNode* node, SymbolTable* st)
+{
+	if (!node || !st) return -1;
+
+	// Validate reference identifier
+	if (!is_valid_identifier(node->reference))
+	{
+		ProPrintfChar("Error: Invalid reference identifier '%s' in USER_SELECT\n", node->reference);
+		return 1;
+	}
+
+	// Check for duplicate
+	if (get_symbol(st, node->reference))
+	{
+		ProPrintfChar("Error: Reference '%s' already declared\n", node->reference);
+		return -1;
+	}
+
+	// Validate type count 
+	if (node->type_count == 0)
+	{
+		ProPrintfChar("Error: No Types specified in USER_SELECT for '%s'\n", node->reference);
+		return 1;
+	}
+
+	// Create top-level map variable to hold all USER_SELECT options/details
+	Variable* user_var = malloc(sizeof(Variable));
+	if (!user_var) return -1;
+	user_var->type = TYPE_MAP;
+	HashTable* map = create_hash_table(32);
+	if (!map)
+	{
+		free(user_var);
+		return -1;
+	}
+	user_var->data.map = map;
+	user_var->declaration_count = 1;
+
+	int status = 0;
+
+	// Types (strings) + ALLOWED_TYPES (mapped ints)
+	Variable* types_array = malloc(sizeof(Variable));
+	if (!types_array) goto cleanup;
+	types_array->type = TYPE_ARRAY;
+	types_array->data.array.size = node->type_count;
+	types_array->data.array.elements = malloc(node->type_count * sizeof(Variable*));
+	if (!types_array->data.array.elements)
+	{
+		free_variable(types_array);
+		goto cleanup;
+	}
+
+	Variable* allowed_types_array = malloc(sizeof(Variable));
+	if (!allowed_types_array)
+	{
+		free_variable(types_array);
+		goto cleanup;
+	}
+	allowed_types_array->type = TYPE_ARRAY;
+	allowed_types_array->data.array.size = node->type_count;
+	allowed_types_array->data.array.elements = malloc(node->type_count * sizeof(Variable*));
+	if (!allowed_types_array->data.array.elements)
+	{
+		free_variable(types_array);
+		free_variable(allowed_types_array);
+		goto cleanup;
+	}
+	for (size_t k = 0; k < node->type_count; k++) {
+		// Each type expr must evaluate to STRING (e.g., "AXIS", "SURFACE")
+		VariableType expr_type = get_expression_type(node->types[k], st);
+		if (expr_type != TYPE_STRING) {
+			ProPrintfChar("Error: Type %zu must evaluate to STRING in USER_SELECT '%s'\n", k, node->reference);
+			free_variable(types_array);
+			free_variable(allowed_types_array);
+			goto cleanup;
+		}
+
+		char* type_str = NULL;
+		status = evaluate_to_string(node->types[k], st, &type_str);
+		if (status != 0 || !type_str) {
+			ProPrintfChar("Error: Failed to evaluate type %zu in USER_SELECT '%s'\n", k, node->reference);
+			free_variable(types_array);
+			free_variable(allowed_types_array);
+			goto cleanup;
+		}
+
+		// Store string in types_array
+		Variable* str_var = malloc(sizeof(Variable));
+		if (!str_var) { free(type_str); free_variable(types_array); free_variable(allowed_types_array); goto cleanup; }
+		str_var->type = TYPE_STRING;
+		str_var->data.string_value = type_str;
+		types_array->data.array.elements[k] = str_var;
+
+		CreoReferenceType creo_t = get_creo_ref_type(type_str);  // returns CREO_* or CREO_UNKNOWN
+		Variable* map_var = malloc(sizeof(Variable));
+		if (!map_var) { free_variable(types_array); free_variable(allowed_types_array); goto cleanup; }
+		map_var->type = TYPE_INTEGER;
+		map_var->data.int_value = (int)creo_t;
+		allowed_types_array->data.array.elements[k] = map_var;
+	}
+
+	// Put arrays into the map
+	hash_table_insert(map, "types", types_array);
+	hash_table_insert(map, "allowed_types", allowed_types_array);
+
+	if (node->display_order) {
+		long order_val;
+		status = evaluate_to_int(node->display_order, st, &order_val);
+		if (status != 0 || order_val < 0) {
+			ProPrintfChar("Error: display_order must be a non-negative integer for USER_SELECT '%s'\n", node->reference);
+			goto cleanup;
+		}
+		Variable* v = malloc(sizeof(Variable));
+		if (!v) goto cleanup;
+		v->type = TYPE_INTEGER;
+		v->data.int_value = (int)order_val;
+		hash_table_insert(map, "display_order", v);
+	}
+
+	if (node->allow_reselect) {
+		Variable* v = malloc(sizeof(Variable));
+		if (!v) goto cleanup;
+		v->type = TYPE_BOOL;
+		v->data.int_value = 1;
+		hash_table_insert(map, "allow_reselect", v);
+	}
+	if (node->select_by_box) {
+		Variable* v = malloc(sizeof(Variable));
+		if (!v) goto cleanup;
+		v->type = TYPE_BOOL;
+		v->data.int_value = 1;
+		hash_table_insert(map, "select_by_box", v);
+	}
+	if (node->select_by_menu) {
+		Variable* v = malloc(sizeof(Variable));
+		if (!v) goto cleanup;
+		v->type = TYPE_BOOL;
+		v->data.int_value = 1;
+		hash_table_insert(map, "select_by_menu", v);
+	}
+
+	if (node->tooltip_message) {
+		char* s = NULL;
+		status = evaluate_to_string(node->tooltip_message, st, &s);
+		if (status != 0 || !s || s[0] == '\0') { free(s); ProPrintfChar("Error: Empty TOOLTIP in USER_SELECT '%s'\n", node->reference); goto cleanup; }
+		Variable* v = malloc(sizeof(Variable)); if (!v) { free(s); goto cleanup; }
+		v->type = TYPE_STRING; v->data.string_value = s;
+		hash_table_insert(map, "tooltip", v);
+	}
+	if (node->image_name) {
+		char* s = NULL;
+		status = evaluate_to_string(node->image_name, st, &s);
+		if (status != 0 || !s || s[0] == '\0') { free(s); ProPrintfChar("Error: Empty IMAGE in USER_SELECT '%s'\n", node->reference); goto cleanup; }
+		Variable* v = malloc(sizeof(Variable)); if (!v) { free(s); goto cleanup; }
+		v->type = TYPE_STRING; v->data.string_value = s;
+		hash_table_insert(map, "image", v);
+	}
+
+	if (node->on_picture) {
+		Variable* onv = malloc(sizeof(Variable)); if (!onv) goto cleanup;
+		onv->type = TYPE_BOOL; onv->data.int_value = 1;
+		hash_table_insert(map, "on_picture", onv);
+
+		long x, y;
+		if (evaluate_to_int(node->posX, st, &x) != 0 || x < 0) { ProPrintfChar("Error: Invalid posX in USER_SELECT '%s'\n", node->reference); goto cleanup; }
+		if (evaluate_to_int(node->posY, st, &y) != 0 || y < 0) { ProPrintfChar("Error: Invalid posY in USER_SELECT '%s'\n", node->reference); goto cleanup; }
+
+		Variable* vx = malloc(sizeof(Variable)); if (!vx) goto cleanup;
+		vx->type = TYPE_INTEGER; vx->data.int_value = (int)x;
+		hash_table_insert(map, "posX", vx);
+
+		Variable* vy = malloc(sizeof(Variable)); if (!vy) goto cleanup;
+		vy->type = TYPE_INTEGER; vy->data.int_value = (int)y;
+		hash_table_insert(map, "posY", vy);
+	}
+	if (node->tag) {
+		char* tag = NULL;
+		status = evaluate_to_string(node->tag, st, &tag);
+		if (status != 0 || !tag || tag[0] == '\0') {
+			free(tag);
+			ProPrintfChar("Error: Failed to evaluate or empty tag for USER_SELECT '%s'\n", node->reference);
+			goto cleanup;
+		}
+		Variable* tv = malloc(sizeof(Variable));
+		if (!tv) { free(tag); goto cleanup; }
+		tv->type = TYPE_STRING;
+		tv->data.string_value = tag;
+		hash_table_insert(map, "tag", tv);
+	}
+
+	if (node->is_required == PRO_B_TRUE) {
+		// Keep same storage pattern as before, but key off is_required
+		Variable* req_list = get_symbol(st, "REQUIRED_SELECTS");
+		if (!req_list) {
+			req_list = malloc(sizeof(Variable));
+			if (!req_list) goto cleanup;
+			req_list->type = TYPE_ARRAY;
+			req_list->data.array.size = 0;
+			req_list->data.array.elements = NULL;
+			set_symbol(st, "REQUIRED_SELECTS", req_list);
+		}
+		else if (req_list->type != TYPE_ARRAY) {
+			ProPrintfChar("Error: REQUIRED_SELECTS in symbol table is not an array\n");
+			goto cleanup;
+		}
+
+		Variable* ref_var = malloc(sizeof(Variable));
+		if (!ref_var) goto cleanup;
+		ref_var->type = TYPE_STRING;
+		ref_var->data.string_value = _strdup(node->reference);
+		if (!ref_var->data.string_value) { free(ref_var); goto cleanup; }
+
+		size_t new_size = req_list->data.array.size + 1;
+		Variable** new_elems = realloc(req_list->data.array.elements, new_size * sizeof(Variable*));
+		if (!new_elems) { free_variable(ref_var); goto cleanup; }
+		new_elems[new_size - 1] = ref_var;
+		req_list->data.array.elements = new_elems;
+		req_list->data.array.size = new_size;
+
+		ProPrintfChar("Note: USER_SELECT '%s' marked as required\n", node->reference);
+	}
+
+	// Finally store the whole USER_SELECT map under the reference name
+	set_symbol(st, node->reference, user_var);
+	return 0;
+
+cleanup:
+	free_variable(user_var);  // Frees map and any children we already inserted
+	return -1;
+
+}
+
+int check_user_select_multiple_semantics(UserSelectMultipleNode* node, SymbolTable* st)
+{
+	if (!node) {
+		ProPrintfChar("Error: Invalid USER_SELECT_MULTIPLE node\n");
+		return -1;
+	}
+
+	/* ---- validate array identifier ---- */
+	if (!node->array || !*node->array) {
+		ProPrintfChar("Error: USER_SELECT_MULTIPLE requires a target array name\n");
+		return -1;
+	}
+	/* same identifier rules used elsewhere */
+	/* local helper exists in this file: is_valid_identifier */
+	if (!is_valid_identifier(node->array)) {  /* uses [a-zA-Z_][a-zA-Z0-9_]* */
+		ProPrintfChar("Error: Invalid array identifier '%s'\n", node->array);
+		return -1;
+	}
+	/* Disallow clobbering an existing symbol of a different shape */
+	if (get_symbol(st, node->array)) {
+		ProPrintfChar("Error: Symbol '%s' already exists\n", node->array);
+		return -1;
+	}
+
+	/* ---- validate type list ---- */
+	if (node->type_count == 0) {
+		ProPrintfChar("Error: USER_SELECT_MULTIPLE must specify at least one type\n");
+		return -1;
+	}
+
+	/* Build strings[] and allowed_types[] */
+	char** type_names = (char**)calloc(node->type_count, sizeof(char*));
+	if (!type_names) return -1;
+
+	Variable* allowed_arr = (Variable*)malloc(sizeof(Variable));
+	if (!allowed_arr) { free(type_names); return -1; }
+	allowed_arr->type = TYPE_ARRAY;
+	allowed_arr->data.array.size = 0;
+	allowed_arr->data.array.elements = (Variable**)calloc(node->type_count, sizeof(Variable*));
+	if (!allowed_arr->data.array.elements) { free(type_names); free(allowed_arr); return -1; }
+
+	for (size_t i = 0; i < node->type_count; ++i) {
+		VariableType t = get_expression_type(node->types[i], st);
+		if (t != TYPE_STRING) {
+			ProPrintfChar("Error: USER_SELECT_MULTIPLE type %zu must be string\n", i);
+			/* cleanup */
+			for (size_t k = 0; k < i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			return -1;
+		}
+		char* tname = NULL;
+		if (evaluate_to_string(node->types[i], st, &tname) != 0 || !tname || !*tname) {
+			ProPrintfChar("Error: Failed to evaluate type %zu\n", i);
+			for (size_t k = 0; k < i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			free(tname);
+			return -1;
+		}
+		type_names[i] = tname;
+
+		/* Map to Creo enum (AXIS, CURVE, EDGE, SURFACE, PLANE...) */
+		CreoReferenceType rt = get_creo_ref_type(tname);  /* maps strings to PRO_* codes */
+		if (rt == CREO_UNKNOWN) {
+			ProPrintfChar("Error: Unsupported reference type '%s'\n", tname);
+			for (size_t k = 0; k <= i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			return -1;
+		}
+		Variable* iv = (Variable*)malloc(sizeof(Variable));
+		if (!iv) {
+			for (size_t k = 0; k <= i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			return -1;
+		}
+		iv->type = TYPE_INTEGER;
+		iv->data.int_value = (int)rt;
+		allowed_arr->data.array.elements[allowed_arr->data.array.size++] = iv;
+	}
+
+	/* ---- validate max_sel ---- */
+	long max_sel_val = -1;
+	if (!node->max_sel) {
+		ProPrintfChar("Error: USER_SELECT_MULTIPLE requires max_sel\n");
+		for (size_t k = 0; k < node->type_count; ++k) free(type_names[k]);
+		free(type_names);
+		for (size_t k = 0; k < allowed_arr->data.array.size; ++k) free(allowed_arr->data.array.elements[k]);
+		free(allowed_arr->data.array.elements);
+		free(allowed_arr);
+		return -1;
+	}
+	if (evaluate_to_int(node->max_sel, st, &max_sel_val) != 0) {
+		ProPrintfChar("Error: max_sel must be an integer (negative => unlimited)\n");
+		for (size_t k = 0; k < node->type_count; ++k) free(type_names[k]);
+		free(type_names);
+		for (size_t k = 0; k < allowed_arr->data.array.size; ++k) free(allowed_arr->data.array.elements[k]);
+		free(allowed_arr->data.array.elements);
+		free(allowed_arr);
+		return -1;
+	}
+
+	/* ---- build config map under the array name ---- */
+	Variable* cfg = (Variable*)malloc(sizeof(Variable));
+	if (!cfg) {
+		for (size_t k = 0; k < node->type_count; ++k) free(type_names[k]);
+		free(type_names);
+		for (size_t k = 0; k < allowed_arr->data.array.size; ++k) free(allowed_arr->data.array.elements[k]);
+		free(allowed_arr->data.array.elements);
+		free(allowed_arr);
+		return -1;
+	}
+	cfg->type = TYPE_MAP;
+	cfg->data.map = create_hash_table(32);
+
+	/* types[] and allowed_types[] */
+	(void)add_string_array_to_map(cfg->data.map, "types", type_names, node->type_count);
+	/* type_names memory becomes owned by the map helpers; if your helper copies, free here instead */
+	hash_table_insert(cfg->data.map, "allowed_types", allowed_arr);
+
+	/* max_sel */
+	(void)add_int_to_map(cfg->data.map, "max_sel", (int)max_sel_val);
+
+	/* display_order (optional) */
+	if (node->display_order) {
+		long ord = 0;
+		if (evaluate_to_int(node->display_order, st, &ord) == 0) {
+			(void)add_int_to_map(cfg->data.map, "display_order", (int)ord);
+		}
+		else {
+			ProPrintfChar("Error: DISPLAY_ORDER must be numeric\n");
+		}
+	}
+
+	/* flags */
+	(void)add_bool_to_map(cfg->data.map, "allow_reselect", node->allow_reselect ? true : false);
+	(void)add_bool_to_map(cfg->data.map, "select_by_box", node->select_by_box ? true : false);
+	(void)add_bool_to_map(cfg->data.map, "select_by_menu", node->select_by_menu ? true : false);
+
+	/* include_multi_cad (TRUE/FALSE identifier or string) -> bool */
+	if (node->include_multi_cad) {
+		char* inc = NULL;
+		if (evaluate_to_string(node->include_multi_cad, st, &inc) == 0 && inc) {
+			int v = (_stricmp(inc, "TRUE") == 0) ? 1 : 0;
+			(void)add_bool_to_map(cfg->data.map, "include_multi_cad", v ? true : false);
+			free(inc);
+		}
+		else {
+			ProPrintfChar("Error: INCLUDE_MULTI_CAD must be TRUE or FALSE\n");
+		}
+	}
+
+	/* filters: keep as stringified expressions so runtime can resolve variables/arrays */
+	if (node->filter_mdl) { char* s = expression_to_string(node->filter_mdl);  if (s) (void)add_string_to_map(cfg->data.map, "filter_mdl", s); }
+	if (node->filter_feat) { char* s = expression_to_string(node->filter_feat); if (s) (void)add_string_to_map(cfg->data.map, "filter_feat", s); }
+	if (node->filter_geom) { char* s = expression_to_string(node->filter_geom); if (s) (void)add_string_to_map(cfg->data.map, "filter_geom", s); }
+	if (node->filter_ref) { char* s = expression_to_string(node->filter_ref);  if (s) (void)add_string_to_map(cfg->data.map, "filter_ref", s); }
+	if (node->filter_identifier) {
+		char* s = NULL;
+		if (evaluate_to_string(node->filter_identifier, st, &s) == 0 && s) {
+			(void)add_string_to_map(cfg->data.map, "filter_identifier", s);
+		}
+		else {
+			ProPrintfChar("Error: FILTER_IDENTIFIER must be a string\n");
+		}
+	}
+
+	/* tooltip/image */
+	if (node->tooltip_message) {
+		char* msg = NULL;
+		if (evaluate_to_string(node->tooltip_message, st, &msg) == 0 && msg) {
+			(void)add_string_to_map(cfg->data.map, "tooltip", msg);
+		}
+		else {
+			ProPrintfChar("Error: TOOLTIP message must be a string\n");
+		}
+	}
+	if (node->image_name) {
+		char* img = NULL;
+		if (evaluate_to_string(node->image_name, st, &img) == 0 && img) {
+			(void)add_string_to_map(cfg->data.map, "image_name", img);
+		}
+		else {
+			ProPrintfChar("Error: IMAGE name must be a string\n");
+		}
+	}
+
+	/* ON_PICTURE */
+	(void)add_bool_to_map(cfg->data.map, "on_picture", node->on_picture ? true : false);
+	if (node->on_picture) {
+		long x = 0, y = 0;
+		if (node->posX && evaluate_to_int(node->posX, st, &x) == 0) {
+			(void)add_int_to_map(cfg->data.map, "posX", (int)x);
+		}
+		else if (node->posX) {
+			ProPrintfChar("Error: ON_PICTURE posX must be integer\n");
+		}
+		if (node->posY && evaluate_to_int(node->posY, st, &y) == 0) {
+			(void)add_int_to_map(cfg->data.map, "posY", (int)y);
+		}
+		else if (node->posY) {
+			ProPrintfChar("Error: ON_PICTURE posY must be integer\n");
+		}
+	}
+
+	/* tag (optional) */
+	if (node->tag) {
+		char* tag = NULL;
+		if (evaluate_to_string(node->tag, st, &tag) == 0 && tag) {
+			(void)add_string_to_map(cfg->data.map, "tag", tag);
+		}
+		else {
+			ProPrintfChar("Error: 'tag' must be a string\n");
+		}
+	}
+
+	/* finally, publish the config under the array name */
+	set_symbol(st, node->array, cfg);
+
+	ProPrintfChar("Note: USER_SELECT_MULTIPLE '%s' registered with %zu types, max_sel=%ld\n",
+		node->array, node->type_count, max_sel_val);
+	return 0;
+}
+
+int check_user_select_multiple_optional_semantics(UserSelectMultipleOptionalNode* node, SymbolTable* st)
+{
+	if (!node) {
+		ProPrintfChar("Error: Invalid USER_SELECT_MULTIPLE node\n");
+		return -1;
+	}
+
+	/* ---- validate array identifier ---- */
+	if (!node->array || !*node->array) {
+		ProPrintfChar("Error: USER_SELECT_MULTIPLE requires a target array name\n");
+		return -1;
+	}
+	/* same identifier rules used elsewhere */
+	/* local helper exists in this file: is_valid_identifier */
+	if (!is_valid_identifier(node->array)) {  /* uses [a-zA-Z_][a-zA-Z0-9_]* */
+		ProPrintfChar("Error: Invalid array identifier '%s'\n", node->array);
+		return -1;
+	}
+	/* Disallow clobbering an existing symbol of a different shape */
+	if (get_symbol(st, node->array)) {
+		ProPrintfChar("Error: Symbol '%s' already exists\n", node->array);
+		return -1;
+	}
+
+	/* ---- validate type list ---- */
+	if (node->type_count == 0) {
+		ProPrintfChar("Error: USER_SELECT_MULTIPLE must specify at least one type\n");
+		return -1;
+	}
+
+	/* Build strings[] and allowed_types[] */
+	char** type_names = (char**)calloc(node->type_count, sizeof(char*));
+	if (!type_names) return -1;
+
+	Variable* allowed_arr = (Variable*)malloc(sizeof(Variable));
+	if (!allowed_arr) { free(type_names); return -1; }
+	allowed_arr->type = TYPE_ARRAY;
+	allowed_arr->data.array.size = 0;
+	allowed_arr->data.array.elements = (Variable**)calloc(node->type_count, sizeof(Variable*));
+	if (!allowed_arr->data.array.elements) { free(type_names); free(allowed_arr); return -1; }
+
+	for (size_t i = 0; i < node->type_count; ++i) {
+		VariableType t = get_expression_type(node->types[i], st);
+		if (t != TYPE_STRING) {
+			ProPrintfChar("Error: USER_SELECT_MULTIPLE type %zu must be string\n", i);
+			/* cleanup */
+			for (size_t k = 0; k < i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			return -1;
+		}
+		char* tname = NULL;
+		if (evaluate_to_string(node->types[i], st, &tname) != 0 || !tname || !*tname) {
+			ProPrintfChar("Error: Failed to evaluate type %zu\n", i);
+			for (size_t k = 0; k < i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			free(tname);
+			return -1;
+		}
+		type_names[i] = tname;
+
+		/* Map to Creo enum (AXIS, CURVE, EDGE, SURFACE, PLANE...) */
+		CreoReferenceType rt = get_creo_ref_type(tname);  /* maps strings to PRO_* codes */
+		if (rt == CREO_UNKNOWN) {
+			ProPrintfChar("Error: Unsupported reference type '%s'\n", tname);
+			for (size_t k = 0; k <= i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			return -1;
+		}
+		Variable* iv = (Variable*)malloc(sizeof(Variable));
+		if (!iv) {
+			for (size_t k = 0; k <= i; ++k) { free(type_names[k]); }
+			free(type_names);
+			free(allowed_arr->data.array.elements);
+			free(allowed_arr);
+			return -1;
+		}
+		iv->type = TYPE_INTEGER;
+		iv->data.int_value = (int)rt;
+		allowed_arr->data.array.elements[allowed_arr->data.array.size++] = iv;
+	}
+
+	/* ---- validate max_sel ---- */
+	long max_sel_val = -1;
+	if (!node->max_sel) {
+		ProPrintfChar("Error: USER_SELECT_MULTIPLE requires max_sel\n");
+		for (size_t k = 0; k < node->type_count; ++k) free(type_names[k]);
+		free(type_names);
+		for (size_t k = 0; k < allowed_arr->data.array.size; ++k) free(allowed_arr->data.array.elements[k]);
+		free(allowed_arr->data.array.elements);
+		free(allowed_arr);
+		return -1;
+	}
+	if (evaluate_to_int(node->max_sel, st, &max_sel_val) != 0) {
+		ProPrintfChar("Error: max_sel must be an integer (negative => unlimited)\n");
+		for (size_t k = 0; k < node->type_count; ++k) free(type_names[k]);
+		free(type_names);
+		for (size_t k = 0; k < allowed_arr->data.array.size; ++k) free(allowed_arr->data.array.elements[k]);
+		free(allowed_arr->data.array.elements);
+		free(allowed_arr);
+		return -1;
+	}
+
+	/* ---- build config map under the array name ---- */
+	Variable* cfg = (Variable*)malloc(sizeof(Variable));
+	if (!cfg) {
+		for (size_t k = 0; k < node->type_count; ++k) free(type_names[k]);
+		free(type_names);
+		for (size_t k = 0; k < allowed_arr->data.array.size; ++k) free(allowed_arr->data.array.elements[k]);
+		free(allowed_arr->data.array.elements);
+		free(allowed_arr);
+		return -1;
+	}
+	cfg->type = TYPE_MAP;
+	cfg->data.map = create_hash_table(32);
+
+	/* types[] and allowed_types[] */
+	(void)add_string_array_to_map(cfg->data.map, "types", type_names, node->type_count);
+	/* type_names memory becomes owned by the map helpers; if your helper copies, free here instead */
+	hash_table_insert(cfg->data.map, "allowed_types", allowed_arr);
+
+	/* max_sel */
+	(void)add_int_to_map(cfg->data.map, "max_sel", (int)max_sel_val);
+
+	/* display_order (optional) */
+	if (node->display_order) {
+		long ord = 0;
+		if (evaluate_to_int(node->display_order, st, &ord) == 0) {
+			(void)add_int_to_map(cfg->data.map, "display_order", (int)ord);
+		}
+		else {
+			ProPrintfChar("Error: DISPLAY_ORDER must be numeric\n");
+		}
+	}
+
+	/* flags */
+	(void)add_bool_to_map(cfg->data.map, "allow_reselect", node->allow_reselect ? true : false);
+	(void)add_bool_to_map(cfg->data.map, "select_by_box", node->select_by_box ? true : false);
+	(void)add_bool_to_map(cfg->data.map, "select_by_menu", node->select_by_menu ? true : false);
+
+	/* include_multi_cad (TRUE/FALSE identifier or string) -> bool */
+	if (node->include_multi_cad) {
+		char* inc = NULL;
+		if (evaluate_to_string(node->include_multi_cad, st, &inc) == 0 && inc) {
+			int v = (_stricmp(inc, "TRUE") == 0) ? 1 : 0;
+			(void)add_bool_to_map(cfg->data.map, "include_multi_cad", v ? true : false);
+			free(inc);
+		}
+		else {
+			ProPrintfChar("Error: INCLUDE_MULTI_CAD must be TRUE or FALSE\n");
+		}
+	}
+
+	/* filters: keep as stringified expressions so runtime can resolve variables/arrays */
+	if (node->filter_mdl) { char* s = expression_to_string(node->filter_mdl);  if (s) (void)add_string_to_map(cfg->data.map, "filter_mdl", s); }
+	if (node->filter_feat) { char* s = expression_to_string(node->filter_feat); if (s) (void)add_string_to_map(cfg->data.map, "filter_feat", s); }
+	if (node->filter_geom) { char* s = expression_to_string(node->filter_geom); if (s) (void)add_string_to_map(cfg->data.map, "filter_geom", s); }
+	if (node->filter_ref) { char* s = expression_to_string(node->filter_ref);  if (s) (void)add_string_to_map(cfg->data.map, "filter_ref", s); }
+	if (node->filter_identifier) {
+		char* s = NULL;
+		if (evaluate_to_string(node->filter_identifier, st, &s) == 0 && s) {
+			(void)add_string_to_map(cfg->data.map, "filter_identifier", s);
+		}
+		else {
+			ProPrintfChar("Error: FILTER_IDENTIFIER must be a string\n");
+		}
+	}
+
+	/* tooltip/image */
+	if (node->tooltip_message) {
+		char* msg = NULL;
+		if (evaluate_to_string(node->tooltip_message, st, &msg) == 0 && msg) {
+			(void)add_string_to_map(cfg->data.map, "tooltip", msg);
+		}
+		else {
+			ProPrintfChar("Error: TOOLTIP message must be a string\n");
+		}
+	}
+	if (node->image_name) {
+		char* img = NULL;
+		if (evaluate_to_string(node->image_name, st, &img) == 0 && img) {
+			(void)add_string_to_map(cfg->data.map, "image_name", img);
+		}
+		else {
+			ProPrintfChar("Error: IMAGE name must be a string\n");
+		}
+	}
+
+	/* ON_PICTURE */
+	(void)add_bool_to_map(cfg->data.map, "on_picture", node->on_picture ? true : false);
+	if (node->on_picture) {
+		long x = 0, y = 0;
+		if (node->posX && evaluate_to_int(node->posX, st, &x) == 0) {
+			(void)add_int_to_map(cfg->data.map, "posX", (int)x);
+		}
+		else if (node->posX) {
+			ProPrintfChar("Error: ON_PICTURE posX must be integer\n");
+		}
+		if (node->posY && evaluate_to_int(node->posY, st, &y) == 0) {
+			(void)add_int_to_map(cfg->data.map, "posY", (int)y);
+		}
+		else if (node->posY) {
+			ProPrintfChar("Error: ON_PICTURE posY must be integer\n");
+		}
+	}
+
+	/* tag (optional) */
+	if (node->tag) {
+		char* tag = NULL;
+		if (evaluate_to_string(node->tag, st, &tag) == 0 && tag) {
+			(void)add_string_to_map(cfg->data.map, "tag", tag);
+		}
+		else {
+			ProPrintfChar("Error: 'tag' must be a string\n");
+		}
+	}
+
+	/* finally, publish the config under the array name */
+	set_symbol(st, node->array, cfg);
+
+	ProPrintfChar("Note: USER_SELECT_MULTIPLE '%s' registered with %zu types, max_sel=%ld\n",
+		node->array, node->type_count, max_sel_val);
+	return 0;
+}
+
 /*=================================================*\
 * 
 * INVALIDATE_PARAM semantic analysis
@@ -2823,6 +3555,15 @@ static int analyze_command(CommandNode* cmd, SymbolTable* st) {
 		break;
 	case COMMAND_USER_SELECT:
 		result = check_user_select_semantics((UserSelectNode*)cmd->data, st);
+		break;
+	case COMMAND_USER_SELECT_OPTIONAL:
+		result = check_user_select_optional_semantics((UserSelectOptionalNode*)cmd->data, st);
+		break;
+	case COMMAND_USER_SELECT_MULTIPLE:
+		result = check_user_select_multiple_semantics((UserSelectMultipleNode*)cmd->data, st);
+		break;
+	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
+		result = check_user_select_multiple_optional_semantics((UserSelectMultipleOptionalNode*)cmd->data, st);
 		break;
 	case COMMAND_ASSIGNMENT:
 		result = check_assignment_semantics(&((CommandData*)cmd->data)->assignment, st);
