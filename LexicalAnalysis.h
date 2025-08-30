@@ -25,6 +25,7 @@ typedef enum {
     tok_backslash, // \:
     tok_bar,     // |
     tok_ampersand, // &
+    tok_andand,
     tok_lparen,  // ( (new)
     tok_rparen,  // ) (new)
     tok_lbrace,  // {
@@ -33,6 +34,8 @@ typedef enum {
     tok_rbracket,// ]
     tok_colon,   // :
     tok_comma,   // , (new)
+    tok_semicolon,
+    tok_quest,
     tok_tab,
     tok_dot,
     tok_and,
