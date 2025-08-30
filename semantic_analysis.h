@@ -22,3 +22,4 @@ void set_default_value(Variable* var);
 
 
 #endif // !SEMANTIC_ANALYSIS_H
+
