@@ -11,6 +11,7 @@
 typedef struct CommandNode CommandNode;
 
 
+
 // Enum for Creo reference types (mapped from strings)
 typedef enum {
     CREO_ASSEMBLY = PRO_ASSEMBLY,
@@ -316,6 +317,77 @@ typedef struct {
 } UserSelectNode;
 
 typedef struct {
+    ExpressionNode** types;         // Array of expressions for types (e.g., literals like "AXIS" or variables like "&myType")
+    size_t type_count;
+    char* reference;                // Reference name (identifier string)
+    ExpressionNode* display_order;  // Expression for display_order (numeric)
+    bool allow_reselect;            // Flag (no value)
+    ExpressionNode* filter_mdl;     // Expression for filter_mdl (variable or array)
+    ExpressionNode* filter_feat;    // Expression for filter_feat (variable or array)
+    ExpressionNode* filter_geom;    // Expression for filter_geom (variable or array)
+    ExpressionNode* filter_ref;     // Expression for filter_ref (variable or array)
+    ExpressionNode* filter_identifier; // Expression for filter_identifier (string literal)
+    bool select_by_box;             // Flag (no value)
+    bool select_by_menu;            // Flag (no value)
+    ExpressionNode* include_multi_cad; // Expression for include_multi_cad (e.g., identifier "TRUE" or "FALSE")
+    ExpressionNode* tooltip_message;   // Expression for tooltip_message (string literal)
+    ExpressionNode* image_name;     // Expression for image_name (string literal)
+    bool on_picture;                // Flag (set if ON_PICTURE present)
+    ExpressionNode* posX;           // Expression for posX (numeric)
+    ExpressionNode* posY;           // Expression for posY (numeric)
+    ExpressionNode* tag;            // Expression for tag (numeric, optional)
+    ProBoolean is_required;
+} UserSelectOptionalNode;
+
+typedef struct {
+
+    ExpressionNode** types;
+    size_t type_count;
+    ExpressionNode* max_sel;
+    char* array;
+    ExpressionNode* display_order;
+    bool allow_reselect;
+    ExpressionNode* filter_mdl;
+    ExpressionNode* filter_feat;
+    ExpressionNode* filter_geom;
+    ExpressionNode* filter_ref;
+    ExpressionNode* filter_identifier;
+    bool select_by_box;
+    bool select_by_menu;
+    ExpressionNode* include_multi_cad;
+    ExpressionNode* tooltip_message;
+    ExpressionNode* image_name;
+    bool on_picture;
+    ExpressionNode* posX;
+    ExpressionNode* posY;
+    ExpressionNode* tag;
+}UserSelectMultipleNode;
+
+typedef struct {
+
+    ExpressionNode** types;
+    size_t type_count;
+    ExpressionNode* max_sel;
+    char* array;
+    ExpressionNode* display_order;
+    bool allow_reselect;
+    ExpressionNode* filter_mdl;
+    ExpressionNode* filter_feat;
+    ExpressionNode* filter_geom;
+    ExpressionNode* filter_ref;
+    ExpressionNode* filter_identifier;
+    bool select_by_box;
+    bool select_by_menu;
+    ExpressionNode* include_multi_cad;
+    ExpressionNode* tooltip_message;
+    ExpressionNode* image_name;
+    bool on_picture;
+    ExpressionNode* posX;
+    ExpressionNode* posY;
+    ExpressionNode* tag;
+}UserSelectMultipleOptionalNode;
+
+typedef struct {
     ParameterSubType subtype;
     char* parameter;
     ExpressionNode** options;
@@ -335,18 +407,20 @@ typedef struct
 }InvalidateParamNode;
 
 typedef struct {
-    char* identifier;          // TABLE_IDENTIFIER
-    char* name;                // Optional table name
-    char** options;            // TABLE_OPTION options
-    size_t option_count;       // Number of options
-    char** sel_strings;        // SEL_STRING parameters
-    size_t sel_string_count;   // Number of SEL_STRING parameters
-    char** data_types;         // Data types for columns
-    size_t data_type_count;    // Number of data types
-    char*** rows;              // 2D array of row data
-    size_t row_count;          // Number of rows
-    size_t column_count;       // Number of columns (matches sel_string_count)
+    char* identifier;                // TABLE_IDENTIFIER (remains char* as a fixed lexical token)
+    ExpressionNode* name;            // Optional table name (now an expression, e.g., string literal or variable)
+    ExpressionNode** options;        // TABLE_OPTION options (array of expressions for dynamic options)
+    int option_count;             // Number of options
+    ExpressionNode** sel_strings;    // SEL_STRING parameters (array of expressions for selection strings)
+    int sel_string_count;         // Number of SEL_STRING parameters
+    ExpressionNode** data_types;     // Data types for columns (array of expressions, e.g., "int" or "&myTypeVar")
+    int data_type_count;          // Number of data types
+    ExpressionNode*** rows;          // 2D array of row data (outer array for rows, inner arrays for column expressions)
+    int row_count;                // Number of rows
+    int column_count;             // Number of columns (should match sel_string_count for consistency)
 } TableNode;
+
+
 
 typedef enum {
     FOR_INTERF_MDL,       // INTERF_MDL model [SOLID_ONLY]
@@ -413,6 +487,9 @@ typedef union
     UserInputParamNode user_input_param;
     CheckboxParamNode checkbox_param;
     UserSelectNode user_select;
+    UserSelectOptionalNode user_select_optional;
+    UserSelectMultipleOptionalNode user_select_multiple_optional;
+    UserSelectMultipleNode user_select_multiple;
     RadioButtonParamNode radiobutton_param;
     InvalidateParamNode invalidate_param;
     TableNode begin_table;
@@ -434,6 +511,9 @@ typedef enum {
     COMMAND_USER_INPUT_PARAM,
     COMMAND_CHECKBOX_PARAM,
     COMMAND_USER_SELECT,
+    COMMAND_USER_SELECT_OPTIONAL,
+    COMMAND_USER_SELECT_MULTIPLE,
+    COMMAND_USER_SELECT_MULTIPLE_OPTIONAL,
     COMMAND_RADIOBUTTON_PARAM,
     COMMAND_BEGIN_TABLE,
     COMMAND_IF,
