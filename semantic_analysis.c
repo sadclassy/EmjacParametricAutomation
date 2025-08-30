@@ -18,6 +18,7 @@ static const char* command_names[] = {
 	[COMMAND_USER_SELECT] = "USER_SELECT",
 	[COMMAND_USER_SELECT_MULTIPLE] = "USER_SELECT_MULTIPLE",
 	[COMMAND_RADIOBUTTON_PARAM] = "RADIOBUTTON_PARAM",
+	[COMMAND_BEGIN_TABLE] = "BEGIN_TABLE",
 	[COMMAND_IF] = "IF",
 	[COMMAND_FOR] = "FOR",
 	[COMMAND_WHILE] = "WHILE",
@@ -144,10 +145,10 @@ void set_default_value(Variable* var) {
 }
 
 // Helper to check if a string is a valid identifier
-static int is_valid_identifier(const char* name) {
-	if (!name || !*name || isdigit(*name)) return 0;  // Empty or starts with digit
-	for (const char* p = name; *p; p++) {
-		if (!isalnum(*p) && *p != '_') return 0;  // Alphanumeric + underscore only
+int is_valid_identifier(const char* id) {
+	if (!id || !id[0] || (!isalpha(id[0]) && id[0] != '_')) return 0;
+	for (const char* p = id + 1; *p; ++p) {
+		if (!isalnum(*p) && *p != '_') return 0;
 	}
 	return 1;
 }
@@ -305,56 +306,110 @@ int evaluate_to_double(ExpressionNode* expr, SymbolTable* st, double* result) {
 
 // Basic expression evaluators (for string)
 int evaluate_to_string(ExpressionNode* expr, SymbolTable* st, char** result) {
+	if (!result) return -1;
+	*result = NULL;
+
 	if (!expr) {
-		*result = NULL;
-		return 0;  // Optional (empty string allowed per spec)
+		/* Empty expression -> treat as empty string per spec */
+		return 0;
 	}
+
 	switch (expr->type) {
 	case EXPR_LITERAL_STRING:
 		*result = _strdup(expr->data.string_val);
 		return *result ? 0 : -1;
+
 	case EXPR_VARIABLE_REF: {
 		Variable* var = get_symbol(st, expr->data.string_val);
 		if (var && var->type == TYPE_STRING) {
 			*result = _strdup(var->data.string_value);
 			return *result ? 0 : -1;
 		}
-		else if (!var) {
-			// Treat undeclared identifier as literal string (handles unquoted file names)
+		else if (var && var->type == TYPE_SUBTABLE) {
+			/* Allow stringification of subtable refs to their target id */
+			*result = _strdup(var->data.string_value);
+			return *result ? 0 : -1;
+		}
+		else if (var) {
+			/* allow numeric/bool to be stringified */
+			char buf[64];
+			switch (var->type) {
+			case TYPE_INTEGER:
+				snprintf(buf, sizeof(buf), "%ld", (long)var->data.int_value);
+				*result = _strdup(buf);
+				return *result ? 0 : -1;
+			case TYPE_DOUBLE:
+				snprintf(buf, sizeof(buf), "%.15g", var->data.double_value);
+				*result = _strdup(buf);
+				return *result ? 0 : -1;
+			case TYPE_BOOL:
+				*result = _strdup(var->data.int_value ? "1" : "0");
+				return *result ? 0 : -1;
+			case TYPE_NULL:
+				*result = NULL;
+				return 0;
+			case TYPE_ARRAY:
+				/* Treat references to tables (TYPE_ARRAY) as literal identifiers */
+				*result = _strdup(expr->data.string_val);
+				return *result ? 0 : -1;
+			default:
+				return -1;
+			}
+		}
+		else {
+			/* Undeclared identifier literal string (unquoted filenames, etc.) */
 			*result = _strdup(expr->data.string_val);
 			return *result ? 0 : -1;
 		}
-		return -1;  // Declared but non-string
 	}
+
 	case EXPR_BINARY_OP: {
 		if (expr->data.binary.op != BINOP_ADD) {
-			return -1;  // Only + for concatenation
+			return -1; /* Only + is concatenation */
 		}
-		char* left_str;
-		int status = evaluate_to_string(expr->data.binary.left, st, &left_str);
-		if (status != 0) return -1;
-		char* right_str;
-		status = evaluate_to_string(expr->data.binary.right, st, &right_str);
-		if (status != 0) {
+		char* left_str = NULL;
+		if (evaluate_to_string(expr->data.binary.left, st, &left_str) != 0) return -1;
+
+		char* right_str = NULL;
+		if (evaluate_to_string(expr->data.binary.right, st, &right_str) != 0) {
 			free(left_str);
 			return -1;
 		}
-		// Concatenate (handle NULL as empty)
-		size_t len = (left_str ? strlen(left_str) : 0) + (right_str ? strlen(right_str) : 0) + 1;
-		*result = malloc(len);
+
+		size_t len = (left_str ? strlen(left_str) : 0)
+			+ (right_str ? strlen(right_str) : 0) + 1;
+		*result = (char*)malloc(len);
 		if (!*result) {
 			free(left_str);
 			free(right_str);
 			return -1;
 		}
-		snprintf(*result, len, "%s%s", left_str ? left_str : "", right_str ? right_str : "");
+		snprintf(*result, len, "%s%s",
+			left_str ? left_str : "",
+			right_str ? right_str : "");
 		free(left_str);
 		free(right_str);
 		return 0;
 	}
-	default:
+
+	default: {
+		long iv;
+		if (evaluate_to_int(expr, st, &iv) == 0) {
+			char buf[32];
+			snprintf(buf, sizeof(buf), "%ld", iv);
+			*result = _strdup(buf);
+			return *result ? 0 : -1;
+		}
+		double dv;
+		if (evaluate_to_double(expr, st, &dv) == 0) {
+			char buf[64];
+			snprintf(buf, sizeof(buf), "%.15g", dv);
+			*result = _strdup(buf);
+			return *result ? 0 : -1;
+		}
 		*result = NULL;
 		return -1;
+	}
 	}
 }
 
@@ -634,7 +689,16 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 
 	case EXPR_VARIABLE_REF: {
 		Variable* src = get_symbol(st, expr->data.string_val);
-		if (!src) { free(*result); return -1; }
+		if (!src) {
+			(*result)->type = TYPE_STRING;
+			(*result)->data.string_value = _strdup("");
+			return 0;
+		}
+		if (src->type == TYPE_UNKNOWN) {
+			(*result)->type = TYPE_STRING;
+			(*result)->data.string_value = _strdup("");
+			return 0;
+		}
 		memcpy(*result, src, sizeof(Variable));
 		if (src->type == TYPE_STRING) {
 			(*result)->data.string_value = _strdup(src->data.string_value);
@@ -2120,7 +2184,7 @@ int check_radiobutton_param_semantics(RadioButtonParamNode * node, SymbolTable *
 		}
 		param_var->type = declared_type;
 		if (declared_type == TYPE_INTEGER) {
-			param_var->data.int_value = -1;  // Default to no selection
+			param_var->data.int_value = 0;  // Default to first selection
 		}
 		else {  // TYPE_BOOL
 			param_var->data.int_value = 0;
@@ -3362,6 +3426,348 @@ int check_invalidate_param_semantics(InvalidateParamNode* node, SymbolTable* st)
 
 /*=================================================*\
 * 
+* BEGIN_TABLE SEMANTICS CHECK
+* 
+* 
+\*=================================================*/
+int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
+	if (!node || !st) {
+		ProPrintfChar("Error: Invalid TableNode or SymbolTable in semantic analysis\n");
+		return -1;
+	}
+	/* 1) Column type header must match */
+	if (node->data_type_count != node->column_count) {
+		ProPrintfChar("Error: Data type count (%zu) does not match column count (%zu)\n",
+			node->data_type_count, node->column_count);
+		return -1;
+	}
+	/* 2) Map declared data types to VariableType */
+	VariableType* column_types = NULL;
+	if (node->column_count > 0) {
+		column_types = (VariableType*)malloc(node->column_count * sizeof(VariableType));
+		if (!column_types) {
+			ProPrintfChar("Error: Memory allocation failed for column types\n");
+			return -1;
+		}
+	}
+	for (size_t c = 0; c < node->column_count; ++c) {
+		char* dtype_str = NULL;
+		if (evaluate_to_string(node->data_types[c], st, &dtype_str) != 0 || !dtype_str) {
+			ProPrintfChar("Error: Failed to evaluate data type for column %zu\n", c);
+			free(column_types);
+			free(dtype_str);
+			return -1;
+		}
+		if (strcmp(dtype_str, "STRING") == 0) column_types[c] = TYPE_STRING;
+		else if (strcmp(dtype_str, "DOUBLE") == 0) column_types[c] = TYPE_DOUBLE;
+		else if (strcmp(dtype_str, "INTEGER") == 0) column_types[c] = TYPE_INTEGER;
+		else if (strcmp(dtype_str, "BOOL") == 0) column_types[c] = TYPE_BOOL;
+		else if (strcmp(dtype_str, "SUBTABLE") == 0) column_types[c] = TYPE_SUBTABLE; /* CHANGED */
+		else if (strcmp(dtype_str, "SUBCOMP") == 0) column_types[c] = TYPE_REFERENCE;
+		else if (strcmp(dtype_str, "CONFIG_DELETE_IDS") == 0) column_types[c] = TYPE_STRING;
+		else if (strcmp(dtype_str, "CONFIG_STATE") == 0) column_types[c] = TYPE_BOOL;
+		else {
+			ProPrintfChar("Error: Invalid data type '%s' for column %zu\n", dtype_str, c);
+			free(column_types);
+			free(dtype_str);
+			return -1;
+		}
+		free(dtype_str);
+	}
+	/* New: Validate and prepare column keys from SEL_STRING (assuming node->sel_strings exists as ExpressionNode**) */
+	if (node->sel_string_count != node->column_count) {
+		ProPrintfChar("Error: SEL_STRING count (%zu) does not match expected %zu\n",
+			node->sel_string_count, node->column_count);
+		free(column_types);
+		return -1;
+	}
+	char** column_keys = (char**)malloc(node->column_count * sizeof(char*));
+	if (!column_keys) {
+		ProPrintfChar("Error: Memory allocation failed for column keys\n");
+		free(column_types);
+		return -1;
+	}
+	column_keys[0] = _strdup("SEL_STRING");
+	if (!column_keys[0]) {
+		ProPrintfChar("Error: Failed to duplicate SEL_STRING key\n");
+		free(column_keys);
+		free(column_types);
+		return -1;
+	}
+	for (size_t c = 1; c < node->column_count; ++c) {
+		ExpressionNode* key_expr = node->sel_strings[c];
+		char* k = NULL;
+		if (key_expr->type == EXPR_VARIABLE_REF) {
+			/* Use the variable name directly as the key, ignoring declaration status */
+			k = _strdup(key_expr->data.string_val);
+		}
+		else {
+			/* Evaluate other expressions to string */
+			if (evaluate_to_string(key_expr, st, &k) != 0 || !k) {
+				ProPrintfChar("Error: Failed to evaluate SEL_STRING key for column %zu\n", c);
+				for (size_t i = 0; i < c; ++i) free(column_keys[i]);
+				free(column_keys);
+				free(column_types);
+				return -1;
+			}
+		}
+		if (!k || !is_valid_identifier(k)) {
+			ProPrintfChar("Error: Invalid SEL_STRING key '%s' for column %zu (must be a valid identifier)\n", k ? k : "(null)", c);
+			free(k);
+			for (size_t i = 0; i < c; ++i) free(column_keys[i]);
+			free(column_keys);
+			free(column_types);
+			return -1;
+		}
+		column_keys[c] = k;  /* Take ownership */
+	}
+	/* 3) Validate rows: empty/NO_VALUE allowed; else enforce type */
+	for (size_t r = 0; r < node->row_count; ++r) {
+		for (size_t c = 0; c < node->column_count; ++c) {
+			ExpressionNode* cell_expr = node->rows[r][c];
+			int is_empty = (cell_expr == NULL);
+			/* Probe for NO_VALUE / "" / NULL via string evaluator (safe for any expr) */
+			if (!is_empty) {
+				char* probe = NULL;
+				if (evaluate_to_string(cell_expr, st, &probe) == 0) {
+					if (!probe || probe[0] == '\0' || strcmp(probe, "NO_VALUE") == 0) {
+						is_empty = 1;
+					}
+				}
+				free(probe);
+			}
+			if (is_empty) continue;
+			switch (column_types[c]) {
+			case TYPE_STRING: {
+				char* s = NULL;
+				if (evaluate_to_string(cell_expr, st, &s) != 0) {
+					ProPrintfChar("Error: STRING cell failed to evaluate in row %zu, column %zu\n", r, c);
+					free(column_types);
+					for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+					free(column_keys);
+					return -1;
+				}
+				free(s);
+			} break;
+			case TYPE_INTEGER: {
+				long iv;
+				if (evaluate_to_int(cell_expr, st, &iv) != 0) {
+					ProPrintfChar("Error: INTEGER cell failed to evaluate in row %zu, column %zu\n", r, c);
+					free(column_types);
+					for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+					free(column_keys);
+					return -1;
+				}
+			} break;
+			case TYPE_DOUBLE: {
+				double dv;
+				if (evaluate_to_double(cell_expr, st, &dv) != 0) {
+					ProPrintfChar("Error: DOUBLE cell failed to evaluate in row %zu, column %zu\n", r, c);
+					free(column_types);
+					for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+					free(column_keys);
+					return -1;
+				}
+				// Revised: Add debug log to confirm exact value during validation
+				LogOnlyPrintfChar("Note: DOUBLE cell in row %zu, column %zu evaluated to exact value %.15g\n", r, c, dv);
+			} break;
+			case TYPE_BOOL: {
+				long bv;
+				if (evaluate_to_int(cell_expr, st, &bv) != 0) {
+					ProPrintfChar("Error: BOOL cell failed to evaluate in row %zu, column %zu\n", r, c);
+					free(column_types);
+					for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+					free(column_keys);
+					return -1;
+				}
+			} break;
+			case TYPE_SUBTABLE: {
+				char* name = NULL;
+				int res = evaluate_to_string(cell_expr, st, &name);
+				if (res != 0) {
+					if (cell_expr->type == EXPR_VARIABLE_REF && get_symbol(st, cell_expr->data.string_val) == NULL) {
+						// Allow undeclared variable as forward reference
+						LogOnlyPrintfChar("Note: Treating undeclared '%s' as forward SUBTABLE ref (row %zu, col %zu)\n",
+							cell_expr->data.string_val, r, c);
+					} else {
+						ProPrintfChar("Error: SUBTABLE cell failed to evaluate in row %zu, column %zu\n", r, c);
+						free(column_types);
+						for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+						free(column_keys);
+						return -1;
+					}
+				}
+				/* Empty allowed (already handled), otherwise keep as typed reference */
+				if (name && name[0] != '\0' && strcmp(name, "NO_VALUE") != 0) {
+					LogOnlyPrintfChar("Note: SUBTABLE reference '%s' recorded (row %zu, col %zu)\n",
+						name, r, c);
+				}
+				free(name);
+			} break;
+			case TYPE_REFERENCE: {
+				char* name = NULL;
+				int res = evaluate_to_string(cell_expr, st, &name);
+				if (res != 0) {
+					if (cell_expr->type == EXPR_VARIABLE_REF && get_symbol(st, cell_expr->data.string_val) == NULL) {
+						// Allow undeclared variable as forward reference
+						LogOnlyPrintfChar("Note: Treating undeclared '%s' as forward REFERENCE ref (row %zu, col %zu)\n",
+							cell_expr->data.string_val, r, c);
+					} else {
+						ProPrintfChar("Error: REFERENCE cell failed to evaluate in row %zu, column %zu\n", r, c);
+						free(column_types);
+						for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+						free(column_keys);
+						return -1;
+					}
+				}
+				free(name);
+			} break;
+			default:
+				ProPrintfChar("Error: Unsupported column type %d in row %zu, column %zu\n", column_types[c], r, c);
+				free(column_types);
+				for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+				free(column_keys);
+				return -1;
+			}
+		}
+	}
+	/* 4) Materialize table */
+	Variable* table_var = (Variable*)malloc(sizeof(Variable));
+	if (!table_var) { ProPrintfChar("Error: Memory allocation failed for table variable\n"); free(column_types); for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]); free(column_keys); return -1; }
+	table_var->type = TYPE_ARRAY;
+	table_var->data.array.size = node->row_count;
+	table_var->data.array.elements = (node->row_count > 0)
+		? (Variable**)malloc(node->row_count * sizeof(Variable*))
+		: NULL;
+	if (node->row_count > 0 && !table_var->data.array.elements) { free(table_var); free(column_types); for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]); free(column_keys); return -1; }
+	for (size_t r = 0; r < node->row_count; ++r) {
+		Variable* row_var = (Variable*)malloc(sizeof(Variable));
+		if (!row_var) {
+			for (size_t k = 0; k < r; ++k) free_variable(table_var->data.array.elements[k]);
+			free(table_var->data.array.elements);
+			free(table_var);
+			free(column_types);
+			for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+			free(column_keys);
+			return -1;
+		}
+		row_var->type = TYPE_MAP;
+		row_var->data.map = create_hash_table(node->column_count);
+		if (!row_var->data.map) {
+			free(row_var);
+			for (size_t k = 0; k < r; ++k) free_variable(table_var->data.array.elements[k]);
+			free(table_var->data.array.elements);
+			free(table_var);
+			free(column_types);
+			for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+			free(column_keys);
+			return -1;
+		}
+		for (size_t c = 0; c < node->column_count; ++c) {
+			ExpressionNode* cell_expr = node->rows[r][c];
+			Variable* v = (Variable*)malloc(sizeof(Variable));
+			if (!v) {
+				free_hash_table(row_var->data.map);
+				free(row_var);
+				for (size_t k = 0; k < r; ++k) free_variable(table_var->data.array.elements[k]);
+				free(table_var->data.array.elements);
+				free(table_var);
+				free(column_types);
+				for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+				free(column_keys);
+				return -1;
+			}
+			v->type = TYPE_NULL; /* default: empty */
+			int is_empty = (cell_expr == NULL);
+			char* probe = NULL;
+			if (!is_empty && evaluate_to_string(cell_expr, st, &probe) == 0) {
+				if (!probe || probe[0] == '\0' || strcmp(probe, "NO_VALUE") == 0) {
+					is_empty = 1;
+				}
+			}
+			if (!is_empty) {
+				switch (column_types[c]) {
+				case TYPE_STRING: {
+					char* s = NULL;
+					if (evaluate_to_string(cell_expr, st, &s) == 0 && s && s[0] != '\0' && strcmp(s, "NO_VALUE") != 0) {
+						v->type = TYPE_STRING;
+						v->data.string_value = _strdup(s);
+						if (!v->data.string_value) { v->type = TYPE_NULL; }
+					}
+					free(s);
+				} break;
+				case TYPE_INTEGER: {
+					long iv;
+					if (evaluate_to_int(cell_expr, st, &iv) == 0) { v->type = TYPE_INTEGER; v->data.int_value = (int)iv; }
+				} break;
+				case TYPE_DOUBLE: {
+					double dv;
+					if (evaluate_to_double(cell_expr, st, &dv) == 0) {
+						v->type = TYPE_DOUBLE;
+						v->data.double_value = dv;
+						// Revised: Add debug log to confirm exact storage
+						LogOnlyPrintfChar("Note: Stored exact DOUBLE value %.15g in row %zu, column %zu\n", dv, r, c);
+					}
+				} break;
+				case TYPE_BOOL: {
+					long bv;
+					if (evaluate_to_int(cell_expr, st, &bv) == 0) { v->type = TYPE_BOOL; v->data.int_value = (bv != 0); }
+				} break;
+				case TYPE_SUBTABLE: {
+					char* name = NULL;
+					int res = evaluate_to_string(cell_expr, st, &name);
+					if (res != 0) {
+						if (cell_expr->type == EXPR_VARIABLE_REF && get_symbol(st, cell_expr->data.string_val) == NULL) {
+							name = _strdup(cell_expr->data.string_val);
+							LogOnlyPrintfChar("Note: Stored undeclared '%s' as forward SUBTABLE ref\n", name);
+						}
+					}
+					if (name && name[0] != '\0' && strcmp(name, "NO_VALUE") != 0) {
+						/* Store typed subtable reference (deferred resolution) */
+						v->type = TYPE_SUBTABLE;
+						v->data.string_value = _strdup(name);
+						if (!v->data.string_value) v->type = TYPE_NULL;
+						LogOnlyPrintfChar("Note: Stored SUBTABLE ref '%s' as TYPE_SUBTABLE\n", name);
+					}
+					free(name);
+				} break;
+				case TYPE_REFERENCE: {
+					char* ref = NULL;
+					int res = evaluate_to_string(cell_expr, st, &ref);
+					if (res != 0) {
+						if (cell_expr->type == EXPR_VARIABLE_REF && get_symbol(st, cell_expr->data.string_val) == NULL) {
+							ref = _strdup(cell_expr->data.string_val);
+							LogOnlyPrintfChar("Note: Stored undeclared '%s' as forward REFERENCE ref\n", ref);
+						} else {
+							ref = NULL;
+						}
+					}
+					if (ref && ref[0] != '\0' && strcmp(ref, "NO_VALUE") != 0) {
+						v->type = TYPE_STRING; /* keep as string token; your USER_SELECT will materialize later */
+						v->data.string_value = _strdup(ref);
+						if (!v->data.string_value) v->type = TYPE_NULL;
+					}
+					free(ref);
+				} break;
+				default: /* leave TYPE_NULL */ break;
+				}
+			}
+			free(probe);
+			/* Insert into row map using column key */
+			hash_table_insert(row_var->data.map, column_keys[c], v);
+		}
+		table_var->data.array.elements[r] = row_var;
+	}
+	/* 5) Publish to symbol table */
+	set_symbol(st, node->identifier, table_var);
+	free(column_types);
+	for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+	free(column_keys);
+	return 0;
+}
+
+/*=================================================*\
+* 
 * // Semantic analysis for IF: Validate conditions and recurse on branches
 * 
 * 
@@ -3561,6 +3967,9 @@ static int analyze_command(CommandNode* cmd, SymbolTable* st) {
 		break;
 	case COMMAND_USER_SELECT_MULTIPLE:
 		result = check_user_select_multiple_semantics((UserSelectMultipleNode*)cmd->data, st);
+		break;
+	case COMMAND_BEGIN_TABLE:
+		result = check_begin_table_semantics((TableNode*)cmd->data, st);
 		break;
 	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
 		result = check_user_select_multiple_optional_semantics((UserSelectMultipleOptionalNode*)cmd->data, st);
