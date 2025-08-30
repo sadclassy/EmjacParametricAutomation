@@ -10,12 +10,20 @@
 // --- Reactive context (file-scope) ---
 static DialogState* g_active_state = NULL;
 static SymbolTable* g_active_st = NULL;
+static int dynamic_table_count = 0;
+
+
+static int if_gate_id_of(IfNode* n)
+{
+	return (int)(((uintptr_t)n) & 0x7fffffff);
+}
 
 
 ProError execute_if(IfNode* node, SymbolTable* st, BlockList* block_list, DialogState* state);
 
 ProError execute_assignment(AssignmentNode* node, SymbolTable* st, BlockList* block_list);
 ProError execute_declare_variable(DeclareVariableNode* node, SymbolTable* st);
+ProError TableSelectCallback(char* dialog, char* table, ProAppData appdata);
 
 ProError InitializeLayout(char* dialog_name, char* parent_layout, char* layout_name, ProUIGridopts* grid_opts, wchar_t* title, int* initialized)
 {
@@ -56,68 +64,98 @@ ProError InitializeLayout(char* dialog_name, char* parent_layout, char* layout_n
 	return PRO_TK_NO_ERROR;
 }
 
+ProError InitializeTableLayout(char* dialog_name, char* parent_layout, char* layout_name, ProUIGridopts* grid_opts, wchar_t* title, int* initialized)
+{
+	ProError status;
+
+	if (*initialized)
+	{
+		return PRO_TK_NO_ERROR;
+	}
+
+	grid_opts->attach_bottom = PRO_B_TRUE;
+	grid_opts->attach_left = PRO_B_TRUE;
+	grid_opts->attach_right = PRO_B_FALSE;
+	grid_opts->attach_top = PRO_B_TRUE;
+	grid_opts->horz_resize = PRO_B_TRUE;
+	grid_opts->vert_resize = PRO_B_TRUE;
+
+	status = ProUILayoutLayoutAdd(dialog_name, parent_layout, layout_name, grid_opts);
+	if (status != PRO_TK_NO_ERROR)
+	{
+		ProGenericMsg(L"Could not add layout");
+		return status;
+	}
+	status = ProUILayoutDecorate(dialog_name, layout_name);
+	if (status != PRO_TK_NO_ERROR)
+	{
+		ProGenericMsg(L"Could not create border for layout");
+		return status;
+	}
+
+	status = ProUILayoutTextSet(dialog_name, layout_name, title);
+	if (status != PRO_TK_NO_ERROR)
+	{
+		ProGenericMsg(L"Could not set title for layout");
+		return status;
+	}
+	*initialized = 1;
+	return PRO_TK_NO_ERROR;
+}
+
 ProError execute_show_param(ShowParamNode* node, DialogState* state, SymbolTable* st)
 {
-	// Initialize layout grid options
-	ProUIGridopts grid_opts_showParam = { 0 };
-	grid_opts_showParam.row = 1;
-	grid_opts_showParam.column = 0;
-	grid_opts_showParam.attach_bottom = PRO_B_TRUE;
-	grid_opts_showParam.attach_top = PRO_B_TRUE;
-	grid_opts_showParam.attach_right = PRO_B_TRUE;
-	grid_opts_showParam.attach_left = PRO_B_TRUE;
-	grid_opts_showParam.horz_resize = PRO_B_TRUE;
-	grid_opts_showParam.vert_resize = PRO_B_TRUE;
+	ProError status;
+	if (node->on_picture)
+	{
+		return addShowParam(state->dialog_name, state->show_param_layout.name, node, &state->show_param_layout.row, 0, st);
+	}
+	else
+	{
 
-	// Always initialize the layout if not already done
-	ProError status = InitializeLayout(state->dialog_name, state->main_layout_name, state->show_param_layout.name, &grid_opts_showParam, L"Info", &state->show_param_layout.initialized);
-	if (status != PRO_TK_NO_ERROR) {
-		return status;
+		// Add parameter to standard layout
+		status = addShowParam(state->dialog_name, state->show_param_layout.name, node, &state->show_param_layout.row, 0, st);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Error: Could not add parameter '%s' to layout\n", node->parameter);
+			return status;
+		}
+
 	}
 
-	// Add parameter to standard layout
-	status = addShowParam(state->dialog_name, state->show_param_layout.name, node, &state->show_param_layout.row, 0, st);
-	if (status != PRO_TK_NO_ERROR) {
-		ProPrintf(L"Error: Could not add parameter '%s' to layout\n", node->parameter);
-		return status;
-	}
 
 	return PRO_TK_NO_ERROR;
 }
 
 ProError execute_checkbox_param(CheckboxParamNode* node, DialogState* state, SymbolTable* st)
 {
-	ProUIGridopts grid_opt_cbp = { 0 };
-	grid_opt_cbp.row = 1;
-	grid_opt_cbp.column = 1;
-	grid_opt_cbp.attach_bottom = PRO_B_TRUE;
-	grid_opt_cbp.attach_left = PRO_B_TRUE;
-	grid_opt_cbp.attach_right = PRO_B_TRUE;
-	grid_opt_cbp.attach_top = PRO_B_TRUE;
-	grid_opt_cbp.horz_resize = PRO_B_TRUE;
-	grid_opt_cbp.vert_resize = PRO_B_TRUE;
-	grid_opt_cbp.left_offset = 20;
+	ProError status;
 
-
-	// Always initialize the layout if not already done
-	ProError status = InitializeLayout(state->dialog_name, state->main_layout_name, state->checkbox_layout.name, &grid_opt_cbp, L"True/False", &state->checkbox_layout.initialized);
-	if (status != PRO_TK_NO_ERROR) {
-		return status;
-	}
-
-
-	status = addCheckboxParam(state->dialog_name, state->checkbox_layout.name, node, &state->checkbox_layout.row, 0, st);
-	if (status != PRO_TK_NO_ERROR)
+	if (node->on_picture)
 	{
-		ProPrintfChar("Error: Could not add Checkbox '%s' to layout\n", node->parameter);
-		return status;
+		return addCheckboxParam(state->dialog_name, state->checkbox_layout.name, node, &state->checkbox_layout.row, 0, st);
+
 	}
+	else
+	{
+
+
+		status = addCheckboxParam(state->dialog_name, state->checkbox_layout.name, node, &state->checkbox_layout.row, 0, st);
+		if (status != PRO_TK_NO_ERROR)
+		{
+			ProPrintfChar("Error: Could not add Checkbox '%s' to layout\n", node->parameter);
+			return status;
+		}
+	}
+
+
 
 	return PRO_TK_NO_ERROR;
 }
 
 ProError execute_user_input_param(UserInputParamNode* node, DialogState* state, SymbolTable* st)
 {
+
+	ProError status;
 	ProUIGridopts grid_opts_uip = { 0 };
 	grid_opts_uip.row = 1;
 	grid_opts_uip.column = 2;
@@ -127,7 +165,7 @@ ProError execute_user_input_param(UserInputParamNode* node, DialogState* state, 
 	grid_opts_uip.attach_top = PRO_B_TRUE;
 	grid_opts_uip.left_offset = 20;
 
-	ProError status = InitializeLayout(state->dialog_name, state->main_layout_name, state->user_input_layout.name, &grid_opts_uip, L"Enter Values", &state->user_input_layout.initialized);
+	status = InitializeLayout(state->dialog_name, state->main_layout_name, state->user_input_layout.name, &grid_opts_uip, L"Enter Values", &state->user_input_layout.initialized);
 	if (status != PRO_TK_NO_ERROR)
 	{
 		ProPrintfChar("Could not set InitializeLayout for USER_INPUT_PARAM");
@@ -146,22 +184,7 @@ ProError execute_user_input_param(UserInputParamNode* node, DialogState* state, 
 
 ProError execute_radiobutton_param(RadioButtonParamNode* node, DialogState* state, SymbolTable* st)
 {
-	ProUIGridopts grid_opts_radio = { 0 };
-	grid_opts_radio.column = 3;
-	grid_opts_radio.row = 1;
-	grid_opts_radio.attach_bottom = PRO_B_TRUE;
-	grid_opts_radio.attach_top = PRO_B_TRUE;
-	grid_opts_radio.attach_left = PRO_B_TRUE;
-	grid_opts_radio.attach_right = PRO_B_TRUE;
-	grid_opts_radio.horz_resize = PRO_B_TRUE;
-	grid_opts_radio.vert_resize = PRO_B_TRUE;
-	grid_opts_radio.left_offset = 20;
-
-	ProError status = InitializeLayout(state->dialog_name, state->main_layout_name, state->radiobutton_layout.name, &grid_opts_radio, L"Choose Options", &state->radiobutton_layout.initialized);
-	if (status != PRO_TK_NO_ERROR) {
-		ProGenericMsg(L"Error: Could not Initialize layout for RADIOBUTTON_PARAM");
-		return status;
-	}
+	ProError status;
 
 	status = addRadioButtonParam(state->dialog_name, state->radiobutton_layout.name, node, &state->radiobutton_layout.row, 3, st);
 	if (status != PRO_TK_NO_ERROR)
@@ -176,26 +199,14 @@ ProError execute_radiobutton_param(RadioButtonParamNode* node, DialogState* stat
 
 ProError execute_user_select_param(UserSelectNode* node, DialogState* state, SymbolTable* st)
 {
+	Variable* existing = get_symbol(st, node->reference);
+	if (existing && existing->type == TYPE_MAP && hash_table_lookup(existing->data.map, "draw_area_id") != NULL)
+	{
+		return PRO_TK_NO_ERROR;
+	}
+
 	ProError status;
 
-	// Ensure the outer "user_select_layotu" 
-	ProUIGridopts grid_opts_US = { 0 };
-	grid_opts_US.row = 1;
-	grid_opts_US.column = 4;
-	grid_opts_US.attach_bottom = PRO_B_TRUE;
-	grid_opts_US.attach_top = PRO_B_TRUE;
-	grid_opts_US.attach_right = PRO_B_TRUE;
-	grid_opts_US.attach_left = PRO_B_TRUE;
-	grid_opts_US.horz_resize = PRO_B_TRUE;
-	grid_opts_US.vert_resize = PRO_B_TRUE;
-	grid_opts_US.left_offset = 20;
-
-	status = InitializeLayout(state->dialog_name, state->main_layout_name, state->user_select_layout.name, &grid_opts_US, L"Selection", &state->user_select_layout.initialized);
-	if (status != PRO_TK_NO_ERROR)
-	{
-		ProPrintfChar("Error: Initialize user select layout");
-		return status;
-	}
 
 	// Create (once) an inner grid inside the user_select_layout
 	char s_us_grid_name[64] = "user_select_grid";
@@ -236,43 +247,223 @@ ProError execute_user_select_param(UserSelectNode* node, DialogState* state, Sym
 	return PRO_TK_NO_ERROR;
 }
 
-// Pre-create USER_SELECTs found anywhere inside this IF (all branches, nested IFs)
+ProError execute_user_select_optional_param(UserSelectOptionalNode* node, DialogState* state, SymbolTable* st)
+{
+	ProError status;
+
+	// Create (once) an inner grid inside the user_select_layout
+	char s_us_grid_name_optional[64] = "user_select_grid_optional";
+	if (!state->user_select_layout.s_us_gridO_initialize)
+	{
+		ProUIGridopts sub_grid = { 0 };
+		sub_grid.row = 2;
+		sub_grid.column = 0;
+		sub_grid.horz_resize = PRO_B_TRUE;
+		sub_grid.attach_right = PRO_B_TRUE;
+		sub_grid.attach_left = PRO_B_TRUE;
+		sub_grid.horz_cells = 2;
+		sub_grid.vert_cells = 1;
+
+		status = ProUILayoutLayoutAdd(state->dialog_name, state->user_select_layout.name, s_us_grid_name_optional, &sub_grid);
+		if (status != PRO_TK_NO_ERROR)
+		{
+			ProPrintfChar("Error: Could not set layout inside the main user select layotu");
+			return status;
+		}
+
+		ProUILayoutDecorate(state->dialog_name, s_us_grid_name_optional);
+		ProUILayoutTextSet(state->dialog_name, s_us_grid_name_optional, L"Optional Selection");
+
+		state->user_select_layout.row = 1;
+		state->user_select_layout.s_us_gridO_initialize = 1;
+	}
+
+
+
+	// Add the selection parameter to the target sub-layout
+	status = addUserSelectOptional(state->dialog_name, s_us_grid_name_optional, node, &state->user_select_layout.row, 0, st);
+	if (status != PRO_TK_NO_ERROR) {
+		ProGenericMsg(L"Error adding user select parameter");
+		return status;
+	}
+
+	return PRO_TK_NO_ERROR;
+}
+
+ProError execute_user_select_multiple_param(UserSelectMultipleNode* node, DialogState* state, SymbolTable* st)
+{
+	ProError status;
+
+
+	// Create (once) an inner grid inside the user_select_layout
+	char s_us_grid_name1[64] = "user_select_grid1";
+	if (!state->user_select_layout.s_us_grid1_initialized)
+	{
+		ProUIGridopts sub_grid = { 0 };
+		sub_grid.row = 1;
+		sub_grid.column = 0;
+		sub_grid.horz_resize = PRO_B_TRUE;
+		sub_grid.attach_right = PRO_B_TRUE;
+		sub_grid.attach_left = PRO_B_TRUE;
+		sub_grid.horz_cells = 2;
+		sub_grid.vert_cells = 1;
+
+		status = ProUILayoutLayoutAdd(state->dialog_name, state->user_select_layout.name, s_us_grid_name1, &sub_grid);
+		if (status != PRO_TK_NO_ERROR)
+		{
+			ProPrintfChar("Error: Could not set layout inside the main user select layotu");
+			return status;
+		}
+
+		ProUILayoutDecorate(state->dialog_name, s_us_grid_name1);
+		ProUILayoutTextSet(state->dialog_name, s_us_grid_name1, L"Multiple Required Selection");
+
+		state->user_select_layout.row = 1;
+		state->user_select_layout.s_us_grid1_initialized = 1;
+	}
+
+
+
+	// Add the selection parameter to the target sub-layout
+	status = addUserSelectMultiple(state->dialog_name, s_us_grid_name1, node, &state->user_select_layout.row, 0, st);
+	if (status != PRO_TK_NO_ERROR) {
+		ProGenericMsg(L"Error adding user select parameter");
+		return status;
+	}
+
+	return PRO_TK_NO_ERROR;
+}
+
+ProError execute_user_select_multiple_optional_param(UserSelectMultipleOptionalNode* node, DialogState* state, SymbolTable* st)
+{
+	ProError status;
+
+	// Create (once) an inner grid inside the user_select_layout
+	char s_us_grid_name_optional[64] = "s_us_grid_name_optional";
+	if (!state->user_select_layout.s_us_gridM_initialized)
+	{
+		ProUIGridopts sub_grid = { 0 };
+		sub_grid.row = 3;
+		sub_grid.column = 0;
+		sub_grid.horz_resize = PRO_B_TRUE;
+		sub_grid.attach_right = PRO_B_TRUE;
+		sub_grid.attach_left = PRO_B_TRUE;
+		sub_grid.horz_cells = 2;
+		sub_grid.vert_cells = 1;
+
+		status = ProUILayoutLayoutAdd(state->dialog_name, state->user_select_layout.name, s_us_grid_name_optional, &sub_grid);
+		if (status != PRO_TK_NO_ERROR)
+		{
+			ProPrintfChar("Error: Could not set layout inside the main user select layotu");
+			return status;
+		}
+
+		ProUILayoutDecorate(state->dialog_name, s_us_grid_name_optional);
+		ProUILayoutTextSet(state->dialog_name, s_us_grid_name_optional, L"Multiple Optional Selection");
+
+		state->user_select_layout.row = 1;
+		state->user_select_layout.s_us_gridM_initialized = 1;
+	}
+
+
+
+	// Add the selection parameter to the target sub-layout
+	status = addUserSelectMultipleOptional(state->dialog_name, s_us_grid_name_optional, node, &state->user_select_layout.row, 0, st);
+	if (status != PRO_TK_NO_ERROR) {
+		ProGenericMsg(L"Error adding user select parameter");
+		return status;
+	}
+
+	return PRO_TK_NO_ERROR;
+}
+
+// Set IF-gate flags BEFORE creation so addUserSelect honors them 
+static void pretag_if_gated(SymbolTable* st, const char* name, int gate_id)
+{
+	if (!st || !name) return;
+	Variable* sv = get_symbol(st, (char*)name);
+	if (!sv || sv->type != TYPE_MAP || !sv->data.map) return;
+
+	set_bool_in_map(sv->data.map, "if_gated", 1);
+	add_int_to_map(sv->data.map, "if_gate_id", gate_id);
+
+	set_bool_in_map(sv->data.map, "ui_enabled", 0);  // start disabled 
+	set_bool_in_map(sv->data.map, "ui_required", 0);  // start unrequired 
+	unrequire_select(st, (char*)name);
+}
+
+// In prepare_if_user_selects: pretag, then create 
 ProError prepare_if_user_selects(IfNode* node, DialogState* state, SymbolTable* st)
 {
 	if (!node || !state || !st) return PRO_TK_NO_ERROR;
+	const int gate_id = (int)(((uintptr_t)node) & 0x7fffffff);
 
-	// Walk true/else-if branches
 	for (size_t b = 0; b < node->branch_count; ++b) {
 		IfBranch* br = node->branches[b];
 		for (size_t i = 0; i < br->command_count; ++i) {
 			CommandNode* c = br->commands[i];
 			if (!c) continue;
+
 			if (c->type == COMMAND_USER_SELECT) {
-				(void)execute_user_select_param((UserSelectNode*)c->data, state, st);
+				UserSelectNode* un = (UserSelectNode*)c->data;
+				pretag_if_gated(st, un->reference, gate_id);
+				execute_user_select_param(un, state, st);
+			}
+			else if (c->type == COMMAND_USER_SELECT_OPTIONAL) {
+				UserSelectOptionalNode* un = (UserSelectOptionalNode*)c->data;
+				pretag_if_gated(st, un->reference, gate_id);
+				execute_user_select_optional_param(un, state, st);
+			}
+			else if (c->type == COMMAND_USER_SELECT_MULTIPLE) {
+				UserSelectMultipleNode* mn = (UserSelectMultipleNode*)c->data;
+				pretag_if_gated(st, mn->array, gate_id);
+				execute_user_select_multiple_param(mn, state, st);
+			}
+			else if (c->type == COMMAND_USER_SELECT_MULTIPLE_OPTIONAL) {
+				UserSelectMultipleOptionalNode* mn = (UserSelectMultipleOptionalNode*)c->data;
+				pretag_if_gated(st, mn->array, gate_id);
+				execute_user_select_multiple_optional_param(mn, state, st);
 			}
 			else if (c->type == COMMAND_IF) {
-				(void)prepare_if_user_selects((IfNode*)c->data, state, st);
+				prepare_if_user_selects((IfNode*)c->data, state, st);
 			}
 		}
 	}
 
-	// Walk ELSE branch
 	for (size_t i = 0; i < node->else_command_count; ++i) {
 		CommandNode* c = node->else_commands[i];
 		if (!c) continue;
+
 		if (c->type == COMMAND_USER_SELECT) {
-			(void)execute_user_select_param((UserSelectNode*)c->data, state, st);
+			UserSelectNode* un = (UserSelectNode*)c->data;
+			pretag_if_gated(st, un->reference, gate_id);
+			execute_user_select_param(un, state, st);
+		}
+		else if (c->type == COMMAND_USER_SELECT_OPTIONAL) {
+			UserSelectOptionalNode* un = (UserSelectOptionalNode*)c->data;
+			pretag_if_gated(st, un->reference, gate_id);
+			execute_user_select_optional_param(un, state, st);
+		}
+		else if (c->type == COMMAND_USER_SELECT_MULTIPLE) {
+			UserSelectMultipleNode* mn = (UserSelectMultipleNode*)c->data;
+			pretag_if_gated(st, mn->array, gate_id);
+			execute_user_select_multiple_param(mn, state, st);
+		}
+		else if (c->type == COMMAND_USER_SELECT_MULTIPLE_OPTIONAL) {
+			UserSelectMultipleOptionalNode* mn = (UserSelectMultipleOptionalNode*)c->data;
+			pretag_if_gated(st, mn->array, gate_id);
+			execute_user_select_multiple_optional_param(mn, state, st);
 		}
 		else if (c->type == COMMAND_IF) {
-			(void)prepare_if_user_selects((IfNode*)c->data, state, st);
+			prepare_if_user_selects((IfNode*)c->data, state, st);
 		}
 	}
+
+	validate_ok_button(state->dialog_name, st);
 	return PRO_TK_NO_ERROR;
 }
 
-ProError execute_global_picture(GlobalPictureNode* node, DialogState* state, SymbolTable* st)
-
-{
+ProError execute_global_picture(GlobalPictureNode* node, DialogState* state, SymbolTable* st) {
 	(void)node;
 	g_active_state = state;
 	g_active_st = st;
@@ -281,23 +472,20 @@ ProError execute_global_picture(GlobalPictureNode* node, DialogState* state, Sym
 	int imageH = 0, imageW = 0;
 
 	Variable* pic_var = get_symbol(st, "GLOBAL_PICTURE");
-	if (!pic_var || pic_var->type != TYPE_STRING)
-	{
+	if (!pic_var || pic_var->type != TYPE_STRING) {
 		ProPrintfChar("Error: GLOBAL_PICTURE not found or invalid type in symbol table.\n");
 		return PRO_TK_GENERAL_ERROR;
 	}
 
 	char* filepath = pic_var->data.string_value;
-	if (!filepath)
-	{
+	if (!filepath) {
 		ProPrintfChar("Error: Image path in symbol table is null.\n");
 		return PRO_TK_GENERAL_ERROR;
 	}
 
 	ProPrintfChar("Image Path from filepath: %s\n", filepath);
 
-	if (!get_gif_dimensions(filepath, &imageW, &imageH))
-	{
+	if (!get_gif_dimensions(filepath, &imageW, &imageH)) {
 		ProPrintfChar("Error: Could not load image '%s' to get dimensions\n", filepath);
 		return PRO_TK_GENERAL_ERROR;
 	}
@@ -306,7 +494,9 @@ ProError execute_global_picture(GlobalPictureNode* node, DialogState* state, Sym
 
 	char* drawA1 = "drawA1";
 	ProUIGridopts grid_opts = { 0 };
-	grid_opts.horz_cells = 5;
+	grid_opts.row = 0;  // Fixed top row
+	grid_opts.column = 0;  // Fixed left column, no insertion
+	grid_opts.horz_cells = state->num_param_sections;  // Span all parameter columns
 	grid_opts.vert_cells = 1;
 	grid_opts.attach_bottom = PRO_B_TRUE;
 	grid_opts.attach_top = PRO_B_TRUE;
@@ -314,8 +504,6 @@ ProError execute_global_picture(GlobalPictureNode* node, DialogState* state, Sym
 	grid_opts.attach_right = PRO_B_TRUE;
 	grid_opts.horz_resize = PRO_B_TRUE;
 	grid_opts.vert_resize = PRO_B_TRUE;
-	grid_opts.row = PRO_UI_INSERT_NEW_ROW;
-	grid_opts.column = PRO_UI_INSERT_NEW_COLUMN;
 	grid_opts.left_offset = 0;
 	grid_opts.top_offset = 0;
 
@@ -332,7 +520,7 @@ ProError execute_global_picture(GlobalPictureNode* node, DialogState* state, Sym
 		return status;
 	}
 
-	status = ProUIDrawingareaBackgroundcolorSet(state->dialog_name, drawA1, PRO_UI_COLOR_LT_GREY);  // Set on inner draw_area for accuracy
+	status = ProUIDrawingareaBackgroundcolorSet(state->dialog_name, drawA1, PRO_UI_COLOR_LT_GREY);
 	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not set background color");
 		return status;
@@ -360,13 +548,12 @@ ProError execute_global_picture(GlobalPictureNode* node, DialogState* state, Sym
 		return status;
 	}
 
-	status = ProUIDrawingareaDrawingmodeSet(state->dialog_name, draw_area, PROUIDRWMODE_COPY);  // Change to COPY for direct pixel rendering
+	status = ProUIDrawingareaDrawingmodeSet(state->dialog_name, draw_area, PROUIDRWMODE_COPY);
 	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not set Drawingmode");
 		return status;
 	}
 
-	// Change to paint callback for persistence on repaint events
 	status = ProUIDrawingareaPostmanagenotifyActionSet(state->dialog_name, draw_area, addpicture, (ProAppData)st);
 	if (status != PRO_TK_NO_ERROR) {
 		ProPrintfChar("Error: Could not set paint callback\n");
@@ -383,7 +570,7 @@ ProError execute_sub_picture(SubPictureNode* node, SymbolTable* st)
 		return PRO_TK_GENERAL_ERROR;
 	}
 
-	/* Evaluate now (snapshot) */
+	// Evaluate now (snapshot) 
 	char* filename = NULL;
 	if (evaluate_to_string(node->picture_expr, st, &filename) != 0 || !filename) {
 		ProPrintfChar("Runtime Error: SUB_PICTURE filename could not be evaluated\n");
@@ -415,7 +602,7 @@ ProError execute_sub_picture(SubPictureNode* node, SymbolTable* st)
 	else { free_variable(vy); free(filename); ProPrintfChar("Type error: posY not numeric\n"); return PRO_TK_GENERAL_ERROR; }
 	free_variable(vy);
 
-	/* Ensure array exists */
+	// Ensure array exists 
 	Variable* array_var = get_symbol(st, "SUB_PICTURES");
 	if (!array_var) {
 		array_var = (Variable*)malloc(sizeof(Variable));
@@ -433,16 +620,16 @@ ProError execute_sub_picture(SubPictureNode* node, SymbolTable* st)
 	HashTable* sub_map = create_hash_table(16);
 	if (!sub_map) { free(filename); return PRO_TK_GENERAL_ERROR; }
 
-	/* Store as TYPE_EXPR but with literal nodes (constants) */
+	// Store as TYPE_EXPR but with literal nodes (constants) 
 
-	/* filename_expr -> literal string */
+	// filename_expr -> literal string 
 	Variable* filename_expr_var = (Variable*)malloc(sizeof(Variable));
 	if (!filename_expr_var) { free_hash_table(sub_map); free(filename); return PRO_TK_GENERAL_ERROR; }
 	filename_expr_var->type = TYPE_EXPR;
 	filename_expr_var->data.expr = (ExpressionNode*)malloc(sizeof(ExpressionNode));
 	if (!filename_expr_var->data.expr) { free_variable(filename_expr_var); free_hash_table(sub_map); free(filename); return PRO_TK_GENERAL_ERROR; }
 	filename_expr_var->data.expr->type = EXPR_LITERAL_STRING;
-	filename_expr_var->data.expr->data.string_val = filename; /* take ownership */
+	filename_expr_var->data.expr->data.string_val = filename; // take ownership 
 
 	if (!add_var_to_map(sub_map, "filename_expr", filename_expr_var)) {
 		free_variable(filename_expr_var);
@@ -450,7 +637,7 @@ ProError execute_sub_picture(SubPictureNode* node, SymbolTable* st)
 		return PRO_TK_GENERAL_ERROR;
 	}
 
-	/* posX_expr -> literal double */
+	// posX_expr -> literal double 
 	Variable* posX_expr_var = (Variable*)malloc(sizeof(Variable));
 	if (!posX_expr_var) { free_hash_table(sub_map); return PRO_TK_GENERAL_ERROR; }
 	posX_expr_var->type = TYPE_EXPR;
@@ -465,7 +652,7 @@ ProError execute_sub_picture(SubPictureNode* node, SymbolTable* st)
 		return PRO_TK_GENERAL_ERROR;
 	}
 
-	/* posY_expr -> literal double (freezes DIMY at this moment) */
+	// posY_expr -> literal double (freezes DIMY at this moment) 
 	Variable* posY_expr_var = (Variable*)malloc(sizeof(Variable));
 	if (!posY_expr_var) { free_hash_table(sub_map); return PRO_TK_GENERAL_ERROR; }
 	posY_expr_var->type = TYPE_EXPR;
@@ -492,6 +679,686 @@ ProError execute_sub_picture(SubPictureNode* node, SymbolTable* st)
 	array_var->data.array.elements[array_var->data.array.size] = map_var;
 	array_var->data.array.size = new_size;
 
+	return PRO_TK_NO_ERROR;
+}
+
+
+
+ProError ClearTableContents(char* dialog, char* table_id, int hide)
+{
+	ProError status;
+
+	char** existing_rows = NULL;
+	int existing_row_count = 0;
+
+	status = ProUITableRownamesGet(dialog, table_id, &existing_row_count, &existing_rows);
+	if (status == PRO_TK_NO_ERROR && existing_row_count > 0)
+	{
+		status = ProUITableRowsDelete(dialog, table_id, existing_row_count, existing_rows);
+		if (status != PRO_TK_NO_ERROR)
+		{
+			ProPrintfChar("Failed to delete rows in table %s (error: $d)", table_id, status);
+			return status;
+		}
+		ProStringarrayFree(existing_rows, existing_row_count);
+	}
+	// Clear existing columns
+	char** columns = NULL;
+	int column_count = 0;
+	status = ProUITableColumnnamesGet(dialog, table_id, &column_count, &columns);
+	if (status == PRO_TK_NO_ERROR && column_count > 0) {
+		status = ProUITableColumnsDelete(dialog, table_id, column_count, columns);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Failed to delete columns in table %s (error: %d)", table_id, status);
+		}
+		ProStringarrayFree(columns, column_count);
+	}
+
+	if (hide)
+	{
+		status = ProUITableHide(dialog, table_id);
+		if (status != PRO_TK_NO_ERROR)
+		{
+			ProPrintfChar("Failed to hide table %s", table_id);
+			return status;
+		}
+		else
+		{
+			ProPrintfChar("Successfully hid table %s", table_id);
+			return status;
+		}
+	}
+	else
+	{
+		status = ProUITableShow(dialog, table_id);
+		if (status != PRO_TK_NO_ERROR)
+		{
+			ProPrintfChar("Failed to show cleared table %s", table_id);
+			return status;
+		}
+		else
+		{
+			ProPrintfChar("Successfully showed cleared table %s", table_id);
+			return status;
+		}
+	}
+}
+
+ProError build_table_from_sym(char* dialog, char* table_id, SymbolTable* st)
+{
+	ProError status;
+	Variable* table_var = get_symbol(st, table_id);
+	if (!table_var || table_var->type != TYPE_ARRAY || table_var->data.array.size == 0) {
+		ProPrintfChar("Error: Table '%s' not found or empty in symbol table\n", table_id);
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	size_t num_rows = table_var->data.array.size;
+
+	// Check if the table already exists by attempting to retrieve row names
+	char** existing_rows = NULL;
+	int existing_row_count = 0;
+	status = ProUITableRownamesGet(dialog, table_id, &existing_row_count, &existing_rows);
+	bool table_exists = (status == PRO_TK_NO_ERROR);
+
+	if (table_exists) {
+		// Table exists: Clear contents without hiding, then repopulate
+		status = ClearTableContents(dialog, table_id, 0);  // hide=0 to show after clearing
+		if (status != PRO_TK_NO_ERROR) {
+			return status;
+		}
+		// Ensure shown after clear
+		status = ProUITableShow(dialog, table_id);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Failed to show existing table %s (error: %d)", table_id, status);
+			return status;
+		}
+	}
+	else {
+		// Table does not exist: Build new sub-layout and add table
+		// Generate unique layout name for this table's sub-layout
+		char sub_layout[128];
+		snprintf(sub_layout, sizeof(sub_layout), "table_layout_%s", table_id);
+
+		ProUIGridopts grid;
+		memset(&grid, 0, sizeof(grid));
+		grid.row = 0;  // Assume row 0 for horizontal chain
+		grid.column = ++dynamic_table_count;  // Dynamic column
+		grid.horz_cells = 1;  // Explicitly set row span to 1
+		grid.vert_cells = 1;  // Explicitly set column span to 1
+		grid.attach_bottom = PRO_B_TRUE;
+		grid.attach_left = PRO_B_TRUE;
+		grid.attach_right = PRO_B_FALSE;
+		grid.attach_top = PRO_B_TRUE;
+		grid.horz_resize = PRO_B_TRUE;
+		grid.vert_resize = PRO_B_TRUE;
+		grid.left_offset = 5;
+		status = ProUILayoutLayoutAdd(dialog, "individual_table", sub_layout, &grid);
+		if (status != PRO_TK_NO_ERROR) {
+			LogOnlyPrintfChar("Could not build layout within individual_table layout");
+			return status;
+		}
+
+		ProUIGridopts table_grid;
+		memset(&table_grid, 0, sizeof(table_grid));
+		table_grid.horz_cells = 1;  // Explicitly set row span to 1
+		table_grid.vert_cells = 1;  // Explicitly set column span to 1
+		table_grid.attach_bottom = PRO_B_TRUE;
+		table_grid.attach_left = PRO_B_TRUE;
+		table_grid.attach_right = PRO_B_TRUE;
+		table_grid.attach_top = PRO_B_TRUE;
+		table_grid.horz_resize = PRO_B_TRUE;
+		table_grid.vert_resize = PRO_B_TRUE;
+		table_grid.top_offset = 5;
+		table_grid.row = 0;
+		table_grid.column = 0;
+		status = ProUILayoutTableAdd(dialog, sub_layout, table_id, &table_grid);
+		if (status != PRO_TK_NO_ERROR) {
+			LogOnlyPrintfChar("Could not add table to individual_table layout");
+			return status;
+		}
+
+		// Selection policy: single row
+		status = ProUITableSelectionpolicySet(dialog, table_id, PROUISELPOLICY_SINGLE);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Error: Could not set row selection policy for '%s'\n", table_id);
+			return status;
+		}
+
+		// Enable row auto-highlighting
+		status = ProUITableAutohighlightEnable(dialog, table_id);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Warning: Could not enable row auto-highlighting for '%s'\n", table_id);
+		}
+	}
+
+	// Common repopulation logic (for both existing and new tables)
+	char col0_buf[32] = "COL_0";
+	char* col_ptrs[1] = { col0_buf };
+	status = ProUITableColumnsInsert(dialog, table_id, NULL, 1, col_ptrs);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Could not insert column for '%s'\n", table_id);
+		return status;
+	}
+
+	// Insert rows based on symbol table data
+	char** row_ptrs = (char**)malloc(num_rows * sizeof(char*));
+	if (!row_ptrs) return PRO_TK_GENERAL_ERROR;
+	for (size_t i = 0; i < num_rows; i++) {
+		row_ptrs[i] = (char*)malloc(32);
+		if (!row_ptrs[i]) {
+			for (size_t j = 0; j < i; j++) free(row_ptrs[j]);
+			free(row_ptrs);
+			return PRO_TK_GENERAL_ERROR;
+		}
+		snprintf(row_ptrs[i], 32, "ROW_%zu", i);
+	}
+
+	status = ProUITableRowsInsert(dialog, table_id, NULL, (int)num_rows, row_ptrs);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Could not insert rows for '%s'\n", table_id);
+		for (size_t i = 0; i < num_rows; i++) free(row_ptrs[i]);
+		free(row_ptrs);
+		return status;
+	}
+
+	// Set cell labels from SEL_STRING in each row map
+	for (size_t i = 0; i < num_rows; i++) {
+		Variable* row_var = table_var->data.array.elements[i];
+		if (row_var && row_var->type == TYPE_MAP) {
+			Variable* label_var = hash_table_lookup(row_var->data.map, "SEL_STRING");
+			char* label_utf8 = (label_var && label_var->type == TYPE_STRING && label_var->data.string_value) ? label_var->data.string_value : "";
+			wchar_t* label_w = char_to_wchar(label_utf8);
+			status = ProUITableCellLabelSet(dialog, table_id, row_ptrs[i], col0_buf, label_w ? label_w : L"");
+			if (label_w) free(label_w);
+			if (status != PRO_TK_NO_ERROR) {
+				ProPrintfChar("Error: Failed to set cell label for row %zu in '%s'\n", i, table_id);
+				for (size_t j = 0; j < num_rows; j++) free(row_ptrs[j]);
+				free(row_ptrs);
+				return status;
+			}
+		}
+	}
+
+	// Cleanup row names
+	for (size_t i = 0; i < num_rows; i++) free(row_ptrs[i]);
+	free(row_ptrs);
+
+	// Set recursive selection callback (safe to set multiple times)
+	status = ProUITableSelectActionSet(dialog, table_id, TableSelectCallback, (ProAppData)st);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Failed to set select callback for '%s'\n", table_id);
+		return status;
+	}
+
+	return PRO_TK_NO_ERROR;
+}
+
+ProError TableSelectCallback(char* dialog, char* table, ProAppData appdata)
+{
+	SymbolTable* st = (SymbolTable*)appdata;
+	if (!st || !dialog || !table) {
+		ProPrintfChar("Error: Invalid inputs in TableSelectCallback\n");
+		return PRO_TK_GENERAL_ERROR;
+	}
+	// Step 1: Get selected row names (assume single selection)
+	char** selected_rows;
+	int num_selected = 0;
+	ProError status = ProUITableSelectednamesGet(dialog, table, &num_selected, &selected_rows);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Failed to get selected rows in table '%s'\n", table);
+		if (selected_rows) ProArrayFree((ProArray*)&selected_rows);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	if (num_selected == 0) {
+		// No selection is a valid state (e.g., init or deselection); log debug and return quietly
+		LogOnlyPrintfChar("Debug: No rows selected in table '%s'\n", table);
+		if (selected_rows) ProArrayFree((ProArray*)&selected_rows);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	if (!selected_rows || !selected_rows[0]) {
+		ProPrintfChar("Error: Invalid selected rows data in table '%s'\n", table);
+		if (selected_rows) ProArrayFree((ProArray*)&selected_rows);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	// Convert selected row name to char* (direct copy, as names are char*)
+	char* selected_row_name = _strdup(selected_rows[0]);
+	if (!selected_row_name) {
+		ProPrintfChar("Error: Failed to copy selected row name\n");
+		ProArrayFree((ProArray*)&selected_rows);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	LogOnlyPrintfChar("Debug: Selected row in table '%s': %s\n", table, selected_row_name);
+	// Step 2: Lookup the table variable in symbol table (key = table component name)
+	Variable* table_var = get_symbol(st, table);
+	if (!table_var || table_var->type != TYPE_ARRAY) {
+		ProPrintfChar("Error: Table '%s' not found in symbol table or not an ARRAY\n", table);
+		free(selected_row_name);
+		ProArrayFree((ProArray*)&selected_rows);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	// Step 3: Get all row names to find the index of the selected row
+	char** all_row_names = NULL;
+	int num_rows = 0;
+	status = ProUITableRownamesGet(dialog, table, &num_rows, &all_row_names);
+	if (status != PRO_TK_NO_ERROR || num_rows == 0 || !all_row_names) {
+		ProPrintfChar("Error: Failed to get row names for table '%s'\n", table);
+		free(selected_row_name);
+		if (all_row_names) ProArrayFree((ProArray*)&all_row_names);
+		ProArrayFree((ProArray*)&selected_rows);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	size_t selected_row_index = (size_t)-1;
+	for (int i = 0; i < num_rows; i++) {
+		if (strcmp(all_row_names[i], selected_row_name) == 0) {
+			selected_row_index = (size_t)i;
+			break;
+		}
+	}
+	if (selected_row_index == (size_t)-1) {
+		ProPrintfChar("Error: Selected row '%s' not found in table '%s'\n", selected_row_name, table);
+		free(selected_row_name);
+		ProArrayFree((ProArray*)&all_row_names);
+		ProArrayFree((ProArray*)&selected_rows);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	LogOnlyPrintfChar("Debug: Selected row index: %zu\n", selected_row_index);
+	// Clean up row names
+	ProArrayFree((ProArray*)&all_row_names);
+	free(selected_row_name);
+	ProArrayFree((ProArray*)&selected_rows);
+	// Step 4: Get the row variable from symbol table (table_var->data.array.elements[row_index])
+	if (selected_row_index >= table_var->data.array.size) {
+		ProPrintfChar("Error: Row index %zu out of bounds in table '%s'\n", selected_row_index, table);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	Variable* row_var = table_var->data.array.elements[selected_row_index];
+	if (!row_var || row_var->type != TYPE_MAP) {
+		ProPrintfChar("Error: Row at index %zu in table '%s' is not a MAP\n", selected_row_index, table);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	// Step 5: Scan row map for TYPE_SUBTABLE and extract its identifier
+	char* subtable_id = NULL;
+	char* subtable_key = NULL;
+	HashTable* row_map = row_var->data.map;
+	for (size_t i = 0; i < row_map->key_count; i++) {
+		const char* key = row_map->key_order[i];
+		Variable* cell = hash_table_lookup(row_map, key);
+		if (cell && cell->type == TYPE_SUBTABLE && cell->data.string_value && strlen(cell->data.string_value) > 0) {
+			subtable_id = _strdup(cell->data.string_value);
+			subtable_key = _strdup(key);
+			LogOnlyPrintfChar("Debug: Found SUBTABLE in row %zu, key '%s': %s\n", selected_row_index, key, subtable_id);
+			break; // Assume first SUBTABLE found is the one (common in your data structure)
+		}
+	}
+	// Collect union of all propagatable keys across all rows in this table
+	char** dynamic_keys = NULL;
+	size_t dk_count = 0;
+	size_t dk_capacity = 0;
+	for (size_t r = 0; r < table_var->data.array.size; r++) {
+		Variable* rv = table_var->data.array.elements[r];
+		if (rv && rv->type == TYPE_MAP) {
+			HashTable* rm = rv->data.map;
+			for (size_t k = 0; k < rm->key_count; k++) {
+				const char* key = rm->key_order[k];
+				if (strcmp(key, "SEL_STRING") == 0) continue;
+				Variable* cell = hash_table_lookup(rm, key);
+				if (!cell || cell->type == TYPE_UNKNOWN || cell->type == TYPE_SUBTABLE) continue;
+				// Check if key is already in dynamic_keys
+				int found = 0;
+				for (size_t d = 0; d < dk_count; d++) {
+					if (strcmp(dynamic_keys[d], key) == 0) {
+						found = 1;
+						break;
+					}
+				}
+				if (!found) {
+					// Resize if necessary
+					if (dk_count >= dk_capacity) {
+						size_t new_cap = dk_capacity ? dk_capacity * 2 : 8;
+						char** new_dk = realloc(dynamic_keys, new_cap * sizeof(char*));
+						if (!new_dk) {
+							// On failure, skip cleanup (non-fatal; proceed with partial or no removal)
+							goto skip_cleanup;
+						}
+						dynamic_keys = new_dk;
+						dk_capacity = new_cap;
+					}
+					dynamic_keys[dk_count] = _strdup(key);
+					if (!dynamic_keys[dk_count]) {
+						// On failure, skip adding
+						continue;
+					}
+					dk_count++;
+				}
+			}
+		}
+	}
+	// Remove all collected dynamic keys from symbol table
+	for (size_t d = 0; d < dk_count; d++) {
+		remove_symbol(st, dynamic_keys[d]);
+	}
+skip_cleanup:
+	// New: Propagate row data as global symbols
+	for (size_t k = 0; k < row_map->key_count; k++) {
+		const char* key = row_map->key_order[k];
+		if (strcmp(key, "SEL_STRING") == 0 || (subtable_key && strcmp(key, subtable_key) == 0)) {
+			continue;
+		}
+		Variable* cell = hash_table_lookup(row_map, key);
+		if (!cell || cell->type == TYPE_UNKNOWN || cell->type == TYPE_SUBTABLE) {
+			continue;
+		}
+		Variable* global_var = malloc(sizeof(Variable));
+		if (!global_var) continue;
+		global_var->type = cell->type;
+		switch (cell->type) {
+		case TYPE_INTEGER:
+		case TYPE_BOOL:
+			global_var->data.int_value = cell->data.int_value;
+			break;
+		case TYPE_DOUBLE:
+			global_var->data.double_value = cell->data.double_value;
+			break;
+		case TYPE_STRING:
+			global_var->data.string_value = _strdup(cell->data.string_value ? cell->data.string_value : "");
+			if (!global_var->data.string_value) {
+				free(global_var);
+				continue;
+			}
+			break;
+		default:
+			free(global_var);
+			continue;
+		}
+		set_symbol(st, key, global_var);
+		LogOnlyPrintfChar("Set global '%s' from selected row in '%s'\n", key, table);
+	}
+	if (!subtable_id) {
+		LogOnlyPrintfChar("No SUBTABLE found in selected row %zu of table '%s'\n", selected_row_index, table);
+		// Optionally: Clear downstream tables here if needed (e.g., destroy layouts beyond current column)
+	}
+	// Step 6: Validate and build dynamically if it's a table
+	Variable* next_table_var = get_symbol(st, subtable_id);
+	if (next_table_var && next_table_var->type == TYPE_ARRAY) {
+		LogOnlyPrintfChar("SUBTABLE '%s' matches a table in symbol table; building dynamically.\n", subtable_id);
+		// Use global state to access DialogState
+		if (!dialog) {
+			ProPrintfChar("Error: No active DialogState for dynamic table build\n");
+			free(subtable_id);
+			if (subtable_key) free(subtable_key);
+			return PRO_TK_GENERAL_ERROR;
+		}
+		// Build the next table (column auto-incremented via NEXT_COLUMN)
+		status = build_table_from_sym(dialog, subtable_id, st);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Error: Failed to build dynamic table '%s'\n", subtable_id);
+			free(subtable_id);
+			if (subtable_key) free(subtable_key);
+			return status;
+		}
+		// Trigger refresh (e.g., for images or validation)
+		EPA_ReactiveRefresh();
+	}
+	else {
+		LogOnlyPrintfChar("SUBTABLE '%s' does not match a table; no dynamic build.\n", subtable_id);
+	}
+	free(subtable_id);
+	if (subtable_key) free(subtable_key);
+	EPA_ReactiveRefresh();
+	for (size_t d = 0; d < dk_count; d++) {
+		free(dynamic_keys[d]);
+	}
+	free(dynamic_keys);
+	return PRO_TK_NO_ERROR;
+}
+
+ProError execute_begin_table(TableNode* node, DialogState* state, SymbolTable* st)
+{
+	if (!node || !state || !st) return PRO_TK_BAD_INPUTS;
+	// Build only the first root table PER DIALOG
+	if (state->root_table_built) {
+		return PRO_TK_NO_ERROR; // don't build more roots here
+	}
+	// If a specific root was requested, skip non-matching tables
+	if (state->root_identifier[0] != '\0' &&
+		_stricmp(state->root_identifier, node->identifier ? node->identifier : "") != 0) {
+		return PRO_TK_NO_ERROR; // not the root we want
+	}
+	ProError status = PRO_TK_NO_ERROR;
+	// Step 1: Evaluate table title (fallbacks to identifier/constant)
+	wchar_t* table_title = L"TABLE";
+	char* title_utf8 = NULL;
+	bool is_default_title = true;
+	if (node->name) {
+		if (evaluate_to_string(node->name, st, &title_utf8) == 0 && title_utf8 && title_utf8[0] != '\0') {
+			wchar_t* w_title = char_to_wchar(title_utf8);
+			if (w_title) {
+				table_title = w_title;
+				is_default_title = false;
+			}
+		}
+	}
+	if (is_default_title && node->identifier && node->identifier[0] != '\0') {
+		wchar_t* w_id = char_to_wchar(node->identifier);
+		if (w_id) table_title = w_id;
+	}
+	// Step 2: Initialize the table layout
+	ProUIGridopts main_table_grid;
+	memset(&main_table_grid, 0, sizeof(main_table_grid));
+	main_table_grid.row = 0;
+	main_table_grid.column = 0;  // Use auto-insertion for consistency
+	main_table_grid.horz_cells = 1;
+	main_table_grid.vert_cells = 1;
+	main_table_grid.attach_bottom = PRO_B_TRUE;
+	main_table_grid.attach_top = PRO_B_TRUE;
+	main_table_grid.attach_left = PRO_B_TRUE;
+	main_table_grid.attach_right = PRO_B_FALSE;
+	main_table_grid.horz_resize = PRO_B_TRUE;
+	main_table_grid.vert_resize = PRO_B_TRUE;
+	status = InitializeTableLayout(state->dialog_name, state->table_layout_name, state->indvidual_table.name,
+		&main_table_grid, L"TABLE", &state->indvidual_table.initialized);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Could not initialize table layout\n");
+		if (title_utf8) free(title_utf8);
+		return status;
+	}
+	// Step 3: Prepare table identifier (component name)
+	char* table_id = node->identifier;
+	if (!table_id || table_id[0] == '\0') {
+		ProPrintfChar("Error: Table identifier is missing\n");
+		if (title_utf8) free(title_utf8);
+		return PRO_TK_BAD_INPUTS;
+	}
+	// Step 4: Add the table component inside the layout
+	ProUIGridopts table_grid;
+	memset(&table_grid, 0, sizeof(table_grid));
+	table_grid.row = 0;
+	table_grid.column = PRO_UI_INSERT_NEW_COLUMN;
+	table_grid.horz_cells = 1;
+	table_grid.vert_cells = 1;
+	table_grid.attach_bottom = PRO_B_TRUE;
+	table_grid.attach_left = PRO_B_TRUE;
+	table_grid.attach_right = PRO_B_FALSE;
+	table_grid.attach_top = PRO_B_TRUE;
+	table_grid.horz_resize = PRO_B_TRUE;
+	table_grid.vert_resize = PRO_B_TRUE;
+	table_grid.top_offset = 5;
+	LogOnlyPrintfChar("Building first table '%s' into layout '%s'\n", table_id, state->indvidual_table.name);
+	status = ProUILayoutTableAdd(state->dialog_name, state->indvidual_table.name, table_id, &table_grid);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Could not add table to layout\n");
+		if (title_utf8) free(title_utf8);
+		return status;
+	}
+	// Done: lock to only first table
+	state->root_table_built = 1;
+	// Step 5: Selection policy (single for rows, none for columns to enforce row selection)
+	status = ProUITableSelectionpolicySet(state->dialog_name, table_id, PROUISELPOLICY_SINGLE);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Could not set the row selection policy\n");
+		if (title_utf8) free(title_utf8);
+		return status;
+	}
+	// Optional: Enable row auto-highlighting for visual feedback on cell click
+	status = ProUITableAutohighlightEnable(state->dialog_name, table_id);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Warning: Could not enable row auto-highlighting\n");
+	}
+
+	// Insert exactly one column: COL_0
+	char col0_buf[32];
+	sprintf_s(col0_buf, sizeof(col0_buf), "COL_0");
+	char* col0_ptrs[1] = { col0_buf };
+	status = ProUITableColumnsInsert(state->dialog_name, table_id, NULL, 1, col0_ptrs);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: ProUITableColumnsInsert failed for COL_0\n");
+		if (title_utf8) free(title_utf8);
+		return status;
+	}
+	// Determine number of rows and source (prioritize rows over sel_strings)
+	int num_rows = 0;
+	int use_rows = (node->rows && node->row_count > 0);
+	if (use_rows) {
+		num_rows = node->row_count;
+	}
+	else if (node->sel_strings && node->sel_string_count > 0) {
+		num_rows = node->sel_string_count;
+	}
+	if (num_rows == 0) {
+		// Fallback to minimal single empty row if no data
+		num_rows = 1;
+	}
+	// Prepare array of row names
+	char** row_ptrs = (char**)malloc(num_rows * sizeof(char*));
+	if (!row_ptrs) {
+		if (title_utf8) free(title_utf8);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	for (int i = 0; i < num_rows; i++) {
+		char* row_buf = (char*)malloc(32 * sizeof(char));
+		if (!row_buf) {
+			for (int j = 0; j < i; j++) free(row_ptrs[j]);
+			free(row_ptrs);
+			if (title_utf8) free(title_utf8);
+			return PRO_TK_GENERAL_ERROR;
+		}
+		sprintf_s(row_buf, 32, "ROW%d", i);
+		row_ptrs[i] = row_buf;
+	}
+	// Insert all rows at once at the top (preserves order: row_ptrs[0] at top)
+	status = ProUITableRowsInsert(state->dialog_name, table_id, NULL, num_rows, row_ptrs);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: ProUITableRowsInsert failed for rows\n");
+		for (int i = 0; i < num_rows; i++) free(row_ptrs[i]);
+		free(row_ptrs);
+		if (title_utf8) free(title_utf8);
+		return status;
+	}
+	// Set cell labels and handle metadata for each row
+	for (int i = 0; i < num_rows; i++) {
+		// Compute the cell label: Priority: rows[i][0] -> sel_strings[i] -> table name -> identifier -> empty
+		char* cell_utf8 = NULL;
+		if (use_rows && node->rows[i] && node->rows[i][0]) {
+			if (evaluate_to_string(node->rows[i][0], st, &cell_utf8) != 0 || !cell_utf8) {
+				cell_utf8 = _strdup("");
+				LogOnlyPrintfChar("Debug: Failed to evaluate rows[%d][0] for cell label; using empty string\n", i);
+			}
+		}
+		else if (!use_rows && node->sel_strings && node->sel_strings[i]) {
+			if (evaluate_to_string(node->sel_strings[i], st, &cell_utf8) != 0 || !cell_utf8) {
+				cell_utf8 = _strdup("");
+				LogOnlyPrintfChar("Debug: Failed to evaluate sel_strings[%d] for cell label; using empty string\n", i);
+			}
+			else {
+				LogOnlyPrintfChar("Debug: Evaluated sel_strings[%d] cell label: %s\n", i, cell_utf8);
+			}
+		}
+		else if (title_utf8 && title_utf8[0] != '\0') {
+			cell_utf8 = _strdup(title_utf8);
+			LogOnlyPrintfChar("Debug: Using table title as fallback cell label for row %d: %s\n", i, cell_utf8);
+		}
+		else if (table_id && table_id[0] != '\0') {
+			cell_utf8 = _strdup(table_id);
+			LogOnlyPrintfChar("Debug: Using table identifier as fallback cell label for row %d: %s\n", i, cell_utf8);
+		}
+		else {
+			cell_utf8 = _strdup("");
+			LogOnlyPrintfChar("Debug: No sources available for cell label for row %d; using empty string\n", i);
+		}
+		wchar_t* cell_w = cell_utf8 ? char_to_wchar(cell_utf8) : L"";
+		status = ProUITableCellLabelSet(state->dialog_name, table_id, row_ptrs[i], col0_buf, cell_w ? cell_w : L"");
+		if (cell_w) free(cell_w);
+		if (status != PRO_TK_NO_ERROR) {
+			if (cell_utf8) free(cell_utf8);
+			for (int j = 0; j < num_rows; j++) free(row_ptrs[j]);
+			free(row_ptrs);
+			if (title_utf8) free(title_utf8);
+			ProPrintfChar("Error: Failed to set cell label for %s/%s\n", row_ptrs[i], col0_buf);
+			return status;
+		}
+		// Build the row key from the evaluated cell label (for potential mapping/callback use)
+		char* map_row_key = cell_utf8 ? _strdup(cell_utf8) : _strdup("");
+		if (!map_row_key) {
+			if (cell_utf8) free(cell_utf8);
+			for (int j = 0; j < num_rows; j++) free(row_ptrs[j]);
+			free(row_ptrs);
+			if (title_utf8) free(title_utf8);
+			return PRO_TK_GENERAL_ERROR;
+		}
+		free(map_row_key); // Assuming not used further; extend if needed for app data
+		// Optional: Prepare sub-table metadata (constructed but not set in original; log for debug)
+		wchar_t* meta_w = NULL;
+		do {
+			char* sub_utf8 = NULL;
+			if (use_rows && node->rows[i] && node->rows[i][1]) {
+				if (evaluate_to_string(node->rows[i][1], st, &sub_utf8) != PRO_TK_NO_ERROR) {
+					sub_utf8 = NULL;
+					LogOnlyPrintfChar("Debug: Failed to evaluate rows[%d][1] for subtable meta; skipping\n", i);
+				}
+			}
+			else if (!use_rows && node->sel_strings && i + 1 < node->sel_string_count && node->sel_strings[i + 1]) {
+				if (evaluate_to_string(node->sel_strings[i + 1], st, &sub_utf8) != PRO_TK_NO_ERROR) {
+					sub_utf8 = NULL;
+					LogOnlyPrintfChar("Debug: Failed to evaluate sel_strings[%d] for subtable meta; skipping\n", i + 1);
+				}
+			}
+			if (sub_utf8 && sub_utf8[0] != '\0') {
+				char meta_buf_stack[256];
+				int need = snprintf(meta_buf_stack, sizeof(meta_buf_stack), "SUBTABLE=%s", sub_utf8);
+				if (need >= 0 && need < (int)sizeof(meta_buf_stack)) {
+					meta_w = char_to_wchar(meta_buf_stack);
+				}
+				else {
+					// Fallback allocate if longer than stack buf
+					size_t slen = strlen(sub_utf8);
+					size_t cap = slen + 16; // "SUBTABLE=" + null
+					char* meta_dyn = (char*)malloc(cap);
+					if (meta_dyn) {
+						snprintf(meta_dyn, cap, "SUBTABLE=%s", sub_utf8);
+						meta_w = char_to_wchar(meta_dyn);
+						free(meta_dyn);
+					}
+					else {
+						LogOnlyPrintfChar("Debug: Memory allocation failed for subtable metadata string for row %d\n", i);
+					}
+				}
+			}
+			if (sub_utf8) free(sub_utf8);
+		} while (0);
+		if (meta_w) free(meta_w); // Not used; extend if needed (e.g., ProUITableRowNoteSet)
+		if (cell_utf8) free(cell_utf8);
+	}
+	// Clean up row names array
+	for (int i = 0; i < num_rows; i++) free(row_ptrs[i]);
+	free(row_ptrs);
+	status = ProUITableSelectActionSet(state->dialog_name, table_id, TableSelectCallback, (ProAppData)st);
+	if (status != PRO_TK_NO_ERROR) {
+		ProPrintfChar("Error: Failed to set select callback for table '%s'\n", table_id);
+		if (title_utf8) free(title_utf8);
+		return status;
+	}
+	if (title_utf8) free(title_utf8);
 	return PRO_TK_NO_ERROR;
 }
 
@@ -524,6 +1391,18 @@ ProError execute_gui_command(CommandNode* node, DialogState* state, SymbolTable*
 	case COMMAND_USER_SELECT:
 		execute_user_select_param((UserSelectNode*)node->data, state, st);
 		break;
+	case COMMAND_USER_SELECT_OPTIONAL:
+		execute_user_select_optional_param((UserSelectOptionalNode*)node->data, state, st);
+		break;
+	case COMMAND_USER_SELECT_MULTIPLE:
+		execute_user_select_multiple_param((UserSelectMultipleNode*)node->data, state, st);
+		break;
+	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
+		execute_user_select_multiple_optional_param((UserSelectMultipleOptionalNode*)node->data, state, st);
+		break;
+	case COMMAND_BEGIN_TABLE:
+		execute_begin_table((TableNode*)node->data, state, st);
+		break;
 	case COMMAND_IF:
 		execute_if((IfNode*)node->data, st, block_list, state);
 		break;
@@ -535,8 +1414,62 @@ ProError execute_gui_command(CommandNode* node, DialogState* state, SymbolTable*
 	return PRO_TK_NO_ERROR;
 }
 
-ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_list)
-{
+static void scan_commands_for_needs(const Block* block, DialogState* state) {
+	if (!block || !state) return;
+
+	for (size_t i = 0; i < block->command_count; i++) {
+		CommandNode* cmd = block->commands[i];
+		if (!cmd) continue;
+
+		switch (cmd->type) {
+		case COMMAND_SHOW_PARAM: {
+			ShowParamNode* node = (ShowParamNode*)cmd->data;
+			if (node && !node->on_picture) {
+				state->needs_show_param = true;
+			}
+			break;
+		}
+		case COMMAND_CHECKBOX_PARAM: {
+			CheckboxParamNode* node = (CheckboxParamNode*)cmd->data;
+			if (node && !node->on_picture) {
+				state->needs_checkbox = true;
+			}
+			break;
+		}
+		case COMMAND_USER_INPUT_PARAM:
+			state->needs_user_input = true;
+			break;
+		case COMMAND_RADIOBUTTON_PARAM:
+			state->needs_radiobutton = true;
+			break;
+		case COMMAND_USER_SELECT:
+		case COMMAND_USER_SELECT_OPTIONAL:
+		case COMMAND_USER_SELECT_MULTIPLE:
+		case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
+			state->needs_user_select = true;
+			break;
+		case COMMAND_GLOBAL_PICTURE:
+			state->needs_picture = true;
+			break;
+		case COMMAND_IF: {
+			IfNode* if_node = (IfNode*)cmd->data;
+			if (if_node) {
+				for (size_t b = 0; b < if_node->branch_count; ++b) {
+					// Assuming IfBranch is compatible with Block for scanning
+					Block branch_block = { if_node->branches[b]->command_count, if_node->branches[b]->commands };
+					scan_commands_for_needs(&branch_block, state);
+				}
+				Block else_block = { if_node->else_command_count, if_node->else_commands };
+				scan_commands_for_needs(&else_block, state);
+			}
+			break;
+		}
+					   // Ignore other types
+		}
+	}
+}
+
+ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_list) {
 	ProError status;
 	DialogState state = { 0 };
 	int dialog_status;
@@ -551,105 +1484,115 @@ ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_l
 	strcpy_s(state.radiobutton_layout.name, sizeof(state.radiobutton_layout.name), "radiobutton_layout");
 	strcpy_s(state.checkbox_layout.name, sizeof(state.checkbox_layout.name), "checkbox_layout");
 	strcpy_s(state.user_select_layout.name, sizeof(state.user_select_layout.name), "user_select_layout");
+	strcpy_s(state.indvidual_table.name, sizeof(state.indvidual_table.name), "individual_table");
 
 	state.gui_block = gui_block;
+	state.tab_block = find_block(block_list, BLOCK_TAB);
 	state.st = st;
 
 	status = ProUIDialogCreate(state.dialog_name, NULL);
-	if (status != PRO_TK_NO_ERROR)
-	{
+	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not create dialog");
 		return status;
 	}
 
-	// Retrieve CONFIG_ELEM configuration from symbol table
+	// Retrieve CONFIG_ELEM configuration from symbol table (unchanged)
 	Variable* config_var = get_symbol(st, "CONFIG_ELEM");
-	if (config_var && config_var->type == TYPE_MAP)
-	{
+	if (config_var && config_var->type == TYPE_MAP) {
 		HashTable* config_map = config_var->data.map;
-
-		//Get width from the map
 		Variable* width_var = hash_table_lookup(config_map, "width");
-		if (width_var && width_var->type == TYPE_DOUBLE && width_var->data.double_value > 0)
-		{
+		if (width_var && width_var->type == TYPE_DOUBLE && width_var->data.double_value > 0) {
 			double width = width_var->data.double_value;
 			int width_pixels = (int)width;
 			ProUIDialogWidthSet(state.dialog_name, width_pixels);
 		}
-
-		// Get height from the map
 		Variable* height_var = hash_table_lookup(config_map, "height");
-		if (height_var && height_var->type == TYPE_DOUBLE && height_var->data.double_value > 0)
-		{
+		if (height_var && height_var->type == TYPE_DOUBLE && height_var->data.double_value > 0) {
 			double height = height_var->data.double_value;
 			int height_pixels = (int)height;
 			ProUIDialogHeightSet(state.dialog_name, height_pixels);
 		}
-
 	}
 
+	// First pass: Recursively scan for needed sections
+	scan_commands_for_needs(gui_block, &state);
+
+	// Calculate number of parameter sections
+	int num_sections = 0;
+	if (state.needs_show_param) num_sections++;
+	if (state.needs_checkbox) num_sections++;
+	if (state.needs_user_input) num_sections++;
+	if (state.needs_radiobutton) num_sections++;
+	if (state.needs_user_select) num_sections++;
+	state.num_param_sections = num_sections > 0 ? num_sections : 1;  // Fallback for no parameters
+
+	// Set main layout vertical cells based on needs
 	ProUIGridopts grid_opts_main = { 0 };
-	grid_opts_main.attach_bottom = PRO_B_FALSE;  // Disable bottom attach to allow stacking
+	grid_opts_main.attach_bottom = PRO_B_FALSE;
 	grid_opts_main.attach_top = PRO_B_TRUE;
 	grid_opts_main.attach_left = PRO_B_TRUE;
 	grid_opts_main.attach_right = PRO_B_TRUE;
-	grid_opts_main.row = 0;        // Top row
-	grid_opts_main.column = 0;
-	grid_opts_main.horz_cells = 5; // Define a visible grid
-	grid_opts_main.vert_cells = 3; // Adjusted to accommodate three stacked layouts
+	grid_opts_main.horz_cells = state.num_param_sections;
+	grid_opts_main.vert_cells = (state.needs_picture ? 1 : 0) + (num_sections > 0 ? 1 : 0);
 	grid_opts_main.vert_resize = PRO_B_TRUE;
 	grid_opts_main.horz_resize = PRO_B_TRUE;
+	grid_opts_main.left_offset = 0;  // Explicitly ensure no left gap
 
+	int dialog_row = 0;
+	grid_opts_main.row = dialog_row;
+	grid_opts_main.column = 0;
 	status = ProUIDialogLayoutAdd(state.dialog_name, state.main_layout_name, &grid_opts_main);
 	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not add main layout to dialog\n");
 		ProUIDialogDestroy(state.dialog_name);
 		return status;
 	}
-
 	status = ProUILayoutDecorate(state.dialog_name, state.main_layout_name);
 	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not add border around main layout\n");
 		ProUIDialogDestroy(state.dialog_name);
 		return status;
 	}
+	dialog_row += grid_opts_main.vert_cells;
 
+	// Table layout (consecutive row)
 	ProUIGridopts grid_opts_table = { 0 };
-	grid_opts_table.attach_bottom = PRO_B_FALSE;  // Disable bottom attach for stacking
+	grid_opts_table.attach_bottom = PRO_B_TRUE;
 	grid_opts_table.attach_top = PRO_B_TRUE;
 	grid_opts_table.attach_left = PRO_B_TRUE;
 	grid_opts_table.attach_right = PRO_B_TRUE;
-	grid_opts_table.row = 4;        // Row below main layout
+	grid_opts_table.row = dialog_row;
 	grid_opts_table.column = 0;
-	grid_opts_table.horz_cells = 5; // Define a visible grid
-	grid_opts_table.vert_cells = 3; // Consistent with main
-
+	grid_opts_table.horz_cells = state.num_param_sections;  // Align with main width
+	grid_opts_table.vert_cells = 1;
+	grid_opts_table.horz_resize = PRO_B_TRUE;
+	grid_opts_table.vert_resize = PRO_B_TRUE;
 	status = ProUIDialogLayoutAdd(state.dialog_name, state.table_layout_name, &grid_opts_table);
 	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not add table layout to dialog\n");
 		ProUIDialogDestroy(state.dialog_name);
 		return status;
 	}
-
 	status = ProUILayoutDecorate(state.dialog_name, state.table_layout_name);
 	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not add border around table layout\n");
 		ProUIDialogDestroy(state.dialog_name);
 		return status;
 	}
+	dialog_row += grid_opts_table.vert_cells;
 
+	// Confirmation layout (consecutive row)
 	ProUIGridopts pbgrid = { 0 };
-	pbgrid.attach_bottom = PRO_B_TRUE;  // Enable bottom attach for the lowest layout
+	pbgrid.attach_bottom = PRO_B_TRUE;
 	pbgrid.attach_top = PRO_B_TRUE;
 	pbgrid.attach_left = PRO_B_TRUE;
 	pbgrid.attach_right = PRO_B_TRUE;
 	pbgrid.horz_resize = PRO_B_TRUE;
-	pbgrid.vert_resize = PRO_B_FALSE;  // Optional: Limit vertical resize if buttons are fixed-height
-	pbgrid.row = 7;  // Row below table layout
+	pbgrid.vert_resize = PRO_B_FALSE;
+	pbgrid.row = dialog_row;
 	pbgrid.column = 0;
-	pbgrid.horz_cells = 5;
-	pbgrid.vert_cells = 1;  // Reduced for button row
-
+	pbgrid.horz_cells = state.num_param_sections;  // Align with main width
+	pbgrid.vert_cells = 1;
 	status = ProUIDialogLayoutAdd(state.dialog_name, state.confirmation_layout_name, &pbgrid);
 	if (status != PRO_TK_NO_ERROR) {
 		ProTKWprintf(L"Could not add pushbutton layout\n");
@@ -658,8 +1601,7 @@ ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_l
 	}
 	ProUILayoutDecorate(state.dialog_name, state.confirmation_layout_name);
 
-
-	// Add the Pushbutton to the Layout
+	// Add pushbutton (unchanged)
 	char* pushbuttonName = "ok_button";
 	ProUIGridopts subpbgrid = { 0 };
 	subpbgrid.attach_bottom = PRO_B_TRUE;
@@ -672,7 +1614,6 @@ ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_l
 	subpbgrid.column = 1;
 	subpbgrid.horz_cells = 1;
 	subpbgrid.vert_cells = 1;
-
 	status = ProUILayoutPushbuttonAdd(state.dialog_name, state.confirmation_layout_name, pushbuttonName, &subpbgrid);
 	if (status != PRO_TK_NO_ERROR) {
 		ProTKWprintf(L"Could not add pushbutton to layout\n");
@@ -680,7 +1621,6 @@ ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_l
 		return status;
 	}
 	ProUIPushbuttonTextSet(state.dialog_name, pushbuttonName, L"OK");
-
 	status = ProUIPushbuttonActivateActionSet(state.dialog_name, pushbuttonName, PushButtonAction, NULL);
 	if (status != PRO_TK_NO_ERROR) {
 		ProTKWprintf(L"Could not set pushbutton activate action\n");
@@ -688,27 +1628,88 @@ ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_l
 		return status;
 	}
 
-	// REMOVED: Premature check for REQUIRE_RADIOS and disable here.
-	// It will be handled by validate_ok_button after all components are added.
+	// Initialize parameter layouts in type order with dynamic columns
+	int current_col = 0;
+	ProUIGridopts grid_opts = { 0 };
+	grid_opts.row = state.needs_picture ? 1 : 0;  // Parameters below picture if present
+	grid_opts.attach_bottom = PRO_B_TRUE;
+	grid_opts.attach_top = PRO_B_TRUE;
+	grid_opts.attach_left = PRO_B_TRUE;
+	grid_opts.attach_right = PRO_B_TRUE;
+	grid_opts.horz_resize = PRO_B_TRUE;
+	grid_opts.vert_resize = PRO_B_TRUE;
+	if (state.needs_show_param) {
+		grid_opts.column = current_col;
+		grid_opts.left_offset = (current_col > 0 ? 20 : 0);
+		current_col++;
+		status = InitializeLayout(state.dialog_name, state.main_layout_name, state.show_param_layout.name, &grid_opts, L"Info", &state.show_param_layout.initialized);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Could not add the show param initial layout");
+			return status;
+		}
+	}
+	if (state.needs_checkbox) {
+		grid_opts.column = current_col;
+		grid_opts.left_offset = (current_col > 0 ? 20 : 0);
+		current_col++;
+		status = InitializeLayout(state.dialog_name, state.main_layout_name, state.checkbox_layout.name, &grid_opts, L"True/False", &state.checkbox_layout.initialized);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Could not add the checkbox param initial layout");
+			return status;
+		}
+	}
+	if (state.needs_user_input) {
+		grid_opts.column = current_col;
+		grid_opts.left_offset = (current_col > 0 ? 20 : 0);
+		current_col++;
+		status = InitializeLayout(state.dialog_name, state.main_layout_name, state.user_input_layout.name, &grid_opts, L"Enter Values", &state.user_input_layout.initialized);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Could not add the user input param initial layout");
+			return status;
+		}
+	}
+	if (state.needs_radiobutton) {
+		grid_opts.column = current_col;
+		grid_opts.left_offset = (current_col > 0 ? 20 : 0);
+		current_col++;
+		status = InitializeLayout(state.dialog_name, state.main_layout_name, state.radiobutton_layout.name, &grid_opts, L"Choose Options", &state.radiobutton_layout.initialized);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Could not add the radiobutton param initial layout");
+			return status;
+		}
+	}
+	if (state.needs_user_select) {
+		grid_opts.column = current_col;
+		grid_opts.left_offset = (current_col > 0 ? 20 : 0);
+		current_col++;
+		status = InitializeLayout(state.dialog_name, state.main_layout_name, state.user_select_layout.name, &grid_opts, L"Selection", &state.user_select_layout.initialized);
+		if (status != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Could not add the user select initial layout");
+			return status;
+		}
+	}
 
-	Block* tab_block = find_block(block_list, BLOCK_TAB);
-	if (!tab_block)
-	{
+	// Handle tab block and GUI commands (unchanged)
+	if (state.tab_block) {
+		for (size_t i = 0; i < state.tab_block->command_count; ++i) {
+			CommandNode* cmd = state.tab_block->commands[i];
+			execute_gui_command(cmd, &state, st);
+		}
+	}
+	else {
 		status = ProUILayoutHide(state.dialog_name, state.table_layout_name);
-		if (status != PRO_TK_NO_ERROR)
-		{
+		if (status != PRO_TK_NO_ERROR) {
 			ProGenericMsg(L"Could not hide table layout\n");
 			return status;
 		}
 	}
 
-	for (size_t i = 0; i < gui_block->command_count; i++)
-	{
+	for (size_t i = 0; i < gui_block->command_count; i++) {
 		CommandNode* cmd = gui_block->commands[i];
 		execute_gui_command(cmd, &state, st);
 	}
 
-	// Validate OK state after all components are added
+	// Validate OK button and set actions (unchanged)
 	status = validate_ok_button(state.dialog_name, st);
 	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Error: Initial validation of OK button failed");
@@ -718,21 +1719,17 @@ ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_l
 	ProUIDialogPostmanagenotifyActionSet(state.dialog_name, MyPostManageCallback, st);
 	ProUIDialogCloseActionSet(state.dialog_name, CloseCallback, NULL);
 
-	// Make the active dialog/state globally available to callbacks
-	g_active_state = &state;   // << NEW
-	g_active_st = st;       // << NEW
-
+	g_active_state = &state;
+	g_active_st = st;
 
 	status = ProUIDialogActivate(state.dialog_name, &dialog_status);
-	if (status != PRO_TK_NO_ERROR)
-	{
+	if (status != PRO_TK_NO_ERROR) {
 		ProGenericMsg(L"Could not activate dialog");
 		return status;
 	}
 
 	ProUIDialogDestroy(state.dialog_name);
 	return PRO_TK_NO_ERROR;
-
 }
 
 void execute_config_elem(CommandData* config, SymbolTable* st, BlockList* block_list)
@@ -971,7 +1968,6 @@ ProError execute_invalidate_param(InvalidateParamNode* node, SymbolTable* st) {
 	return 0;
 }
 
-
 ProError execute_command(CommandNode* node, SymbolTable* st, BlockList* block_list)
 {
 	switch (node->type)
@@ -1000,6 +1996,7 @@ ProError execute_assignment(AssignmentNode* node, SymbolTable* st, BlockList* bl
 {
 	(void)block_list;
 
+
 	if (!node || !node->lhs || node->lhs->type != EXPR_VARIABLE_REF) {
 		ProPrintfChar("Error: Invalid assignment LHS (must be variable ref)\n");
 		return PRO_TK_GENERAL_ERROR;
@@ -1017,15 +2014,14 @@ ProError execute_assignment(AssignmentNode* node, SymbolTable* st, BlockList* bl
 		return PRO_TK_GENERAL_ERROR;
 	}
 
-	/* STRING path: use evaluate_to_string so tokens like AdjShelf2.gif (no quotes)
-	   are treated as literal strings and + does concatenation, same as SUB_PICTURE. */
+	// STRING path: use evaluate_to_string so tokens like AdjShelf2.gif (no quotes) are treated as literal strings and + does concatenation, same as SUB_PICTURE. 
 	if (dst->type == TYPE_STRING) {
 		char* sval = NULL;
 		if (evaluate_to_string(node->rhs, st, &sval) != 0 || !sval) {
 			ProPrintfChar("Error: RHS does not evaluate to a string for '%s'\n", lhs_name);
 			return PRO_TK_GENERAL_ERROR;
 		}
-		/* replace previous string */
+		// replace previous string 
 		if (dst->data.string_value) {
 			free(dst->data.string_value);
 		}
@@ -1033,7 +2029,7 @@ ProError execute_assignment(AssignmentNode* node, SymbolTable* st, BlockList* bl
 		return PRO_TK_NO_ERROR;
 	}
 
-	/* Non-string path: use general evaluator and coerce as needed. */
+	// Non-string path: use general evaluator and coerce as needed. 
 	Variable* rval = NULL;
 	if (evaluate_expression(node->rhs, st, &rval) != 0 || !rval) {
 		ProPrintfChar("Error: Failed to evaluate RHS for assignment to '%s'\n", lhs_name);
@@ -1092,88 +2088,272 @@ ProError execute_assignment(AssignmentNode* node, SymbolTable* st, BlockList* bl
 	return status;
 }
 
-ProError execute_if(IfNode* node, SymbolTable* st, BlockList* block_list, DialogState* state) {
-	if (!node) return PRO_TK_BAD_INPUTS;
+ProError apply_ui_gate_to_block(Block* blk, ExecContext* ctx, ProBoolean enabled)
+{
+	if (!blk || !ctx || !ctx->st) return PRO_TK_NO_ERROR;
 
-	// 0) GUI: pre-create all USER_SELECTs that live inside this IF (all branches)
-	if (state != NULL) {
-		(void)prepare_if_user_selects(node, state, st);
+	char* dialog = NULL;
+	if (ctx->ui && ctx->ui->dialog_name) dialog = ctx->ui->dialog_name;
 
-		// Gate: disable all branches, then enable the active one now
-		// First disable all branch blocks
+	ProBoolean required = enabled;
+
+	for (size_t i = 0; i < blk->command_count; ++i) {
+		CommandNode* cmd = blk->commands[i];
+		if (!cmd) continue;
+
+		switch (cmd->type) {
+		case COMMAND_USER_SELECT:
+		{
+			UserSelectNode* un = (UserSelectNode*)cmd->data;
+			if (un && un->reference) (void)set_user_select_enabled(dialog, ctx->st, un->reference, enabled, required);
+			break;
+		}
+		case COMMAND_USER_SELECT_OPTIONAL:
+		{
+			UserSelectOptionalNode* un = (UserSelectOptionalNode*)cmd->data;
+			if (un && un->reference) (void)set_user_select_optional_enabled(dialog, ctx->st, un->reference, enabled, required);
+			break;
+		}
+		case COMMAND_USER_SELECT_MULTIPLE:
+		{
+			UserSelectMultipleNode* mn = (UserSelectMultipleNode*)cmd->data;
+			if (mn && mn->array) (void)set_user_select_enabled(dialog, ctx->st, mn->array, enabled, required);
+			break;
+		}
+		case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
+		{
+			UserSelectMultipleOptionalNode* mn = (UserSelectMultipleOptionalNode*)cmd->data;
+			if (mn && mn->array) (void)set_user_select_optional_enabled(dialog, ctx->st, mn->array, enabled, required);
+			break;
+		}
+		default:
+			break; // Other components are created only when their branch executes 
+		}
+	}
+	return PRO_TK_NO_ERROR;
+}
+
+// Re-evaluate IF conditions and only gate UI (no command execution). 
+ProError recompute_if_gates_only(Block* blk, ExecContext* ctx)
+{
+	if (!blk || !ctx || !ctx->st) return PRO_TK_NO_ERROR;
+
+	for (size_t i = 0; i < blk->command_count; ++i) {
+		CommandNode* cmd = blk->commands[i];
+		if (!cmd) continue;
+
+		if (cmd->type == COMMAND_IF) {
+			IfNode* node = (IfNode*)cmd->data;
+
+			// 0) Turn everything OFF 
+			for (size_t b = 0; b < node->branch_count; ++b) {
+				Block off = { 0 };
+				off.command_count = node->branches[b]->command_count;
+				off.commands = node->branches[b]->commands;
+				(void)apply_ui_gate_to_block(&off, ctx, PRO_B_FALSE);
+				
+			}
+			if (node->else_command_count > 0) {
+				Block off_else = { 0 };
+				off_else.command_count = node->else_command_count;
+				off_else.commands = node->else_commands;
+				(void)apply_ui_gate_to_block(&off_else, ctx, PRO_B_FALSE);
+			}
+
+			// 1) Find winning branch 
+			size_t winning = (size_t)-1;
+			for (size_t b = 0; b < node->branch_count; ++b) {
+				Variable* cond_val = NULL;
+				int est = evaluate_expression(node->branches[b]->condition, ctx->st, &cond_val);
+				if (est != 0 || !cond_val) { continue; }
+
+				bool truth = false;
+				if (cond_val->type == TYPE_BOOL || cond_val->type == TYPE_INTEGER)
+					truth = (cond_val->data.int_value != 0);
+				else if (cond_val->type == TYPE_DOUBLE)
+					truth = (cond_val->data.double_value != 0.0);
+
+				free_variable(cond_val);
+				if (truth) { winning = b; break; }
+			}
+
+			// 2) Gate ON the winner (or ELSE) and recurse into that block 
+			if (winning != (size_t)-1) {
+				Block on = { 0 };
+				on.command_count = node->branches[winning]->command_count;
+				on.commands = node->branches[winning]->commands;
+				(void)apply_ui_gate_to_block(&on, ctx, PRO_B_TRUE);
+				(void)recompute_if_gates_only(&on, ctx); // nested IFs 
+			}
+			else if (node->else_command_count > 0) {
+				Block on_else = { 0 };
+				on_else.command_count = node->else_command_count;
+				on_else.commands = node->else_commands;
+				(void)apply_ui_gate_to_block(&on_else, ctx, PRO_B_TRUE);
+				(void)recompute_if_gates_only(&on_else, ctx);
+			}
+
+			// Continue scanning peers after this IF 
+		}
+	}
+	return PRO_TK_NO_ERROR;
+}
+
+ProError exec_command_in_context(CommandNode* node, ExecContext* ctx)
+{
+	if (!node || !ctx || !ctx->st) return PRO_TK_BAD_INPUTS;
+
+	switch (node->type)
+	{
+	case COMMAND_IF:
+		return execute_if_ctx((IfNode*)node->data, ctx);
+
+		// --- GUI-aware commands 
+	case COMMAND_SHOW_PARAM:
+		return (ctx->ui ? execute_show_param((ShowParamNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_CHECKBOX_PARAM:
+		return (ctx->ui ? execute_checkbox_param((CheckboxParamNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_USER_INPUT_PARAM:
+		return (ctx->ui ? execute_user_input_param((UserInputParamNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_RADIOBUTTON_PARAM:
+		return (ctx->ui ? execute_radiobutton_param((RadioButtonParamNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_USER_SELECT:
+		return (ctx->ui ? execute_user_select_param((UserSelectNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_USER_SELECT_OPTIONAL:
+		return (ctx->ui ? execute_user_select_optional_param((UserSelectOptionalNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_USER_SELECT_MULTIPLE:
+		return(ctx->ui ? execute_user_select_multiple_param((UserSelectMultipleNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
+		return (ctx->ui ? execute_user_select_multiple_optional_param((UserSelectMultipleOptionalNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_GLOBAL_PICTURE:
+		return (ctx->ui ? execute_global_picture((GlobalPictureNode*)node->data, ctx->ui, ctx->st)
+			: execute_command(node, ctx->st, ctx->block_list));
+
+	case COMMAND_SUB_PICTURE:
+		return execute_sub_picture((SubPictureNode*)node->data, ctx->st);
+
+		// --- non-GUI core commands 
+	case COMMAND_DECLARE_VARIABLE:
+		return execute_declare_variable((DeclareVariableNode*)node->data, ctx->st);
+
+	case COMMAND_ASSIGNMENT:
+		return execute_assignment((AssignmentNode*)node->data, ctx->st, ctx->block_list);
+
+	default:
+		// Fallback to your existing dispatcher so new commands keep working 
+		return execute_command(node, ctx->st, ctx->block_list);
+	}
+}
+
+ProError execute_if_ctx(IfNode* node, ExecContext* ctx)
+{
+	if (!node || !ctx || !ctx->st) return PRO_TK_BAD_INPUTS;
+
+	// 0) GUI pre-pass: ensure USER_SELECT controls exist so gating can work. We keep the scope tight: only for this IF subtree. 
+	if (ctx->ui) {
+		(void)prepare_if_user_selects(node, ctx->ui, ctx->st); // pre-create once 
+		// Proactively gate everything OFF; the winning branch will be enabled once found. 
 		for (size_t b = 0; b < node->branch_count; ++b) {
 			Block temp = { 0 };
 			temp.command_count = node->branches[b]->command_count;
 			temp.commands = node->branches[b]->commands;
-			toggle_user_selects_in_block(&temp, st, state->dialog_name, PRO_B_FALSE);
+			(void)apply_ui_gate_to_block(&temp, ctx, PRO_B_FALSE);
 		}
 		if (node->else_command_count > 0) {
 			Block temp = { 0 };
 			temp.command_count = node->else_command_count;
 			temp.commands = node->else_commands;
-			toggle_user_selects_in_block(&temp, st, state->dialog_name, PRO_B_FALSE);
+			(void)apply_ui_gate_to_block(&temp, ctx, PRO_B_FALSE);
 		}
 	}
 
-	// 1) Evaluate IF as before and execute the first true branch (or ELSE)
-	bool executed = false;
-	for (size_t b = 0; b < node->branch_count; b++) {
-		IfBranch* branch = node->branches[b];
+	// 1) Find the first true branch (single-pass, no duplicate evaluation). 
+	size_t winning = (size_t)-1;
+	for (size_t b = 0; b < node->branch_count; ++b) {
 		Variable* cond_val = NULL;
-		int status = evaluate_expression(branch->condition, st, &cond_val);
-		if (status != 0 || !cond_val) {
-			ProGenericMsg(L"Error: Failed to evaluate IF condition");
+		int est = evaluate_expression(node->branches[b]->condition, ctx->st, &cond_val);
+		if (est != 0 || !cond_val) {
+			ProGenericMsg(L"Error: IF condition evaluation failed");
 			return PRO_TK_GENERAL_ERROR;
 		}
-		bool cond_true = false;
-		if (cond_val->type == TYPE_BOOL)         cond_true = (cond_val->data.int_value != 0);
-		else if (cond_val->type == TYPE_INTEGER) cond_true = (cond_val->data.int_value != 0);
-		else if (cond_val->type == TYPE_DOUBLE)  cond_true = (cond_val->data.double_value != 0.0);
+
+		// Accept bool or numeric truthiness (unchanged semantics). 
+		bool truth = false;
+		if (cond_val->type == TYPE_BOOL || cond_val->type == TYPE_INTEGER) {
+			truth = (cond_val->data.int_value != 0);
+		}
+		else if (cond_val->type == TYPE_DOUBLE) {
+			truth = (cond_val->data.double_value != 0.0);
+		}
 		else {
 			free_variable(cond_val);
-			ProGenericMsg(L"Error: IF condition must evaluate to bool or numeric");
+			ProGenericMsg(L"Error: IF condition must be bool or numeric");
 			return PRO_TK_GENERAL_ERROR;
 		}
 		free_variable(cond_val);
 
-		if (cond_true) {
-			// Gate: enable this true branch now (if in GUI context)
-			if (state != NULL) {
-				Block temp = { 0 };
-				temp.command_count = branch->command_count;
-				temp.commands = branch->commands;
-				toggle_user_selects_in_block(&temp, st, state->dialog_name, PRO_B_TRUE);
-			}
-
-			for (size_t c = 0; c < branch->command_count; c++) {
-				ProError cmd_status = (state != NULL)
-					? execute_gui_command(branch->commands[c], state, st)
-					: execute_command(branch->commands[c], st, block_list);
-				if (cmd_status != PRO_TK_NO_ERROR) return cmd_status;
-			}
-			executed = true;
-			break;  // Stop after first true branch
-		}
+		if (truth) { winning = b; break; }
 	}
 
-	if (!executed && node->else_command_count > 0) {
-		// Gate: enable ELSE branch when nothing matched (GUI context)
-		if (state != NULL) {
+	// 2) Gate ON the winning branch (or ELSE), then execute only that block. 
+	if (winning != (size_t)-1) {
+		IfBranch* br = node->branches[winning];
+
+		if (ctx->ui) {
+			Block temp = { 0 };
+			temp.command_count = br->command_count;
+			temp.commands = br->commands;
+			(void)apply_ui_gate_to_block(&temp, ctx, PRO_B_TRUE);
+		}
+
+		for (size_t i = 0; i < br->command_count; ++i) {
+			ProError s = exec_command_in_context(br->commands[i], ctx);
+			if (s != PRO_TK_NO_ERROR) return s;
+		}
+		return PRO_TK_NO_ERROR;
+	}
+
+	// ELSE branch 
+	if (node->else_command_count > 0) {
+		if (ctx->ui) {
 			Block temp = { 0 };
 			temp.command_count = node->else_command_count;
 			temp.commands = node->else_commands;
-			toggle_user_selects_in_block(&temp, st, state->dialog_name, PRO_B_TRUE);
+			(void)apply_ui_gate_to_block(&temp, ctx, PRO_B_TRUE);
 		}
 
-		for (size_t c = 0; c < node->else_command_count; c++) {
-			ProError cmd_status = (state != NULL)
-				? execute_gui_command(node->else_commands[c], state, st)
-				: execute_command(node->else_commands[c], st, block_list);
-			if (cmd_status != PRO_TK_NO_ERROR) return cmd_status;
+		for (size_t i = 0; i < node->else_command_count; ++i) {
+			ProError s = exec_command_in_context(node->else_commands[i], ctx);
+			if (s != PRO_TK_NO_ERROR) return s;
 		}
 	}
 
 	return PRO_TK_NO_ERROR;
+}
+
+ProError execute_if(IfNode* node, SymbolTable* st, BlockList* block_list, DialogState* state)
+{
+	ExecContext ctx = { 0 };
+	ctx.st = st;
+	ctx.block_list = block_list;
+	ctx.ui = state;
+	return execute_if_ctx(node, &ctx);
 }
 
 // Function to execute all commands in the ASM block
@@ -1188,7 +2368,6 @@ void execute_asm_block(Block* asm_block, SymbolTable* st, BlockList* block_list)
 }
 
 
-
 /*=================================================*\
 *
 * CORE GUI LOGIC FUNCTIONALITY
@@ -1198,19 +2377,26 @@ void execute_asm_block(Block* asm_block, SymbolTable* st, BlockList* block_list)
 \*=================================================*/
 void EPA_ReactiveRefresh(void)
 {
-	if (!g_active_state || !g_active_state->dialog_name || !g_active_st || !g_active_state->gui_block)
+	if (!g_active_state || !g_active_state->dialog_name || !g_active_st || !g_active_state->gui_block || !g_active_state->tab_block)
 		return;
+
 
 	// 1) Rebuild SUB_PICTURES for the current truth of all IFs
 	remove_symbol(g_active_st, "SUB_PICTURES");   // clear prior set
-	(void)rebuild_sub_pictures_only(g_active_state->gui_block, g_active_st);
+	rebuild_sub_pictures_only(g_active_state->gui_block, g_active_st);
 
 	// 2) Redraw images (GLOBAL + new SUB_PICTURES)
-	(void)addpicture(g_active_state->dialog_name, "draw_area", (ProAppData)g_active_st);
+	addpicture(g_active_state->dialog_name, "draw_area", (ProAppData)g_active_st);
 
-	// 4) Enable/disable USER_SELECT buttons based on IF truth right now
-	toggle_user_selects_in_block(g_active_state->gui_block, g_active_st, g_active_state->dialog_name, PRO_B_TRUE);
+	ExecContext ctx = { 0 };
+	ctx.st = g_active_st;
+	ctx.ui = g_active_state;
+	recompute_if_gates_only(g_active_state->gui_block, &ctx);
+
+
 
 	// 5) Re-validate OK button (you already centralize required checks here)
-	(void)validate_ok_button(g_active_state->dialog_name, g_active_st);  // :contentReference[oaicite:8]{index=8}
+	validate_ok_button(g_active_state->dialog_name, g_active_st);  
+
+
 }
