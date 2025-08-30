@@ -33,6 +33,18 @@ HashTable* create_hash_table(size_t initial_size)
 	}
 	ht->size = initial_size;
 	ht->count = 0;
+
+	// New: Initialize key_order similarly to SymbolTable
+	ht->key_order = malloc(initial_size * sizeof(char*));
+	if (!ht->key_order)
+	{
+		free(ht->buckets);
+		free(ht);
+		return NULL;
+	}
+	ht->key_count = 0;
+	ht->key_capacity = initial_size;
+
 	return ht;
 }
 
@@ -45,18 +57,18 @@ void hash_table_insert(HashTable* ht, const char* key, Variable* value)
 	size_t index = hash % ht->size;
 	HashEntry* entry = ht->buckets[index];
 
-	//Check if key already exists
+	// Check if key already exists
 	while (entry != NULL)
 	{
 		if (strcmp(entry->key, key) == 0)
 		{
-			// key found, update value (old value must be freed by caller if needed
+			// Key found, update value (old value must be freed by caller if needed)
 			entry->value = value;
 			return;
 		}
 		entry = entry->next;
 	}
-	// key not found, create new entry
+	// Key not found, create new entry
 	HashEntry* new_entry = malloc(sizeof(HashEntry));
 	if (!new_entry) return;
 
@@ -71,6 +83,22 @@ void hash_table_insert(HashTable* ht, const char* key, Variable* value)
 	new_entry->next = ht->buckets[index];
 	ht->buckets[index] = new_entry;
 	ht->count++;
+
+	// New: Add to key_order only if new key
+	if (ht->key_count >= ht->key_capacity) {
+		size_t new_capacity = ht->key_capacity * 2;
+		char** new_key_order = realloc(ht->key_order, new_capacity * sizeof(char*));
+		if (!new_key_order) {
+			// Non-fatal: Proceed without updating order
+			return;
+		}
+		ht->key_order = new_key_order;
+		ht->key_capacity = new_capacity;
+	}
+	ht->key_order[ht->key_count] = _strdup(key);
+	if (ht->key_order[ht->key_count]) {
+		ht->key_count++;
+	}
 }
 
 // Look up a value by key in the hash table
@@ -119,6 +147,18 @@ void hash_table_remove(HashTable* ht, const char* key)
 			free_variable(entry->value);
 			free(entry);
 			ht->count--;
+
+			// New: Remove from key_order
+			for (size_t i = 0; i < ht->key_count; i++) {
+				if (strcmp(ht->key_order[i], key) == 0) {
+					free(ht->key_order[i]);
+					for (size_t j = i; j < ht->key_count - 1; j++) {
+						ht->key_order[j] = ht->key_order[j + 1];
+					}
+					ht->key_count--;
+					break;
+				}
+			}
 			return;
 		}
 		prev = entry;
@@ -181,17 +221,23 @@ void free_hash_table(HashTable* ht)
 		}
 	}
 	free(ht->buckets);
+
+	// New: Free key_order
+	if (ht->key_order) {
+		for (size_t i = 0; i < ht->key_count; i++) {
+			free(ht->key_order[i]);
+		}
+		free(ht->key_order);
+	}
 	free(ht);
 }
 
-
 void free_variable(Variable* var) {
-	if (var == NULL) {
-		return;
-	}
+	if (var == NULL) return;
 
 	switch (var->type) {
 	case TYPE_STRING:
+	case TYPE_SUBTABLE:  /* free underlying string for subtable refs */
 		if (var->data.string_value != NULL) {
 			free(var->data.string_value);
 		}
@@ -199,10 +245,8 @@ void free_variable(Variable* var) {
 
 	case TYPE_REFERENCE:
 		if (var->data.reference.reference_value) {
-			// Cast void* to ProSelection for safe freeing
 			ProSelection sel = (ProSelection)var->data.reference.reference_value;
 			ProSelectionFree(&sel);
-			// Assign back (typically NULL after free) with reverse cast
 			var->data.reference.reference_value = (void*)sel;
 		}
 		break;
@@ -224,25 +268,23 @@ void free_variable(Variable* var) {
 
 	case TYPE_MAP:
 		if (var->data.map != NULL) {
-			// Assuming hash_table_free frees keys (if strdup'ed) and calls freer on values.
 			free_hash_table(var->data.map);
 		}
 		break;
 
 	case TYPE_STRUCTURE:
 		if (var->data.structure != NULL) {
-			// Similar to map: frees member names (keys) and values.
 			free_hash_table(var->data.structure);
 		}
 		break;
 
-		// Simple types like TYPE_INTEGER, TYPE_DOUBLE, TYPE_BOOL require no extra freeing.
 	default:
 		break;
 	}
 
 	free(var);
 }
+
 // Create a new Symbol Table
 SymbolTable* create_symbol_table(void) {
 	SymbolTable* st = malloc(sizeof(SymbolTable));
@@ -352,7 +394,6 @@ static char* get_indent(int indent) {
 	return indent_str;
 }
 
-// Helper function to print a Variable based on its type
 static void print_variable(const Variable* var, int indent) {
 	if (!var) {
 		LogOnlyPrintfChar("%sValue: NULL\n", get_indent(indent));
@@ -363,45 +404,75 @@ static void print_variable(const Variable* var, int indent) {
 		LogOnlyPrintfChar("%sType: INTEGER, Value: %d\n", get_indent(indent), var->data.int_value);
 		break;
 	case TYPE_DOUBLE:
-		LogOnlyPrintfChar("%sType: DOUBLE, Value: %.2f\n", get_indent(indent), var->data.double_value);
+		// Revised: Use %.15g for higher precision to avoid rounding in output
+		LogOnlyPrintfChar("%sType: DOUBLE, Value: %.15g\n", get_indent(indent), var->data.double_value);
 		break;
 	case TYPE_STRING:
-		LogOnlyPrintfChar("%sType: STRING, Value: %s\n", get_indent(indent), var->data.string_value ? var->data.string_value : "NULL");
+		LogOnlyPrintfChar("%sType: STRING, Value: %s\n", get_indent(indent),
+			var->data.string_value ? var->data.string_value : "NULL");
+		break;
+	case TYPE_SUBTABLE:
+		LogOnlyPrintfChar("%sType: SUBTABLE, Target: %s\n", get_indent(indent),
+			var->data.string_value ? var->data.string_value : "NULL");
 		break;
 	case TYPE_REFERENCE:
-		LogOnlyPrintfChar("%sType: REFERENCE, Allowed Types Count: %zu\n", get_indent(indent), var->data.reference.allowed_count);
+		LogOnlyPrintfChar("%sType: REFERENCE, Allowed Types Count: %zu\n",
+			get_indent(indent), var->data.reference.allowed_count);
 		for (size_t i = 0; i < var->data.reference.allowed_count; i++) {
-			LogOnlyPrintfChar("%s  Allowed Type %zu: %d\n", get_indent(indent + 1), i, var->data.reference.allowed_types[i]);
+			LogOnlyPrintfChar("%s  Allowed Type %zu: %d\n", get_indent(indent + 1), i,
+				var->data.reference.allowed_types[i]);
 		}
 		break;
-	case TYPE_MAP: {
-		LogOnlyPrintfChar("%sType: MAP\n", get_indent(indent));
-		HashTable* map = var->data.map;
-		if (!map) {
-			LogOnlyPrintfChar("%sMap is empty or not initialized\n", get_indent(indent + 1));
-			return;
-		}
-		for (size_t i = 0; i < map->size; i++) {
-			HashEntry* entry = map->buckets[i];
-			while (entry != NULL) {
-				LogOnlyPrintfChar("%sKey: %s\n", get_indent(indent + 1), entry->key);
-				print_variable(entry->value, indent + 2);
-				entry = entry->next;
-			}
-		}
+	case TYPE_FILE_DESCRIPTOR:  // New case for file descriptors
+		LogOnlyPrintfChar("%sType: FILE_DESCRIPTOR, Value: %s\n", get_indent(indent),
+			var->data.file_descriptor ? "Open file handle" : "NULL");
 		break;
-	}
 	case TYPE_ARRAY: {
 		LogOnlyPrintfChar("%sType: ARRAY\n", get_indent(indent));
-		ArrayData array = var->data.array;  // Both are now of type ArrayData
+		ArrayData array = var->data.array;
 		for (size_t j = 0; j < array.size; j++) {
 			LogOnlyPrintfChar("%sElement %zu:\n", get_indent(indent + 1), j);
 			print_variable(array.elements[j], indent + 2);
 		}
 		break;
 	}
+	case TYPE_MAP: {
+		LogOnlyPrintfChar("%sType: MAP\n", get_indent(indent));
+		HashTable* map = var->data.map;
+		if (!map || map->key_count == 0) {
+			LogOnlyPrintfChar("%sMap is empty or not initialized\n", get_indent(indent + 1));
+			return;
+		}
+		// New: Iterate key_order for insertion-order printing
+		for (size_t i = 0; i < map->key_count; i++) {
+			const char* key = map->key_order[i];
+			Variable* value = hash_table_lookup(map, key);
+			if (value) {
+				LogOnlyPrintfChar("%sKey: %s\n", get_indent(indent + 1), key);
+				print_variable(value, indent + 2);
+			}
+		}
+		break;
+	}
+	case TYPE_STRUCTURE: {  // New case for structures, treated similarly to maps
+		LogOnlyPrintfChar("%sType: STRUCTURE\n", get_indent(indent));
+		HashTable* structure = var->data.structure;
+		if (!structure || structure->key_count == 0) {
+			LogOnlyPrintfChar("%sStructure is empty or not initialized\n", get_indent(indent + 1));
+			return;
+		}
+		for (size_t i = 0; i < structure->key_count; i++) {
+			const char* key = structure->key_order[i];
+			Variable* value = hash_table_lookup(structure, key);
+			if (value) {
+				LogOnlyPrintfChar("%sField: %s\n", get_indent(indent + 1), key);
+				print_variable(value, indent + 2);
+			}
+		}
+		break;
+	}
 	default:
-		ProPrintfChar("%sType: UNKNOWN\n", get_indent(indent));
+		LogOnlyPrintfChar("%sType: UNKNOWN\n", get_indent(indent));
 		break;
 	}
 }
