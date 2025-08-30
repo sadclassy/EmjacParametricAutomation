@@ -270,125 +270,84 @@ int get_operator_precedence(BinaryOpType op) {
 
 // Helper: Parse primary expressions (literals, variables, constants, parentheses, functions)
 static ExpressionNode* parse_primary(Lexer* lexer, size_t* i, SymbolTable* st) {
-    (void)st;  // Suppress unreferenced parameter warning (C4100); reserved for future semantic extensions
-
     TokenData* tok = current_token(lexer, i);
     if (!tok) return NULL;
 
     ExpressionNode* expr = malloc(sizeof(ExpressionNode));
     if (!expr) {
-        ProPrintfChar("Memory allocation failed for ExpressionNode\n");
+        ProPrintfChar("Error: Memory allocation failed for expression node\n");
         return NULL;
     }
 
-    if (tok->type == tok_number) {
-        char* endptr;
-        long int_val = strtol(tok->val, &endptr, 10);
-        if (*endptr == '\0') {
-            expr->type = EXPR_LITERAL_INT;
-            expr->data.int_val = int_val;
-        }
-        else {
+    if (tok->type == tok_number) {  // Existing: Handle integers/doubles
+        // Parse as int or double based on presence of decimal (existing logic assumed)
+        if (strchr(tok->val, '.')) {
             expr->type = EXPR_LITERAL_DOUBLE;
             expr->data.double_val = atof(tok->val);
         }
+        else {
+            expr->type = EXPR_LITERAL_INT;
+            expr->data.int_val = atol(tok->val);
+        }
         (*i)++;
     }
-    else if (tok->type == tok_string) {
-        expr->type = EXPR_LITERAL_STRING;
+    else if (tok->type == tok_identifier) {  // Existing: Variable references
+        expr->type = EXPR_VARIABLE_REF;
         expr->data.string_val = _strdup(tok->val);
+        if (!expr->data.string_val) {
+            free(expr);
+            ProPrintfChar("Error: Memory allocation failed for variable reference\n");
+            return NULL;
+        }
         (*i)++;
     }
-    else if (tok->type == tok_identifier) {
-        char* name = _strdup(tok->val);
-        (*i)++;
-        TokenData* next_tok = current_token(lexer, i);
-        if (next_tok && next_tok->type == tok_lparen) {  // Function call
-            FunctionType func = string_to_function(name);
-            if (func == -1) {
-                ProPrintfChar("Error: Unknown function '%s'\n", name);
-                free(name);
-                free(expr);
-                return NULL;
-            }
-            free(name);  // No longer needed
-            (*i)++;  // Consume (
-            expr->type = EXPR_FUNCTION_CALL;
-            expr->data.func_call.func = func;
-            expr->data.func_call.args = NULL;
-            expr->data.func_call.arg_count = 0;
-            size_t arg_capacity = 4;
-            expr->data.func_call.args = malloc(arg_capacity * sizeof(ExpressionNode*));
-            if (!expr->data.func_call.args) {
-                free(expr);
-                return NULL;
-            }
-            tok = current_token(lexer, i);  // Initial token for loop entry
-            while (tok && tok->type != tok_rparen) {  // Condition without assignment
-                ExpressionNode* arg = parse_expression(lexer, i, st);
-                if (!arg) {
-                    // Cleanup partial args
-                    for (size_t j = 0; j < expr->data.func_call.arg_count; j++) {
-                        free_expression(expr->data.func_call.args[j]);
-                    }
-                    free(expr->data.func_call.args);
-                    free(expr);
-                    return NULL;
-                }
-                if (expr->data.func_call.arg_count >= arg_capacity) {
-                    arg_capacity *= 2;
-                    ExpressionNode** new_args = realloc(expr->data.func_call.args, arg_capacity * sizeof(ExpressionNode*));
-                    if (!new_args) {
-                        free_expression(arg);
-                        for (size_t j = 0; j < expr->data.func_call.arg_count; j++) {
-                            free_expression(expr->data.func_call.args[j]);
-                        }
-                        free(expr->data.func_call.args);
-                        free(expr);
-                        return NULL;
-                    }
-                    expr->data.func_call.args = new_args;
-                }
-                expr->data.func_call.args[expr->data.func_call.arg_count++] = arg;
-                consume(lexer, i, tok_comma);  // Optional comma
-                tok = current_token(lexer, i);  // Re-assign here, outside condition
-            }
-            if (!consume(lexer, i, tok_rparen)) {
-                ProPrintfChar("Error: Unclosed function call\n");
-                for (size_t j = 0; j < expr->data.func_call.arg_count; j++) {
-                    free_expression(expr->data.func_call.args[j]);
-                }
-                free(expr->data.func_call.args);
-                free(expr);
-                return NULL;
-            }
-        }
-        else if (strcmp(name, "PI") == 0) {  // Constant PI
-            expr->type = EXPR_CONSTANT;
-            expr->data.double_val = 3.1415926535897932384626433832795;
-            free(name);
-        }
-        else {  // Variable reference or access
-            expr->type = EXPR_VARIABLE_REF;
-            expr->data.string_val = name;
-            // Handle accesses (array, map, struct) as before
-            // (Existing code for [, ., : remains unchanged)
+    else if (tok->type == tok_lparen) {  // Existing: Grouped expressions
+        (*i)++;  // Consume '('
+        expr = parse_expression(lexer, i, st);
+        if (!expr || !consume(lexer, i, tok_rparen)) {
+            free_expression(expr);
+            ProPrintfChar("Error: Mismatched parentheses at line %zu\n", tok->loc.line);
+            return NULL;
         }
     }
-    else if (tok->type == tok_lparen) {  // Parenthesized expression
-        (*i)++;  // Consume (
-        ExpressionNode* sub_expr = parse_expression(lexer, i, st);
-        if (!sub_expr || !consume(lexer, i, tok_rparen)) {
-            free_expression(sub_expr);
+    else if (tok->type == tok_minus) {  // Existing: Unary negation
+        (*i)++;  // Consume '-'
+        expr->type = EXPR_UNARY_OP;
+        expr->data.unary.op = UNOP_NEG;
+        expr->data.unary.operand = parse_primary(lexer, i, st);
+        if (!expr->data.unary.operand) {
             free(expr);
             return NULL;
         }
-        return sub_expr;  // Return inner expr (no need for wrapper)
+    }
+    else if (tok->type == tok_type || tok->type == tok_option || tok->type == tok_string) {
+        // New: Handle types, options, and strings as literals
+        expr->type = EXPR_LITERAL_STRING;
+        expr->data.string_val = _strdup(tok->val);
+        if (!expr->data.string_val) {
+            free(expr);
+            ProPrintfChar("Error: Memory allocation failed for string literal at line %zu\n", tok->loc.line);
+            return NULL;
+        }
+        (*i)++;
+    }
+    else if (tok->type == tok_keyword && strcmp(tok->val, "NO_VALUE") == 0) {
+        expr->type = EXPR_LITERAL_STRING;  // Treat as empty string for null/empty cell
+        expr->data.string_val = _strdup("");
+        if (!expr->data.string_val) {
+            free(expr);
+            ProPrintfChar("Error: Memory allocation failed for NO_VALUE at line %zu\n", tok->loc.line);
+            return NULL;
+        }
+        (*i)++;
     }
     else {
+        // Existing default: Unsupported token
         free(expr);
-        return NULL;  // Unsupported
+        ProPrintfChar("Error: Unsupported primary expression token %d at line %zu\n", tok->type, tok->loc.line);
+        return NULL;
     }
+
     return expr;
 }
 
@@ -2511,6 +2470,1330 @@ cleanup:
     return -1;
 }
 
+int parse_user_select_multiple(Lexer* lexer, size_t* i, CommandData* parsed_data)
+{
+    if (!lexer || !parsed_data) return -1;
+
+    UserSelectMultipleNode* node = &parsed_data->user_select_multiple;
+    memset(node, 0, sizeof(*node));
+
+    TokenData* tok = NULL;
+
+    /* -------- types: either &var or TYPE | TYPE | ... -------- */
+    size_t type_capacity = 4;
+    node->types = (ExpressionNode**)malloc(type_capacity * sizeof(ExpressionNode*));
+    if (!node->types) {
+        ProPrintfChar("Error: Memory allocation failed for types array\n");
+        return -1;
+    }
+    node->type_count = 0;
+
+    tok = current_token(lexer, i);
+    if (!tok) { ProPrintfChar("Error: Unexpected end while parsing USER_SELECT_MULTIPLE\n"); goto cleanup; }
+
+    if (tok->type == tok_ampersand) {
+        (*i)++; /* consume '&' */
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_identifier) {
+            ProPrintfChar("Error: Expected identifier after & in USER_SELECT_MULTIPLE types\n");
+            goto cleanup;
+        }
+        ExpressionNode* var_expr = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+        if (!var_expr) { ProPrintfChar("Error: Memory allocation failed for type expression\n"); goto cleanup; }
+        var_expr->type = EXPR_VARIABLE_REF;
+        {
+            size_t buf_size = strlen(tok->val) + 2;
+            var_expr->data.string_val = (char*)malloc(buf_size);
+            if (!var_expr->data.string_val) { free(var_expr); ProPrintfChar("Error: Memory allocation failed for variable type string\n"); goto cleanup; }
+            sprintf_s(var_expr->data.string_val, buf_size, "&%s", tok->val);
+        }
+        node->types[0] = var_expr;
+        node->type_count = 1;
+        (*i)++; /* consumed identifier */
+    }
+    else {
+        /* Parse sequence like: AXIS | PLANE | EDGE */
+        while (tok && tok->type == tok_type) {
+            ExpressionNode* type_expr = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+            if (!type_expr) { ProPrintfChar("Error: Memory allocation failed for type expression\n"); goto cleanup; }
+            type_expr->type = EXPR_LITERAL_STRING;
+            type_expr->data.string_val = _strdup(tok->val);
+            if (!type_expr->data.string_val) { free(type_expr); ProPrintfChar("Error: Memory allocation failed for type string\n"); goto cleanup; }
+            if (node->type_count >= type_capacity) {
+                type_capacity *= 2;
+                ExpressionNode** new_types = (ExpressionNode**)realloc(node->types, type_capacity * sizeof(ExpressionNode*));
+                if (!new_types) { free_expression(type_expr); ProPrintfChar("Error: Memory reallocation failed for types array\n"); goto cleanup; }
+                node->types = new_types;
+            }
+            node->types[node->type_count++] = type_expr;
+            (*i)++; /* consumed this type */
+            tok = current_token(lexer, i);
+            if (tok && tok->type == tok_bar) { (*i)++; tok = current_token(lexer, i); }
+            else break;
+        }
+        if (node->type_count == 0) {
+            ProPrintfChar("Error: Expected at least one reference type or a variable (&myType) in USER_SELECT_MULTIPLE\n");
+            goto cleanup;
+        }
+    }
+
+    /* -------- max_sel (INT; allow negative via unary minus) -------- */
+    node->max_sel = parse_expression(lexer, i, NULL);
+    if (!node->max_sel) {
+        ProPrintfChar("Error: Expected max_sel integer in USER_SELECT_MULTIPLE\n");
+        goto cleanup;
+    }
+    /* Robust guard: forbid string for max_sel, allow numeric literals or unary/binary numeric expr */
+    if (node->max_sel->type == EXPR_LITERAL_STRING) {
+        ProPrintfChar("Error: max_sel must be numeric in USER_SELECT_MULTIPLE\n");
+        goto cleanup;
+    }
+
+    /* -------- array identifier (optionally followed by <:out>) -------- */
+    tok = current_token(lexer, i);
+    if (!tok || tok->type != tok_identifier) {
+        ProPrintfChar("Error: Expected array identifier in USER_SELECT_MULTIPLE\n");
+        goto cleanup;
+    }
+    node->array = _strdup(tok->val);
+    if (!node->array) { ProPrintfChar("Error: Memory allocation failed for array name\n"); goto cleanup; }
+    (*i)++;
+
+    /* Optional <:out> decoration: array<:out> */
+    tok = current_token(lexer, i);
+    if (tok && tok->type == tok_lt) {
+        (*i)++;
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_colon) { ProPrintfChar("Error: Expected ':' in '<:out>' after array name\n"); goto cleanup; }
+        (*i)++;
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_identifier || _stricmp(tok->val, "out") != 0) {
+            ProPrintfChar("Error: Expected 'out' in '<:out>' after array name\n");
+            goto cleanup;
+        }
+        (*i)++;
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_gt) { ProPrintfChar("Error: Expected '>' in '<:out>' after array name\n"); goto cleanup; }
+        (*i)++;
+    }
+
+    /* -------- options (same logic as USER_SELECT) -------- */
+    tok = current_token(lexer, i);
+    while (tok && tok->type == tok_option) {
+        (*i)++;
+        const char* option = tok->val;
+
+        if (strcmp(option, "DISPLAY_ORDER") == 0) {
+            if (node->display_order) { ProPrintfChar("Error: DISPLAY_ORDER specified more than once\n"); goto cleanup; }
+            node->display_order = parse_expression(lexer, i, NULL);
+            if (!node->display_order || (node->display_order->type != EXPR_LITERAL_INT && node->display_order->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression after DISPLAY_ORDER\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "ALLOW_RESELECT") == 0) {
+            if (node->allow_reselect) { ProPrintfChar("Error: ALLOW_RESELECT specified more than once\n"); goto cleanup; }
+            node->allow_reselect = true;
+        }
+        else if (strcmp(option, "FILTER_MDL") == 0) {
+            if (node->filter_mdl) { ProPrintfChar("Error: FILTER_MDL specified more than once\n"); goto cleanup; }
+            node->filter_mdl = parse_expression(lexer, i, NULL);
+            if (!node->filter_mdl) { ProPrintfChar("Error: Expected expression after FILTER_MDL\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_FEAT") == 0) {
+            if (node->filter_feat) { ProPrintfChar("Error: FILTER_FEAT specified more than once\n"); goto cleanup; }
+            node->filter_feat = parse_expression(lexer, i, NULL);
+            if (!node->filter_feat) { ProPrintfChar("Error: Expected expression after FILTER_FEAT\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_GEOM") == 0) {
+            if (node->filter_geom) { ProPrintfChar("Error: FILTER_GEOM specified more than once\n"); goto cleanup; }
+            node->filter_geom = parse_expression(lexer, i, NULL);
+            if (!node->filter_geom) { ProPrintfChar("Error: Expected expression after FILTER_GEOM\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_REF") == 0) {
+            if (node->filter_ref) { ProPrintfChar("Error: FILTER_REF specified more than once\n"); goto cleanup; }
+            node->filter_ref = parse_expression(lexer, i, NULL);
+            if (!node->filter_ref) { ProPrintfChar("Error: Expected expression after FILTER_REF\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_IDENTIFIER") == 0) {
+            if (node->filter_identifier) { ProPrintfChar("Error: FILTER_IDENTIFIER specified more than once\n"); goto cleanup; }
+            node->filter_identifier = parse_expression(lexer, i, NULL);
+            if (!node->filter_identifier || node->filter_identifier->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression after FILTER_IDENTIFIER\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "SELECT_BY_BOX") == 0) {
+            if (node->select_by_box) { ProPrintfChar("Error: SELECT_BY_BOX specified more than once\n"); goto cleanup; }
+            node->select_by_box = true;
+        }
+        else if (strcmp(option, "SELECT_BY_MENU") == 0) {
+            if (node->select_by_menu) { ProPrintfChar("Error: SELECT_BY_MENU specified more than once\n"); goto cleanup; }
+            node->select_by_menu = true;
+        }
+        else if (strcmp(option, "INCLUDE_MULTI_CAD") == 0) {
+            if (node->include_multi_cad) { ProPrintfChar("Error: INCLUDE_MULTI_CAD specified more than once\n"); goto cleanup; }
+            node->include_multi_cad = parse_expression(lexer, i, NULL);
+            if (!node->include_multi_cad || node->include_multi_cad->type != EXPR_VARIABLE_REF) {
+                ProPrintfChar("Error: Expected TRUE or FALSE after INCLUDE_MULTI_CAD\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "TOOLTIP") == 0) {
+            if (node->tooltip_message) { ProPrintfChar("Error: TOOLTIP specified more than once\n"); goto cleanup; }
+            node->tooltip_message = parse_expression(lexer, i, NULL);
+            if (!node->tooltip_message || node->tooltip_message->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression after TOOLTIP\n");
+                goto cleanup;
+            }
+            /* Optional IMAGE */
+            tok = current_token(lexer, i);
+            if (tok && tok->type == tok_option && strcmp(tok->val, "IMAGE") == 0) {
+                (*i)++;
+                node->image_name = parse_expression(lexer, i, NULL);
+                if (!node->image_name || node->image_name->type != EXPR_LITERAL_STRING) {
+                    ProPrintfChar("Error: Expected string expression after IMAGE\n");
+                    goto cleanup;
+                }
+            }
+        }
+        else if (strcmp(option, "ON_PICTURE") == 0) {
+            if (node->on_picture) { ProPrintfChar("Error: ON_PICTURE specified more than once\n"); goto cleanup; }
+            node->posX = parse_expression(lexer, i, NULL);
+            if (!node->posX || (node->posX->type != EXPR_LITERAL_INT && node->posX->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for posX after ON_PICTURE\n");
+                goto cleanup;
+            }
+            node->posY = parse_expression(lexer, i, NULL);
+            if (!node->posY || (node->posY->type != EXPR_LITERAL_INT && node->posY->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for posY after posX\n");
+                goto cleanup;
+            }
+            node->on_picture = true;
+        }
+        else {
+            ProPrintfChar("Error: Unknown option '%s' in USER_SELECT_MULTIPLE\n", option);
+            goto cleanup;
+        }
+
+        tok = current_token(lexer, i);
+    }
+
+    /* -------- trailing optional tag (same policy as USER_SELECT) -------- */
+    tok = current_token(lexer, i);
+    if (tok) {
+        if (tok->type == tok_string) {
+            node->tag = parse_expression(lexer, i, NULL);
+            if (!node->tag || node->tag->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression for tag\n");
+                goto cleanup;
+            }
+        }
+        else if (tok->type == tok_number || tok->type == tok_identifier ||
+            tok->type == tok_lparen || tok->type == tok_minus) {
+            node->tag = parse_expression(lexer, i, NULL);
+            if (!node->tag || (node->tag->type != EXPR_LITERAL_INT && node->tag->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for tag\n");
+                goto cleanup;
+            }
+        }
+    }
+
+    /* -------- summary log -------- */
+    {
+        char* types_str = NULL;
+        if (node->type_count > 0) {
+            size_t total_len = 0;
+            for (size_t k = 0; k < node->type_count; k++) {
+                char* t = expression_to_string(node->types[k]);
+                if (t) { total_len += strlen(t) + 2; free(t); }
+            }
+            if (total_len >= 2) total_len -= 2;
+            types_str = (char*)malloc(total_len + 1);
+            if (types_str) {
+                types_str[0] = '\0';
+                for (size_t k = 0; k < node->type_count; k++) {
+                    char* t = expression_to_string(node->types[k]);
+                    if (t) {
+                        strcat_s(types_str, total_len + 1, t);
+                        if (k < node->type_count - 1) strcat_s(types_str, total_len + 1, ", ");
+                        free(t);
+                    }
+                }
+            }
+        }
+        char* max_sel_str = expression_to_string(node->max_sel);
+        char* display_order_str = expression_to_string(node->display_order);
+        char* filter_mdl_str = expression_to_string(node->filter_mdl);
+        char* filter_feat_str = expression_to_string(node->filter_feat);
+        char* filter_geom_str = expression_to_string(node->filter_geom);
+        char* filter_ref_str = expression_to_string(node->filter_ref);
+        char* filter_id_str = expression_to_string(node->filter_identifier);
+        char* include_str = expression_to_string(node->include_multi_cad);
+        char* tooltip_str = expression_to_string(node->tooltip_message);
+        char* image_str = expression_to_string(node->image_name);
+        char* posX_str = expression_to_string(node->posX);
+        char* posY_str = expression_to_string(node->posY);
+        char* tag_str = expression_to_string(node->tag);
+
+        LogOnlyPrintfChar(
+            "UserSelectMultipleNode: types=%s, max_sel=%s, array=%s, display_order=%s, allow_reselect=%d, "
+            "filter_mdl=%s, filter_feat=%s, filter_geom=%s, filter_ref=%s, filter_identifier=%s, "
+            "select_by_box=%d, select_by_menu=%d, include_multi_cad=%s, tooltip=%s, image=%s, "
+            "on_picture=%d, posX=%s, posY=%s, tag=%s\n",
+            types_str ? types_str : "NULL",
+            max_sel_str ? max_sel_str : "NULL",
+            node->array ? node->array : "NULL",
+            display_order_str ? display_order_str : "NULL",
+            node->allow_reselect,
+            filter_mdl_str ? filter_mdl_str : "NULL",
+            filter_feat_str ? filter_feat_str : "NULL",
+            filter_geom_str ? filter_geom_str : "NULL",
+            filter_ref_str ? filter_ref_str : "NULL",
+            filter_id_str ? filter_id_str : "NULL",
+            (int)node->select_by_box, (int)node->select_by_menu,
+            include_str ? include_str : "NULL",
+            tooltip_str ? tooltip_str : "NULL",
+            image_str ? image_str : "NULL",
+            (int)node->on_picture,
+            posX_str ? posX_str : "NULL",
+            posY_str ? posY_str : "NULL",
+            tag_str ? tag_str : "NULL"
+        );
+
+        free(types_str); free(max_sel_str); free(display_order_str); free(filter_mdl_str);
+        free(filter_feat_str); free(filter_geom_str); free(filter_ref_str); free(filter_id_str);
+        free(include_str); free(tooltip_str); free(image_str); free(posX_str); free(posY_str); free(tag_str);
+    }
+
+    return 0;
+
+cleanup:
+    /* Free on failure */
+    if (node->types) {
+        for (size_t k = 0; k < node->type_count; k++) free_expression(node->types[k]);
+        free(node->types);
+        node->types = NULL;
+    }
+    free_expression(node->max_sel);
+    free(node->array);
+
+    free_expression(node->display_order);
+    free_expression(node->filter_mdl);
+    free_expression(node->filter_feat);
+    free_expression(node->filter_geom);
+    free_expression(node->filter_ref);
+    free_expression(node->filter_identifier);
+    free_expression(node->include_multi_cad);
+    free_expression(node->tooltip_message);
+    free_expression(node->image_name);
+    free_expression(node->posX);
+    free_expression(node->posY);
+    free_expression(node->tag);
+    memset(node, 0, sizeof(*node));
+    return -1;
+}
+
+int parse_user_select_multiple_optional(Lexer* lexer, size_t* i, CommandData* parsed_data)
+{
+    if (!lexer || !parsed_data) return -1;
+
+    UserSelectMultipleOptionalNode* node = &parsed_data->user_select_multiple_optional;
+    memset(node, 0, sizeof(*node));
+
+    TokenData* tok = NULL;
+
+    /* -------- types: either &var or TYPE | TYPE | ... -------- */
+    size_t type_capacity = 4;
+    node->types = (ExpressionNode**)malloc(type_capacity * sizeof(ExpressionNode*));
+    if (!node->types) {
+        ProPrintfChar("Error: Memory allocation failed for types array\n");
+        return -1;
+    }
+    node->type_count = 0;
+
+    tok = current_token(lexer, i);
+    if (!tok) { ProPrintfChar("Error: Unexpected end while parsing USER_SELECT_MULTIPLE\n"); goto cleanup; }
+
+    if (tok->type == tok_ampersand) {
+        (*i)++; /* consume '&' */
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_identifier) {
+            ProPrintfChar("Error: Expected identifier after & in USER_SELECT_MULTIPLE types\n");
+            goto cleanup;
+        }
+        ExpressionNode* var_expr = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+        if (!var_expr) { ProPrintfChar("Error: Memory allocation failed for type expression\n"); goto cleanup; }
+        var_expr->type = EXPR_VARIABLE_REF;
+        {
+            size_t buf_size = strlen(tok->val) + 2;
+            var_expr->data.string_val = (char*)malloc(buf_size);
+            if (!var_expr->data.string_val) { free(var_expr); ProPrintfChar("Error: Memory allocation failed for variable type string\n"); goto cleanup; }
+            sprintf_s(var_expr->data.string_val, buf_size, "&%s", tok->val);
+        }
+        node->types[0] = var_expr;
+        node->type_count = 1;
+        (*i)++; /* consumed identifier */
+    }
+    else {
+        /* Parse sequence like: AXIS | PLANE | EDGE */
+        while (tok && tok->type == tok_type) {
+            ExpressionNode* type_expr = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+            if (!type_expr) { ProPrintfChar("Error: Memory allocation failed for type expression\n"); goto cleanup; }
+            type_expr->type = EXPR_LITERAL_STRING;
+            type_expr->data.string_val = _strdup(tok->val);
+            if (!type_expr->data.string_val) { free(type_expr); ProPrintfChar("Error: Memory allocation failed for type string\n"); goto cleanup; }
+            if (node->type_count >= type_capacity) {
+                type_capacity *= 2;
+                ExpressionNode** new_types = (ExpressionNode**)realloc(node->types, type_capacity * sizeof(ExpressionNode*));
+                if (!new_types) { free_expression(type_expr); ProPrintfChar("Error: Memory reallocation failed for types array\n"); goto cleanup; }
+                node->types = new_types;
+            }
+            node->types[node->type_count++] = type_expr;
+            (*i)++; /* consumed this type */
+            tok = current_token(lexer, i);
+            if (tok && tok->type == tok_bar) { (*i)++; tok = current_token(lexer, i); }
+            else break;
+        }
+        if (node->type_count == 0) {
+            ProPrintfChar("Error: Expected at least one reference type or a variable (&myType) in USER_SELECT_MULTIPLE\n");
+            goto cleanup;
+        }
+    }
+
+    /* -------- max_sel (INT; allow negative via unary minus) -------- */
+    node->max_sel = parse_expression(lexer, i, NULL);
+    if (!node->max_sel) {
+        ProPrintfChar("Error: Expected max_sel integer in USER_SELECT_MULTIPLE\n");
+        goto cleanup;
+    }
+    /* Robust guard: forbid string for max_sel, allow numeric literals or unary/binary numeric expr */
+    if (node->max_sel->type == EXPR_LITERAL_STRING) {
+        ProPrintfChar("Error: max_sel must be numeric in USER_SELECT_MULTIPLE\n");
+        goto cleanup;
+    }
+
+    /* -------- array identifier (optionally followed by <:out>) -------- */
+    tok = current_token(lexer, i);
+    if (!tok || tok->type != tok_identifier) {
+        ProPrintfChar("Error: Expected array identifier in USER_SELECT_MULTIPLE\n");
+        goto cleanup;
+    }
+    node->array = _strdup(tok->val);
+    if (!node->array) { ProPrintfChar("Error: Memory allocation failed for array name\n"); goto cleanup; }
+    (*i)++;
+
+    /* Optional <:out> decoration: array<:out> */
+    tok = current_token(lexer, i);
+    if (tok && tok->type == tok_lt) {
+        (*i)++;
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_colon) { ProPrintfChar("Error: Expected ':' in '<:out>' after array name\n"); goto cleanup; }
+        (*i)++;
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_identifier || _stricmp(tok->val, "out") != 0) {
+            ProPrintfChar("Error: Expected 'out' in '<:out>' after array name\n");
+            goto cleanup;
+        }
+        (*i)++;
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_gt) { ProPrintfChar("Error: Expected '>' in '<:out>' after array name\n"); goto cleanup; }
+        (*i)++;
+    }
+
+    /* -------- options (same logic as USER_SELECT) -------- */
+    tok = current_token(lexer, i);
+    while (tok && tok->type == tok_option) {
+        (*i)++;
+        const char* option = tok->val;
+
+        if (strcmp(option, "DISPLAY_ORDER") == 0) {
+            if (node->display_order) { ProPrintfChar("Error: DISPLAY_ORDER specified more than once\n"); goto cleanup; }
+            node->display_order = parse_expression(lexer, i, NULL);
+            if (!node->display_order || (node->display_order->type != EXPR_LITERAL_INT && node->display_order->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression after DISPLAY_ORDER\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "ALLOW_RESELECT") == 0) {
+            if (node->allow_reselect) { ProPrintfChar("Error: ALLOW_RESELECT specified more than once\n"); goto cleanup; }
+            node->allow_reselect = true;
+        }
+        else if (strcmp(option, "FILTER_MDL") == 0) {
+            if (node->filter_mdl) { ProPrintfChar("Error: FILTER_MDL specified more than once\n"); goto cleanup; }
+            node->filter_mdl = parse_expression(lexer, i, NULL);
+            if (!node->filter_mdl) { ProPrintfChar("Error: Expected expression after FILTER_MDL\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_FEAT") == 0) {
+            if (node->filter_feat) { ProPrintfChar("Error: FILTER_FEAT specified more than once\n"); goto cleanup; }
+            node->filter_feat = parse_expression(lexer, i, NULL);
+            if (!node->filter_feat) { ProPrintfChar("Error: Expected expression after FILTER_FEAT\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_GEOM") == 0) {
+            if (node->filter_geom) { ProPrintfChar("Error: FILTER_GEOM specified more than once\n"); goto cleanup; }
+            node->filter_geom = parse_expression(lexer, i, NULL);
+            if (!node->filter_geom) { ProPrintfChar("Error: Expected expression after FILTER_GEOM\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_REF") == 0) {
+            if (node->filter_ref) { ProPrintfChar("Error: FILTER_REF specified more than once\n"); goto cleanup; }
+            node->filter_ref = parse_expression(lexer, i, NULL);
+            if (!node->filter_ref) { ProPrintfChar("Error: Expected expression after FILTER_REF\n"); goto cleanup; }
+        }
+        else if (strcmp(option, "FILTER_IDENTIFIER") == 0) {
+            if (node->filter_identifier) { ProPrintfChar("Error: FILTER_IDENTIFIER specified more than once\n"); goto cleanup; }
+            node->filter_identifier = parse_expression(lexer, i, NULL);
+            if (!node->filter_identifier || node->filter_identifier->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression after FILTER_IDENTIFIER\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "SELECT_BY_BOX") == 0) {
+            if (node->select_by_box) { ProPrintfChar("Error: SELECT_BY_BOX specified more than once\n"); goto cleanup; }
+            node->select_by_box = true;
+        }
+        else if (strcmp(option, "SELECT_BY_MENU") == 0) {
+            if (node->select_by_menu) { ProPrintfChar("Error: SELECT_BY_MENU specified more than once\n"); goto cleanup; }
+            node->select_by_menu = true;
+        }
+        else if (strcmp(option, "INCLUDE_MULTI_CAD") == 0) {
+            if (node->include_multi_cad) { ProPrintfChar("Error: INCLUDE_MULTI_CAD specified more than once\n"); goto cleanup; }
+            node->include_multi_cad = parse_expression(lexer, i, NULL);
+            if (!node->include_multi_cad || node->include_multi_cad->type != EXPR_VARIABLE_REF) {
+                ProPrintfChar("Error: Expected TRUE or FALSE after INCLUDE_MULTI_CAD\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "TOOLTIP") == 0) {
+            if (node->tooltip_message) { ProPrintfChar("Error: TOOLTIP specified more than once\n"); goto cleanup; }
+            node->tooltip_message = parse_expression(lexer, i, NULL);
+            if (!node->tooltip_message || node->tooltip_message->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression after TOOLTIP\n");
+                goto cleanup;
+            }
+            /* Optional IMAGE */
+            tok = current_token(lexer, i);
+            if (tok && tok->type == tok_option && strcmp(tok->val, "IMAGE") == 0) {
+                (*i)++;
+                node->image_name = parse_expression(lexer, i, NULL);
+                if (!node->image_name || node->image_name->type != EXPR_LITERAL_STRING) {
+                    ProPrintfChar("Error: Expected string expression after IMAGE\n");
+                    goto cleanup;
+                }
+            }
+        }
+        else if (strcmp(option, "ON_PICTURE") == 0) {
+            if (node->on_picture) { ProPrintfChar("Error: ON_PICTURE specified more than once\n"); goto cleanup; }
+            node->posX = parse_expression(lexer, i, NULL);
+            if (!node->posX || (node->posX->type != EXPR_LITERAL_INT && node->posX->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for posX after ON_PICTURE\n");
+                goto cleanup;
+            }
+            node->posY = parse_expression(lexer, i, NULL);
+            if (!node->posY || (node->posY->type != EXPR_LITERAL_INT && node->posY->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for posY after posX\n");
+                goto cleanup;
+            }
+            node->on_picture = true;
+        }
+        else {
+            ProPrintfChar("Error: Unknown option '%s' in USER_SELECT_MULTIPLE\n", option);
+            goto cleanup;
+        }
+
+        tok = current_token(lexer, i);
+    }
+
+    /* -------- trailing optional tag (same policy as USER_SELECT) -------- */
+    tok = current_token(lexer, i);
+    if (tok) {
+        if (tok->type == tok_string) {
+            node->tag = parse_expression(lexer, i, NULL);
+            if (!node->tag || node->tag->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression for tag\n");
+                goto cleanup;
+            }
+        }
+        else if (tok->type == tok_number || tok->type == tok_identifier ||
+            tok->type == tok_lparen || tok->type == tok_minus) {
+            node->tag = parse_expression(lexer, i, NULL);
+            if (!node->tag || (node->tag->type != EXPR_LITERAL_INT && node->tag->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for tag\n");
+                goto cleanup;
+            }
+        }
+    }
+
+    /* -------- summary log -------- */
+    {
+        char* types_str = NULL;
+        if (node->type_count > 0) {
+            size_t total_len = 0;
+            for (size_t k = 0; k < node->type_count; k++) {
+                char* t = expression_to_string(node->types[k]);
+                if (t) { total_len += strlen(t) + 2; free(t); }
+            }
+            if (total_len >= 2) total_len -= 2;
+            types_str = (char*)malloc(total_len + 1);
+            if (types_str) {
+                types_str[0] = '\0';
+                for (size_t k = 0; k < node->type_count; k++) {
+                    char* t = expression_to_string(node->types[k]);
+                    if (t) {
+                        strcat_s(types_str, total_len + 1, t);
+                        if (k < node->type_count - 1) strcat_s(types_str, total_len + 1, ", ");
+                        free(t);
+                    }
+                }
+            }
+        }
+        char* max_sel_str = expression_to_string(node->max_sel);
+        char* display_order_str = expression_to_string(node->display_order);
+        char* filter_mdl_str = expression_to_string(node->filter_mdl);
+        char* filter_feat_str = expression_to_string(node->filter_feat);
+        char* filter_geom_str = expression_to_string(node->filter_geom);
+        char* filter_ref_str = expression_to_string(node->filter_ref);
+        char* filter_id_str = expression_to_string(node->filter_identifier);
+        char* include_str = expression_to_string(node->include_multi_cad);
+        char* tooltip_str = expression_to_string(node->tooltip_message);
+        char* image_str = expression_to_string(node->image_name);
+        char* posX_str = expression_to_string(node->posX);
+        char* posY_str = expression_to_string(node->posY);
+        char* tag_str = expression_to_string(node->tag);
+
+        LogOnlyPrintfChar(
+            "UserSelectMultipleNode: types=%s, max_sel=%s, array=%s, display_order=%s, allow_reselect=%d, "
+            "filter_mdl=%s, filter_feat=%s, filter_geom=%s, filter_ref=%s, filter_identifier=%s, "
+            "select_by_box=%d, select_by_menu=%d, include_multi_cad=%s, tooltip=%s, image=%s, "
+            "on_picture=%d, posX=%s, posY=%s, tag=%s\n",
+            types_str ? types_str : "NULL",
+            max_sel_str ? max_sel_str : "NULL",
+            node->array ? node->array : "NULL",
+            display_order_str ? display_order_str : "NULL",
+            node->allow_reselect,
+            filter_mdl_str ? filter_mdl_str : "NULL",
+            filter_feat_str ? filter_feat_str : "NULL",
+            filter_geom_str ? filter_geom_str : "NULL",
+            filter_ref_str ? filter_ref_str : "NULL",
+            filter_id_str ? filter_id_str : "NULL",
+            (int)node->select_by_box, (int)node->select_by_menu,
+            include_str ? include_str : "NULL",
+            tooltip_str ? tooltip_str : "NULL",
+            image_str ? image_str : "NULL",
+            (int)node->on_picture,
+            posX_str ? posX_str : "NULL",
+            posY_str ? posY_str : "NULL",
+            tag_str ? tag_str : "NULL"
+        );
+
+        free(types_str); free(max_sel_str); free(display_order_str); free(filter_mdl_str);
+        free(filter_feat_str); free(filter_geom_str); free(filter_ref_str); free(filter_id_str);
+        free(include_str); free(tooltip_str); free(image_str); free(posX_str); free(posY_str); free(tag_str);
+    }
+
+    return 0;
+
+cleanup:
+    /* Free on failure */
+    if (node->types) {
+        for (size_t k = 0; k < node->type_count; k++) free_expression(node->types[k]);
+        free(node->types);
+        node->types = NULL;
+    }
+    free_expression(node->max_sel);
+    free(node->array);
+
+    free_expression(node->display_order);
+    free_expression(node->filter_mdl);
+    free_expression(node->filter_feat);
+    free_expression(node->filter_geom);
+    free_expression(node->filter_ref);
+    free_expression(node->filter_identifier);
+    free_expression(node->include_multi_cad);
+    free_expression(node->tooltip_message);
+    free_expression(node->image_name);
+    free_expression(node->posX);
+    free_expression(node->posY);
+    free_expression(node->tag);
+    memset(node, 0, sizeof(*node));
+    return -1;
+}
+
+int parse_user_select_optional(Lexer* lexer, size_t* i, CommandData* parsed_data) {
+    UserSelectOptionalNode* node = &parsed_data->user_select_optional;
+    memset(node, 0, sizeof(UserSelectOptionalNode));  // Initialize to zeros/NULLs
+
+    TokenData* tok = current_token(lexer, i);
+    if (!tok) {
+        ProPrintfChar("Error: Unexpected end of input in USER_SELECT\n");
+        return -1;
+    }
+
+    /*-----------------------------------------
+      Parse types: either &identifier, or
+      a | separated list of tok_type (AXIS|PLANE)
+    ------------------------------------------*/
+    size_t type_capacity = 4;
+    node->types = (ExpressionNode**)malloc(type_capacity * sizeof(ExpressionNode*));
+    if (!node->types) {
+        ProPrintfChar("Error: Memory allocation failed for types array\n");
+        return -1;
+    }
+
+    if (tok->type == tok_ampersand) {
+        (*i)++;  // consume '&'
+        tok = current_token(lexer, i);
+        if (!tok || tok->type != tok_identifier) {
+            ProPrintfChar("Error: Expected identifier after & in USER_SELECT types\n");
+            goto cleanup;
+        }
+        ExpressionNode* var_expr = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+        if (!var_expr) {
+            ProPrintfChar("Error: Memory allocation failed for type expression\n");
+            goto cleanup;
+        }
+        var_expr->type = EXPR_VARIABLE_REF;
+        {
+            size_t buf_size = strlen(tok->val) + 2; // '&' + name + NUL
+            var_expr->data.string_val = (char*)malloc(buf_size);
+            if (!var_expr->data.string_val) {
+                free(var_expr);
+                ProPrintfChar("Error: Memory allocation failed for variable type string\n");
+                goto cleanup;
+            }
+            sprintf_s(var_expr->data.string_val, buf_size, "&%s", tok->val);
+        }
+        node->types[0] = var_expr;
+        node->type_count = 1;
+        (*i)++; // consumed identifier
+    }
+    else {
+        // Parse sequence like: AXIS | PLANE | EDGE
+        while (tok && tok->type == tok_type) {
+            ExpressionNode* type_expr = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+            if (!type_expr) {
+                ProPrintfChar("Error: Memory allocation failed for type expression\n");
+                goto cleanup;
+            }
+            type_expr->type = EXPR_LITERAL_STRING;
+            type_expr->data.string_val = _strdup(tok->val);
+            if (!type_expr->data.string_val) {
+                free(type_expr);
+                ProPrintfChar("Error: Memory allocation failed for type string\n");
+                goto cleanup;
+            }
+            if (node->type_count >= type_capacity) {
+                type_capacity *= 2;
+                ExpressionNode** new_types =
+                    (ExpressionNode**)realloc(node->types, type_capacity * sizeof(ExpressionNode*));
+                if (!new_types) {
+                    free_expression(type_expr);
+                    ProPrintfChar("Error: Memory reallocation failed for types array\n");
+                    goto cleanup;
+                }
+                node->types = new_types;
+            }
+            node->types[node->type_count++] = type_expr;
+            (*i)++; // consumed this type
+            tok = current_token(lexer, i);
+            if (tok && tok->type == tok_bar) {
+                (*i)++; // consume '|'
+                tok = current_token(lexer, i);
+            }
+            else {
+                break;
+            }
+        }
+        if (node->type_count == 0) {
+            ProPrintfChar("Error: Expected at least one reference type or a variable (&myType) in USER_SELECT\n");
+            goto cleanup;
+        }
+    }
+
+    /*-----------------------------------------
+      Parse reference identifier
+    ------------------------------------------*/
+    tok = current_token(lexer, i);
+    if (!tok || tok->type != tok_identifier) {
+        ProPrintfChar("Error: Expected reference identifier in USER_SELECT\n");
+        goto cleanup;
+    }
+    node->reference = _strdup(tok->val);
+    if (!node->reference) {
+        ProPrintfChar("Error: Memory allocation failed for reference\n");
+        goto cleanup;
+    }
+    (*i)++;
+
+    /*-----------------------------------------
+      Parse options (same logic as before)
+    ------------------------------------------*/
+    tok = current_token(lexer, i);
+    while (tok && tok->type == tok_option) {
+        (*i)++;  // consume option
+        const char* option = tok->val;
+
+        if (strcmp(option, "DISPLAY_ORDER") == 0) {
+            if (node->display_order) {
+                ProPrintfChar("Error: DISPLAY_ORDER specified more than once\n");
+                goto cleanup;
+            }
+            node->display_order = parse_expression(lexer, i, NULL);
+            if (!node->display_order ||
+                (node->display_order->type != EXPR_LITERAL_INT &&
+                    node->display_order->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression after DISPLAY_ORDER\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "ALLOW_RESELECT") == 0) {
+            if (node->allow_reselect) {
+                ProPrintfChar("Error: ALLOW_RESELECT specified more than once\n");
+                goto cleanup;
+            }
+            node->allow_reselect = true;
+        }
+        else if (strcmp(option, "FILTER_MDL") == 0) {
+            if (node->filter_mdl) {
+                ProPrintfChar("Error: FILTER_MDL specified more than once\n");
+                goto cleanup;
+            }
+            node->filter_mdl = parse_expression(lexer, i, NULL);
+            if (!node->filter_mdl) {
+                ProPrintfChar("Error: Expected expression after FILTER_MDL\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "FILTER_FEAT") == 0) {
+            if (node->filter_feat) {
+                ProPrintfChar("Error: FILTER_FEAT specified more than once\n");
+                goto cleanup;
+            }
+            node->filter_feat = parse_expression(lexer, i, NULL);
+            if (!node->filter_feat) {
+                ProPrintfChar("Error: Expected expression after FILTER_FEAT\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "FILTER_GEOM") == 0) {
+            if (node->filter_geom) {
+                ProPrintfChar("Error: FILTER_GEOM specified more than once\n");
+                goto cleanup;
+            }
+            node->filter_geom = parse_expression(lexer, i, NULL);
+            if (!node->filter_geom) {
+                ProPrintfChar("Error: Expected expression after FILTER_GEOM\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "FILTER_REF") == 0) {
+            if (node->filter_ref) {
+                ProPrintfChar("Error: FILTER_REF specified more than once\n");
+                goto cleanup;
+            }
+            node->filter_ref = parse_expression(lexer, i, NULL);
+            if (!node->filter_ref) {
+                ProPrintfChar("Error: Expected expression after FILTER_REF\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "FILTER_IDENTIFIER") == 0) {
+            if (node->filter_identifier) {
+                ProPrintfChar("Error: FILTER_IDENTIFIER specified more than once\n");
+                goto cleanup;
+            }
+            node->filter_identifier = parse_expression(lexer, i, NULL);
+            if (!node->filter_identifier || node->filter_identifier->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression after FILTER_IDENTIFIER\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "SELECT_BY_BOX") == 0) {
+            if (node->select_by_box) {
+                ProPrintfChar("Error: SELECT_BY_BOX specified more than once\n");
+                goto cleanup;
+            }
+            node->select_by_box = true;
+        }
+        else if (strcmp(option, "SELECT_BY_MENU") == 0) {
+            if (node->select_by_menu) {
+                ProPrintfChar("Error: SELECT_BY_MENU specified more than once\n");
+                goto cleanup;
+            }
+            node->select_by_menu = true;
+        }
+        else if (strcmp(option, "INCLUDE_MULTI_CAD") == 0) {
+            if (node->include_multi_cad) {
+                ProPrintfChar("Error: INCLUDE_MULTI_CAD specified more than once\n");
+                goto cleanup;
+            }
+            node->include_multi_cad = parse_expression(lexer, i, NULL);
+            if (!node->include_multi_cad || node->include_multi_cad->type != EXPR_VARIABLE_REF) {
+                ProPrintfChar("Error: Expected TRUE or FALSE after INCLUDE_MULTI_CAD\n");
+                goto cleanup;
+            }
+        }
+        else if (strcmp(option, "TOOLTIP") == 0) {
+            if (node->tooltip_message) {
+                ProPrintfChar("Error: TOOLTIP specified more than once\n");
+                goto cleanup;
+            }
+            node->tooltip_message = parse_expression(lexer, i, NULL);
+            if (!node->tooltip_message || node->tooltip_message->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression after TOOLTIP\n");
+                goto cleanup;
+            }
+            // Optional IMAGE
+            tok = current_token(lexer, i);
+            if (tok && tok->type == tok_option && strcmp(tok->val, "IMAGE") == 0) {
+                (*i)++;
+                node->image_name = parse_expression(lexer, i, NULL);
+                if (!node->image_name || node->image_name->type != EXPR_LITERAL_STRING) {
+                    ProPrintfChar("Error: Expected string expression after IMAGE\n");
+                    goto cleanup;
+                }
+            }
+        }
+        else if (strcmp(option, "ON_PICTURE") == 0) {
+            if (node->on_picture) {
+                ProPrintfChar("Error: ON_PICTURE specified more than once\n");
+                goto cleanup;
+            }
+            node->posX = parse_expression(lexer, i, NULL);
+            if (!node->posX ||
+                (node->posX->type != EXPR_LITERAL_INT && node->posX->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for posX after ON_PICTURE\n");
+                goto cleanup;
+            }
+            node->posY = parse_expression(lexer, i, NULL);
+            if (!node->posY ||
+                (node->posY->type != EXPR_LITERAL_INT && node->posY->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for posY after posX\n");
+                goto cleanup;
+            }
+            node->on_picture = true;
+        }
+        else {
+            ProPrintfChar("Error: Unknown option '%s' in USER_SELECT\n", option);
+            goto cleanup;
+        }
+
+        tok = current_token(lexer, i);
+    }
+
+    /*-----------------------------------------
+      Trailing tag revised to match CHECKBOX_PARAM
+      Primary behavior: if next token is a STRING, accept it.
+      (Optional) Back-compat: accept numeric expr too.
+    ------------------------------------------*/
+    tok = current_token(lexer, i);
+    if (tok) {
+        if (tok->type == tok_string) {
+            node->tag = parse_expression(lexer, i, NULL);
+            if (!node->tag || node->tag->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression for tag\n");
+                goto cleanup;
+            }
+        }
+        else if (tok->type == tok_number || tok->type == tok_identifier ||
+            tok->type == tok_lparen || tok->type == tok_minus) {
+            // Backward compatibility: keep supporting numeric tag if you already emit it
+            node->tag = parse_expression(lexer, i, NULL);
+            if (!node->tag || (node->tag->type != EXPR_LITERAL_INT && node->tag->type != EXPR_LITERAL_DOUBLE)) {
+                ProPrintfChar("Error: Expected numeric expression for tag\n");
+                goto cleanup;
+            }
+        }
+    }
+
+    {
+        char* types_str = NULL;
+        if (node->type_count > 0) {
+            size_t total_len = 0;
+            for (size_t k = 0; k < node->type_count; k++) {
+                char* t = expression_to_string(node->types[k]);
+                if (t) { total_len += strlen(t) + 2; free(t); }
+            }
+            if (total_len >= 2) total_len -= 2;
+            types_str = (char*)malloc(total_len + 1);
+            if (types_str) {
+                types_str[0] = '\0';
+                for (size_t k = 0; k < node->type_count; k++) {
+                    char* t = expression_to_string(node->types[k]);
+                    if (t) {
+                        strcat_s(types_str, total_len + 1, t);
+                        if (k < node->type_count - 1) strcat_s(types_str, total_len + 1, ", ");
+                        free(t);
+                    }
+                }
+            }
+        }
+        char* display_order_str = expression_to_string(node->display_order);
+        char* filter_mdl_str = expression_to_string(node->filter_mdl);
+        char* filter_feat_str = expression_to_string(node->filter_feat);
+        char* filter_geom_str = expression_to_string(node->filter_geom);
+        char* filter_ref_str = expression_to_string(node->filter_ref);
+        char* filter_id_str = expression_to_string(node->filter_identifier);
+        char* include_str = expression_to_string(node->include_multi_cad);
+        char* tooltip_str = expression_to_string(node->tooltip_message);
+        char* image_str = expression_to_string(node->image_name);
+        char* posX_str = expression_to_string(node->posX);
+        char* posY_str = expression_to_string(node->posY);
+        char* tag_str = expression_to_string(node->tag);
+
+        LogOnlyPrintfChar(
+            "UserSelectionOptionalNode: types=%s, reference=%s, display_order=%s, allow_reselect=%d, "
+            "filter_mdl=%s, filter_feat=%s, filter_geom=%s, filter_ref=%s, filter_identifier=%s, "
+            "select_by_box=%d, select_by_menu=%d, include_multi_cad=%s, tooltip=%s, image=%s, "
+            "on_picture=%d, posX=%s, posY=%s, tag=%s\n",
+            types_str ? types_str : "NULL",
+            node->reference ? node->reference : "NULL",
+            display_order_str ? display_order_str : "NULL",
+            node->allow_reselect,
+            filter_mdl_str ? filter_mdl_str : "NULL",
+            filter_feat_str ? filter_feat_str : "NULL",
+            filter_geom_str ? filter_geom_str : "NULL",
+            filter_ref_str ? filter_ref_str : "NULL",
+            filter_id_str ? filter_id_str : "NULL",
+            node->select_by_box, node->select_by_menu,
+            include_str ? include_str : "NULL",
+            tooltip_str ? tooltip_str : "NULL",
+            image_str ? image_str : "NULL",
+            node->on_picture,
+            posX_str ? posX_str : "NULL",
+            posY_str ? posY_str : "NULL",
+            tag_str ? tag_str : "NULL"
+        );
+
+        if (types_str) free(types_str);
+        if (display_order_str) free(display_order_str);
+        if (filter_mdl_str) free(filter_mdl_str);
+        if (filter_feat_str) free(filter_feat_str);
+        if (filter_geom_str) free(filter_geom_str);
+        if (filter_ref_str) free(filter_ref_str);
+        if (filter_id_str) free(filter_id_str);
+        if (include_str) free(include_str);
+        if (tooltip_str) free(tooltip_str);
+        if (image_str) free(image_str);
+        if (posX_str) free(posX_str);
+        if (posY_str) free(posY_str);
+        if (tag_str) free(tag_str);
+    }
+
+    return 0;
+
+cleanup:
+    // Free partial allocations
+    for (size_t k = 0; k < node->type_count; k++) {
+        free_expression(node->types[k]);
+    }
+    free(node->types);
+    node->types = NULL;
+    node->type_count = 0;
+
+    if (node->reference) { free(node->reference); node->reference = NULL; }
+    free_expression(node->display_order);
+    free_expression(node->filter_mdl);
+    free_expression(node->filter_feat);
+    free_expression(node->filter_geom);
+    free_expression(node->filter_ref);
+    free_expression(node->filter_identifier);
+    free_expression(node->include_multi_cad);
+    free_expression(node->tooltip_message);
+    free_expression(node->image_name);
+    free_expression(node->posX);
+    free_expression(node->posY);
+    free_expression(node->tag);
+
+    return -1;
+}
+
+
+/*=================================================*\
+* 
+* BEGIN_TABLE Parser
+* 
+* 
+\*=================================================*/
+int parse_begin_table(Lexer* lexer, size_t* i, CommandData* parsed_data) {
+    TableNode* node = &parsed_data->begin_table;
+
+    // Initialize node fields to defaults
+    node->identifier = NULL;
+    node->name = NULL;
+    node->options = NULL;
+    node->option_count = 0;
+    node->sel_strings = NULL;
+    node->sel_string_count = 0;
+    node->data_types = NULL;
+    node->data_type_count = 0;
+    node->rows = NULL;
+    node->row_count = 0;
+    node->column_count = 0;
+
+    // Step 1: Assume 'BEGIN_TABLE' has already been consumed by the caller; parse TABLE_IDENTIFIER
+    TokenData* tok = current_token(lexer, i);
+    if (!tok || (tok->type != tok_field && tok->type != tok_identifier)) {
+        ProPrintfChar("Error: Expected TABLE_IDENTIFIER after BEGIN_TABLE at line %zu\n", tok ? tok->loc.line : (*i > 0 ? lexer->tokens[*i - 1].loc.line : 0));
+        return -1;
+    }
+    node->identifier = _strdup(tok->val);
+    if (!node->identifier) {
+        ProPrintfChar("Error: Memory allocation failed for identifier\n");
+        return -1;
+    }
+    (*i)++;
+
+    // Step 2: Parse optional table name (as ExpressionNode*)
+    tok = current_token(lexer, i);
+    if (tok && (tok->type == tok_string || tok->type == tok_identifier || tok->type == tok_number || tok->type == tok_lparen || tok->type == tok_minus)) {  // Potential start of expression
+        node->name = parse_expression(lexer, i, NULL);  // Pass NULL for st if not needed yet
+        if (!node->name) {
+            ProPrintfChar("Error: Failed to parse table name expression at line %zu\n", tok->loc.line);
+            goto cleanup;
+        }
+    }
+    else {
+        // Default to identifier as string literal if no name provided
+        node->name = malloc(sizeof(ExpressionNode));
+        if (!node->name) {
+            ProPrintfChar("Error: Memory allocation failed for default name\n");
+            goto cleanup;
+        }
+        node->name->type = EXPR_LITERAL_STRING;
+        node->name->data.string_val = _strdup(node->identifier);
+        if (!node->name->data.string_val) {
+            ProPrintfChar("Error: Memory allocation failed for default name string\n");
+            goto cleanup;
+        }
+    }
+
+    // Step 3: Parse optional TABLE_OPTION (array of ExpressionNode*)
+    tok = current_token(lexer, i);
+    if (tok && tok->type == tok_keyword && strcmp(tok->val, "TABLE_OPTION") == 0) {
+        (*i)++;  // Consume TABLE_OPTION
+        int option_capacity = 4;
+        node->options = malloc(option_capacity * sizeof(ExpressionNode*));
+        if (!node->options) {
+            ProPrintfChar("Error: Memory allocation failed for options\n");
+            goto cleanup;
+        }
+        size_t current_line = tok->loc.line;  // Use line of TABLE_OPTION for reference
+        tok = current_token(lexer, i);
+        while (tok && tok->loc.line == current_line && tok->type != tok_keyword) {  // Parse expressions on the same line
+            ExpressionNode* option = parse_expression(lexer, i, NULL);
+            if (!option) {
+                ProPrintfChar("Error: Failed to parse TABLE_OPTION expression at line %zu\n", tok->loc.line);
+                goto cleanup;
+            }
+            if (node->option_count >= option_capacity) {
+                option_capacity *= 2;
+                ExpressionNode** new_options = realloc(node->options, option_capacity * sizeof(ExpressionNode*));
+                if (!new_options) {
+                    ProPrintfChar("Error: Memory reallocation failed for options\n");
+                    goto cleanup;
+                }
+                node->options = new_options;
+            }
+            node->options[node->option_count++] = option;
+            tok = current_token(lexer, i);
+        }
+    }
+
+    // Step 4: Parse SEL_STRING (array of ExpressionNode*)
+    tok = current_token(lexer, i);
+    if (!tok || tok->type != tok_keyword || strcmp(tok->val, "SEL_STRING") != 0) {
+        ProPrintfChar("Error: Expected 'SEL_STRING' at line %zu\n", tok ? tok->loc.line : (*i > 0 ? lexer->tokens[*i - 1].loc.line : 0));
+        goto cleanup;
+    }
+    (*i)++;  // Consume SEL_STRING
+
+    // Allocate initial capacity for sel_strings
+    int sel_capacity = 4;
+    node->sel_strings = malloc(sel_capacity * sizeof(ExpressionNode*));
+    if (!node->sel_strings) {
+        ProPrintfChar("Error: Memory allocation failed for sel_strings\n");
+        goto cleanup;
+    }
+
+    // Insert "SEL_STRING" as the first sel_string (for the implicit first column header)
+    ExpressionNode* first_sel = malloc(sizeof(ExpressionNode));
+    if (!first_sel) {
+        ProPrintfChar("Error: Memory allocation failed for first sel_string\n");
+        goto cleanup;
+    }
+    first_sel->type = EXPR_LITERAL_STRING;
+    first_sel->data.string_val = _strdup("SEL_STRING");
+    if (!first_sel->data.string_val) {
+        ProPrintfChar("Error: Memory allocation failed for 'SEL_STRING' string\n");
+        free(first_sel);
+        goto cleanup;
+    }
+    node->sel_strings[0] = first_sel;
+    node->sel_string_count = 1;
+
+    // Parse remaining sel_strings on the same line
+    size_t sel_line = tok->loc.line;
+    tok = current_token(lexer, i);
+    while (tok && tok->loc.line == sel_line && tok->type != tok_keyword) {
+        ExpressionNode* sel = parse_expression(lexer, i, NULL);
+        if (!sel) {
+            ProPrintfChar("Error: Failed to parse SEL_STRING expression at line %zu\n", tok->loc.line);
+            goto cleanup;
+        }
+        if (node->sel_string_count >= sel_capacity) {
+            sel_capacity *= 2;
+            ExpressionNode** new_sels = realloc(node->sel_strings, sel_capacity * sizeof(ExpressionNode*));
+            if (!new_sels) {
+                ProPrintfChar("Error: Memory reallocation failed for sel_strings\n");
+                goto cleanup;
+            }
+            node->sel_strings = new_sels;
+        }
+        node->sel_strings[node->sel_string_count++] = sel;
+        tok = current_token(lexer, i);
+    }
+    if (node->sel_string_count == 1) {  // Only the implicit one; expect at least one explicit
+        ProPrintfChar("Warning: No explicit SEL_STRING parameters provided at line %zu; using implicit only\n", sel_line);
+    }
+    node->column_count = node->sel_string_count;  // Adjusted: no +1, as implicit is now included
+
+    // Step 5: Parse data types (array of ExpressionNode*)
+    tok = current_token(lexer, i);
+    if (!tok || tok->type != tok_type || strcmp(tok->val, "STRING") != 0) {
+        ProPrintfChar("Error: Expected 'STRING' as first data type at line %zu\n", tok ? tok->loc.line : (*i > 0 ? lexer->tokens[*i - 1].loc.line : 0));
+        goto cleanup;
+    }
+    int type_capacity = node->column_count;
+    node->data_types = malloc(type_capacity * sizeof(ExpressionNode*));
+    if (!node->data_types) {
+        ProPrintfChar("Error: Memory allocation failed for data_types\n");
+        goto cleanup;
+    }
+    size_t type_line = tok->loc.line;
+    int type_idx = 0;
+    while (tok && tok->loc.line == type_line && tok->type != tok_keyword && type_idx < node->column_count) {
+        ExpressionNode* dtype = parse_expression(lexer, i, NULL);
+        if (!dtype) {
+            ProPrintfChar("Error: Failed to parse data type expression at line %zu\n", tok->loc.line);
+            goto cleanup;
+        }
+        node->data_types[type_idx++] = dtype;
+        tok = current_token(lexer, i);
+    }
+    node->data_type_count = type_idx;
+    if (node->data_type_count != node->column_count) {
+        ProPrintfChar("Error: Number of data types (%d) does not match column count (%d) at line %zu\n",
+            node->data_type_count, node->column_count, type_line);
+        goto cleanup;
+    }
+
+    // Step 6: Parse rows (ExpressionNode***: array of rows, each an array of ExpressionNode*)
+    int row_capacity = 4;
+    node->rows = malloc(row_capacity * sizeof(ExpressionNode**));
+    if (!node->rows) {
+        ProPrintfChar("Error: Memory allocation failed for rows\n");
+        goto cleanup;
+    }
+    tok = current_token(lexer, i);
+    while (tok && !(tok->type == tok_keyword && strcmp(tok->val, "END_TABLE") == 0)) {
+        if (node->row_count >= row_capacity) {
+            row_capacity *= 2;
+            ExpressionNode*** new_rows = realloc(node->rows, row_capacity * sizeof(ExpressionNode**));
+            if (!new_rows) {
+                ProPrintfChar("Error: Memory reallocation failed for rows\n");
+                goto cleanup;
+            }
+            node->rows = new_rows;
+        }
+        // Allocate row
+        ExpressionNode** row = malloc(node->column_count * sizeof(ExpressionNode*));
+        if (!row) {
+            ProPrintfChar("Error: Memory allocation failed for row %d\n", node->row_count);
+            goto cleanup;
+        }
+        // Initialize to NULL
+        for (int c = 0; c < node->column_count; c++) {
+            row[c] = NULL;
+        }
+        size_t row_line = tok->loc.line;
+        int col_idx = 0;
+        while (tok && tok->loc.line == row_line && !(tok->type == tok_keyword && strcmp(tok->val, "END_TABLE") == 0) && col_idx < node->column_count) {
+            ExpressionNode* cell = parse_expression(lexer, i, NULL);
+            if (!cell) {
+                ProPrintfChar("Error: Failed to parse row %d column %d expression at line %zu\n",
+                    node->row_count, col_idx, tok ? tok->loc.line : 0);
+                for (int c = 0; c < col_idx; c++) free_expression(row[c]);
+                free(row);
+                goto cleanup;
+            }
+            row[col_idx++] = cell;
+            tok = current_token(lexer, i);
+        }
+
+        if (col_idx > node->column_count) {
+            ProPrintfChar("Error: Row %d has too many columns (%d > %d) at line %zu\n", node->row_count, col_idx, node->column_count, row_line);
+            for (int c = 0; c < col_idx; c++) free_expression(row[c]);
+            free(row);
+            goto cleanup;
+        }
+        node->rows[node->row_count++] = row;
+        tok = current_token(lexer, i);  // Check for next row or END_TABLE
+    }
+
+    // Step 7: Consume END_TABLE
+    if (!tok || tok->type != tok_keyword || strcmp(tok->val, "END_TABLE") != 0) {
+        ProPrintfChar("Error: Expected 'END_TABLE' to close table block\n");
+        goto cleanup;
+    }
+    (*i)++;  // Consume END_TABLE
+
+    // Logging (optional summary)
+    LogOnlyPrintfChar("Parsed table '%s' with %d options, %d sel_strings, %d data_types, %d rows, %d columns\n",
+        node->identifier, node->option_count, node->sel_string_count, node->data_type_count, node->row_count, node->column_count);
+
+    // Detailed row and cell logging
+    if (node->row_count > 0) {
+        LogOnlyPrintfChar("Detailed table rows and cells:\n");
+        for (int r = 0; r < node->row_count; r++) {
+            LogOnlyPrintfChar(" Row %d:\n", r);
+            for (int c = 0; c < node->column_count; c++) {
+                char* cell_str = expression_to_string(node->rows[r][c]);
+                LogOnlyPrintfChar("  Column %d: %s\n", c, cell_str ? cell_str : "NULL");
+                free(cell_str);  // Free to prevent memory leaks
+            }
+        }
+    }
+
+    return 0;
+
+cleanup:
+    // Free allocated resources
+    free(node->identifier);
+    free_expression(node->name);
+    if (node->options) {
+        for (int j = 0; j < node->option_count; j++) free_expression(node->options[j]);
+        free(node->options);
+    }
+    if (node->sel_strings) {
+        for (int j = 0; j < node->sel_string_count; j++) free_expression(node->sel_strings[j]);
+        free(node->sel_strings);
+    }
+    if (node->data_types) {
+        for (int j = 0; j < node->data_type_count; j++) free_expression(node->data_types[j]);
+        free(node->data_types);
+    }
+    if (node->rows) {
+        for (int r = 0; r < node->row_count; r++) {
+            for (int c = 0; c < node->column_count; c++) free_expression(node->rows[r][c]);
+            free(node->rows[r]);
+        }
+        free(node->rows);
+    }
+    // Reset node
+    memset(node, 0, sizeof(TableNode));
+    return -1;
+}
+
 /*=================================================*\
 * 
 * Invalidate_param syntax analysis
@@ -2797,7 +4080,11 @@ CommandEntry command_table[] = {
     {"USER_INPUT_PARAM", COMMAND_USER_INPUT_PARAM, parse_user_input_param},
     {"RADIOBUTTON_PARAM", COMMAND_RADIOBUTTON_PARAM, parse_radiobutton_param},
     {"USER_SELECT", COMMAND_USER_SELECT, parse_user_select},
-    {"INVALIDATE_PARAM", COMMAND_INVALIDATE_PARAM, parse_invlaidate_param}
+    {"USER_SELECT_MULTIPLE", COMMAND_USER_SELECT_MULTIPLE, parse_user_select_multiple},
+    {"USER_SELECT_MULTIPLE_OPTIONAL", COMMAND_USER_SELECT_MULTIPLE_OPTIONAL, parse_user_select_multiple_optional},
+    {"USER_SELECT_OPTIONAL", COMMAND_USER_SELECT_OPTIONAL, parse_user_select_optional},
+    {"INVALIDATE_PARAM", COMMAND_INVALIDATE_PARAM, parse_invlaidate_param},
+    {"BEGIN_TABLE", COMMAND_BEGIN_TABLE, parse_begin_table}
 };
 
 // Allocate data based on CommandType
@@ -2821,7 +4108,15 @@ CommandData* allocate_data(CommandType type) {
         return malloc(sizeof(CommandData));
     case COMMAND_USER_SELECT:
         return malloc(sizeof(CommandData));
+    case COMMAND_USER_SELECT_OPTIONAL:
+        return malloc(sizeof(CommandData));
+    case COMMAND_USER_SELECT_MULTIPLE:
+        return malloc(sizeof(CommandData));
+    case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
+        return malloc(sizeof(CommandData));
     case COMMAND_INVALIDATE_PARAM:
+        return malloc(sizeof(CommandData));
+    case COMMAND_BEGIN_TABLE:
         return malloc(sizeof(CommandData));
     default:
         ProPrintf(L"Error: Unknown CommandType in allocate_data\n");
@@ -2829,109 +4124,88 @@ CommandData* allocate_data(CommandType type) {
     }
 }
 
-
 CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
     if (*i >= lexer->token_count) return NULL;
 
+    /* IF-family still has priority */
     CommandNode* if_cmd = parse_if_command(lexer, i, st);
     if (if_cmd) return if_cmd;
 
-    // Handle keyword-based commands
+    /* Keyword-driven commands */
     if (lexer->tokens[*i].type == tok_keyword) {
         const char* keyword = lexer->tokens[*i].val;
 
-        if (strcmp(keyword, "BEGIN_TABLE") == 0) {
-            // Parse BEGIN_TABLE block
-            size_t table_start = *i;
-            size_t table_end = *i;
-            while (table_end < lexer->token_count &&
-                (lexer->tokens[table_end].type != tok_keyword ||
-                    strcmp(lexer->tokens[table_end].val, "END_TABLE") != 0)) {
-                table_end++;
+        /* No special-casing for BEGIN_TABLE here.
+           It must be registered in command_table with its parser. */
+        CommandEntry* entry = NULL;
+        size_t table_size = sizeof(command_table) / sizeof(command_table[0]);
+        for (size_t j = 0; j < table_size; j++) {
+            if (strcmp(keyword, command_table[j].command_name) == 0) {
+                entry = &command_table[j];
+                break;
             }
-            if (table_end >= lexer->token_count ||
-                strcmp(lexer->tokens[table_end].val, "END_TABLE") != 0) {
-                printf("Error: Unterminated table block at line %zu\n",
-                    lexer->tokens[table_start].loc.line);
-                *i = table_end;
-                return NULL;
-            }
-            table_end++; // Include END_TABLE
-
-            CommandNode* node = malloc(sizeof(CommandNode));
-            if (!node) {
-                printf("Memory allocation failed for CommandNode\n");
-                *i = table_end;
-                return NULL;
-            }
-            node->type = COMMAND_BEGIN_TABLE; // Ensure this is defined in CommandType enum
-            node->data = NULL; // Placeholder; implement parse_table if needed
-            *i = table_end;
-            return node;
         }
-        else {
-            // Find command entry
-            CommandEntry* entry = NULL;
-            size_t table_size = sizeof(command_table) / sizeof(command_table[0]);
-            for (size_t j = 0; j < table_size; j++) {
-                if (strcmp(keyword, command_table[j].command_name) == 0) {
-                    entry = &command_table[j];
-                    break;
-                }
-            }
 
-            if (!entry) {
-                printf("Warning: Unknown command '%s' at line %zu\n",
-                    keyword, lexer->tokens[*i].loc.line);
-                (*i)++; // Skip unrecognized keyword
-                return NULL;
-            }
-
-            // Skip the keyword token
-            (*i)++;
-
-            CommandNode* node = malloc(sizeof(CommandNode));
-            if (!node) {
-                printf("Memory allocation failed for CommandNode\n");
-                return NULL;
-            }
-            node->type = entry->type;
-            node->data = allocate_data(node->type);
-            if (!node->data) {
-                printf("Memory allocation failed for command data\n");
-                free(node);
-                return NULL;
-            }
-
-            int result = entry->parser(lexer, i, node->data);
-            if (result != 0) {
-                printf("Error parsing '%s' at line %zu\n",
-                    keyword, lexer->tokens[*i - 1].loc.line);  // Adjust line reference as needed
-                free_command_node(node);
-                return NULL;
-            }
-
-            return node;
+        if (!entry) {
+            printf("Warning: Unknown command '%s' at line %zu\n",
+                keyword, lexer->tokens[*i].loc.line);
+            (*i)++; /* consume the unknown keyword to make progress */
+            return NULL;
         }
+
+        /* consume the keyword token */
+        (*i)++;
+
+        CommandNode* node = (CommandNode*)malloc(sizeof(CommandNode));
+        if (!node) {
+            printf("Memory allocation failed for CommandNode\n");
+            return NULL;
+        }
+        node->type = entry->type;
+        node->data = allocate_data(node->type);
+        if (!node->data) {
+            printf("Memory allocation failed for command data\n");
+            free(node);
+            return NULL;
+        }
+
+        int result = entry->parser(lexer, i, node->data);
+        if (result != 0) {
+            printf("Error parsing '%s' at line %zu\n",
+                keyword, lexer->tokens[*i - 1].loc.line);
+            free_command_node(node);
+            return NULL;
+        }
+
+        return node;
     }
-    else if (lexer->tokens[*i].type == tok_identifier || lexer->tokens[*i].type == tok_number || lexer->tokens[*i].type == tok_lparen || lexer->tokens[*i].type == tok_minus || lexer->tokens[*i].type == tok_string) {  // Start of potential expression
+    /* Expression / assignment handling stays exactly the same */
+    else if (lexer->tokens[*i].type == tok_identifier ||
+        lexer->tokens[*i].type == tok_number ||
+        lexer->tokens[*i].type == tok_lparen ||
+        lexer->tokens[*i].type == tok_minus ||
+        lexer->tokens[*i].type == tok_string) {
+
         size_t start = *i;
         ExpressionNode* expr = parse_expression(lexer, i, st);
         if (!expr) {
-            ProPrintfChar("Error: Failed to parse expression at line %zu\n", lexer->tokens[start].loc.line);
+            ProPrintfChar("Error: Failed to parse expression at line %zu\n",
+                lexer->tokens[start].loc.line);
             return NULL;
         }
+
         TokenData* tok = current_token(lexer, i);
         if (tok && tok->type == tok_equal) {
-            (*i)++;  // Consume '='
+            (*i)++; /* consume '=' */
             ExpressionNode* rhs = parse_expression(lexer, i, st);
             if (!rhs) {
-                ProPrintfChar("Error: Failed to parse RHS in assignment at line %zu\n", lexer->tokens[start].loc.line);
+                ProPrintfChar("Error: Failed to parse RHS in assignment at line %zu\n",
+                    lexer->tokens[start].loc.line);
                 free_expression(expr);
                 return NULL;
             }
-            // Create assignment node
-            CommandNode* node = malloc(sizeof(CommandNode));
+
+            CommandNode* node = (CommandNode*)malloc(sizeof(CommandNode));
             if (!node) {
                 free_expression(expr);
                 free_expression(rhs);
@@ -2945,9 +4219,10 @@ CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
                 free_expression(rhs);
                 return NULL;
             }
+
             ((CommandData*)node->data)->assignment.lhs = expr;
             ((CommandData*)node->data)->assignment.rhs = rhs;
-            // Logging as before
+
             char* lhs_str = expression_to_string(expr);
             char* rhs_str = expression_to_string(rhs);
             if (lhs_str && rhs_str) {
@@ -2961,8 +4236,7 @@ CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
             return node;
         }
         else {
-            // Standalone expression: Create new command type
-            CommandNode* node = malloc(sizeof(CommandNode));
+            CommandNode* node = (CommandNode*)malloc(sizeof(CommandNode));
             if (!node) {
                 free_expression(expr);
                 return NULL;
@@ -2974,9 +4248,8 @@ CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
                 free_expression(expr);
                 return NULL;
             }
-            // Assume union has 'expression' field; add to CommandData: ExpressionNode expression;
-            ((CommandData*)node->data)->expression = expr;  // Transfer ownership, no free(expr)
-            // Logging
+            ((CommandData*)node->data)->expression = expr;
+
             char* expr_str = expression_to_string(((CommandData*)node->data)->expression);
             LogOnlyPrintfChar("Parsed standalone expression: %s", expr_str ? expr_str : "NULL");
             free(expr_str);
@@ -2984,11 +4257,10 @@ CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
         }
     }
     else {
-        // Skip unrecognized tokens
+        /* Skip unrecognized token kinds to avoid stalling */
         (*i)++;
         return NULL;
     }
-
 }
 
 Block* find_block(BlockList* block_list, BlockType type)
@@ -3300,6 +4572,106 @@ void free_command_node(CommandNode* node) {
             free_expression(usn->tag);
             break;
         }
+        case COMMAND_USER_SELECT_OPTIONAL:
+        {
+            UserSelectOptionalNode* usn = &((CommandData*)node->data)->user_select_optional;
+            for (size_t k = 0; k < usn->type_count; k++) {
+                free_expression(usn->types[k]);
+            }
+            free(usn->types);
+            free(usn->reference);
+            free_expression(usn->display_order);
+            free_expression(usn->filter_mdl);
+            free_expression(usn->filter_feat);
+            free_expression(usn->filter_geom);
+            free_expression(usn->filter_ref);
+            free_expression(usn->filter_identifier);
+            free_expression(usn->include_multi_cad);
+            free_expression(usn->tooltip_message);
+            free_expression(usn->image_name);
+            free_expression(usn->posX);
+            free_expression(usn->posY);
+            free_expression(usn->tag);
+            break;
+        }
+        case COMMAND_USER_SELECT_MULTIPLE: {
+            UserSelectMultipleNode* n = &node->data->user_select_multiple;
+
+            if (n->types) {
+                for (size_t k = 0; k < n->type_count; k++) free_expression(n->types[k]);
+                free(n->types);
+            }
+            free_expression(n->max_sel);
+            free(n->array);
+
+            free_expression(n->display_order);
+            free_expression(n->filter_mdl);
+            free_expression(n->filter_feat);
+            free_expression(n->filter_geom);
+            free_expression(n->filter_ref);
+            free_expression(n->filter_identifier);
+            free_expression(n->include_multi_cad);
+            free_expression(n->tooltip_message);
+            free_expression(n->image_name);
+            free_expression(n->posX);
+            free_expression(n->posY);
+            free_expression(n->tag);
+        } break;
+        case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL: {
+            UserSelectMultipleOptionalNode* n = &node->data->user_select_multiple_optional;
+
+            if (n->types) {
+                for (size_t k = 0; k < n->type_count; k++) free_expression(n->types[k]);
+                free(n->types);
+            }
+            free_expression(n->max_sel);
+            free(n->array);
+
+            free_expression(n->display_order);
+            free_expression(n->filter_mdl);
+            free_expression(n->filter_feat);
+            free_expression(n->filter_geom);
+            free_expression(n->filter_ref);
+            free_expression(n->filter_identifier);
+            free_expression(n->include_multi_cad);
+            free_expression(n->tooltip_message);
+            free_expression(n->image_name);
+            free_expression(n->posX);
+            free_expression(n->posY);
+            free_expression(n->tag);
+        } break;
+        case COMMAND_BEGIN_TABLE: {
+            TableNode* tn = &((CommandData*)node->data)->begin_table;
+
+            free(tn->identifier);
+            free_expression(tn->name);
+
+            for (size_t k = 0; k < tn->option_count; k++) {
+                free_expression(tn->options[k]);
+            }
+            free(tn->options);
+
+            for (size_t k = 0; k < tn->sel_string_count; k++) {
+                free_expression(tn->sel_strings[k]);
+            }
+            free(tn->sel_strings);
+
+            for (size_t k = 0; k < tn->data_type_count; k++) {
+                free_expression(tn->data_types[k]);
+            }
+            free(tn->data_types);
+
+            for (size_t r = 0; r < tn->row_count; r++) {
+                for (size_t c = 0; c < tn->column_count; c++) {
+                    free_expression(tn->rows[r][c]);
+                }
+                free(tn->rows[r]);
+            }
+            free(tn->rows);
+
+            free(node->data);  // Free the entire CommandData allocation after cleaning internals
+            break;
+        }
         case COMMAND_ASSIGNMENT: {  // New case added here
             AssignmentNode* an = (AssignmentNode*)node->data;
             free_expression(an->lhs);
@@ -3360,3 +4732,8 @@ void free_block_list(BlockList* block_list) {
     block_list->blocks = NULL;
     block_list->block_count = 0;
 }
+
+
+
+
+
