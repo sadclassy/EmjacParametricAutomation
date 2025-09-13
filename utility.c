@@ -4,6 +4,16 @@
 
 wchar_t selectedTabFilePath[MAX_PATH] = L"";
 
+static SelMapEntry* g_selmap = NULL;
+static size_t g_selmap_count = 0;
+static int g_selmap_loaded = 0;
+static char g_selmap_path[MAX_PATH] = "C:\\emjacScript\\component_engine.txt";
+
+/* forward decls for local helpers */
+static void selmap_free_all(void);
+static char* dup_trim_line(const char* in);
+static int is_blank_line(const char* s);
+
 
 // Print function to display messages in creo
 ProError ProGenericMsg(wchar_t* wMsg)
@@ -214,4 +224,161 @@ bool get_gif_dimensions(const char* filepath, int* width, int* height)
 int starts_with(const char* str, const char* prefix) {
 	size_t len_prefix = strlen(prefix);
 	return strncmp(str, prefix, len_prefix) == 0;
+}
+
+/* Optional: let caller override path before first use. */
+void selmap_set_path(const char* path)
+{
+	if (!path || !path[0]) return;
+	strncpy_s(g_selmap_path, sizeof(g_selmap_path), path, _TRUNCATE);
+}
+
+/* Reload on demand (clears cache) */
+int selmap_reload(void)
+{
+	g_selmap_loaded = 0;
+	selmap_free_all();
+	return 0;
+}
+
+static int selmap_load_once(void)
+{
+	if (g_selmap_loaded) return 1;
+
+	FILE* fp = NULL;
+	errno_t e = fopen_s(&fp, g_selmap_path, "r");
+	if (e != 0 || !fp) {
+		ProPrintfChar("selmap: could not open '%s'\n", g_selmap_path);
+		g_selmap_loaded = 1; /* avoid retry storms */
+		return 0;
+	}
+
+	/* We'll read three logical lines per entry, ignoring blanks between blocks. */
+	char buf1[512], buf2[512], buf3[512];
+	while (1) {
+		/* Seek first non-blank as line1 */
+		char* p1 = NULL;
+		while ((p1 = fgets(buf1, sizeof(buf1), fp)) != NULL && is_blank_line(p1)) { /* skip */ }
+		if (!p1) break; /* EOF */
+
+		char* p2 = fgets(buf2, sizeof(buf2), fp);
+		char* p3 = fgets(buf3, sizeof(buf3), fp);
+		if (!p2 || !p3) {
+			ProPrintfChar("selmap: truncated block for key starting with '%s'\n", buf1);
+			break;
+		}
+
+		char* key = dup_trim_line(p1);
+		char* name = dup_trim_line(p2);
+		char* confirm = dup_trim_line(p3);
+		if (!key || !name || !confirm) {
+			free(key); free(name); free(confirm);
+			continue;
+		}
+
+		/* Accept only if name equals confirm */
+		if (strcmp(name, confirm) == 0 && key[0] != '\0' && name[0] != '\0') {
+			size_t new_count = g_selmap_count + 1;
+			SelMapEntry* tmp = (SelMapEntry*)realloc(g_selmap, new_count * sizeof(SelMapEntry));
+			if (!tmp) {
+				ProPrintfChar("selmap: out of memory\n");
+				free(key); free(name); free(confirm);
+				break;
+			}
+			g_selmap = tmp;
+
+			/* ---- IMPORTANT: zero-init the new slot before assigning ---- */
+			g_selmap[g_selmap_count].key = NULL;
+			g_selmap[g_selmap_count].label = NULL;
+
+			g_selmap[g_selmap_count].key = key;
+			g_selmap[g_selmap_count].label = name;
+			g_selmap_count++;
+		}
+		else {
+			/* reject; mismatch or empty */
+			free(key);
+			free(name);
+		}
+		free(confirm);
+
+		/* Skip any blank separator lines that may follow; loop restarts to find next block */
+	}
+
+	fclose(fp);
+	g_selmap_loaded = 1;
+	LogOnlyPrintfChar("selmap: loaded %zu entries from '%s'\n", g_selmap_count, g_selmap_path);
+	return (g_selmap_count > 0);
+}
+
+/* Returns 1 if found and *out_wlabel is set to a newly-allocated wchar_t* (caller frees).
+   Returns 0 if not found (out_wlabel untouched). */
+int selmap_lookup_w(const char* param, wchar_t** out_wlabel)
+{
+	if (!param || !out_wlabel) return 0;
+	if (!g_selmap_loaded) (void)selmap_load_once();
+
+	/* case-sensitive match to align with your parameter keys; tweak if needed */
+	for (size_t i = 0; i < g_selmap_count; ++i) {
+		/* guard against any hypothetical partial slot */
+		if (g_selmap[i].key && strcmp(g_selmap[i].key, param) == 0) {
+			*out_wlabel = char_to_wchar(g_selmap[i].label ? g_selmap[i].label : "");
+			return (*out_wlabel != NULL);
+		}
+	}
+	return 0;
+}
+
+/* ---- internals ---- */
+
+static void selmap_free_all(void)
+{
+	if (!g_selmap) {
+		g_selmap_count = 0;
+		return;
+	}
+	for (size_t i = 0; i < g_selmap_count; ++i) {
+		if (g_selmap[i].key) { free(g_selmap[i].key);   g_selmap[i].key = NULL; }
+		if (g_selmap[i].label) { free(g_selmap[i].label); g_selmap[i].label = NULL; }
+	}
+	free(g_selmap);
+	g_selmap = NULL;
+	g_selmap_count = 0;
+}
+
+static void rstrip(char* s)
+{
+	if (!s) return;
+	size_t n = strlen(s);
+	while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) {
+		s[--n] = '\0';
+	}
+}
+
+static char* dup_trim_line(const char* in)
+{
+	if (!in) return NULL;
+	size_t n = strlen(in);
+	while (n > 0 && (in[n - 1] == '\n' || in[n - 1] == '\r' || in[n - 1] == ' ' || in[n - 1] == '\t')) {
+		--n;
+	}
+	size_t start = 0;
+	while (start < n && (in[start] == ' ' || in[start] == '\t')) ++start;
+	size_t len = (n > start) ? (n - start) : 0;
+
+	char* out = (char*)malloc(len + 1);
+	if (!out) return NULL;
+	if (len) memcpy(out, in + start, len);
+	out[len] = '\0';
+	return out;
+}
+
+static int is_blank_line(const char* s)
+{
+	if (!s) return 1;
+	while (*s) {
+		if (*s != ' ' && *s != '\t' && *s != '\r' && *s != '\n') return 0;
+		++s;
+	}
+	return 1;
 }
