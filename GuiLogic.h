@@ -11,6 +11,14 @@ typedef struct {
     char button_id[128];
 } ButtonFitData;
 
+typedef struct {
+    ProBoolean do_declares;
+    ProBoolean do_assigns;
+    ProBoolean do_subpics;
+} GuiRebuildOps;
+
+ProError set_checkbox_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled);
+
 
 
 /* NEW: select helpers */
@@ -28,7 +36,6 @@ ProError UserSelectUpdateCallback(char* dialog, char* component, ProAppData app_
 ProError UserSelectOptionalUpdateCallback(char* dialog, char* component, ProAppData app_data);
 ProError set_user_select_optional_enabled(char* dialog, SymbolTable* st, const char* reference, ProBoolean enabled, ProBoolean required);
 int var_to_bool(const Variable* v, int dflt);
-const char* uicolor_to_string(ProUIColor color);
 
 
 
@@ -40,6 +47,7 @@ const char* uicolor_to_string(ProUIColor color);
 \*=================================================*/
 ProError refresh_required_input_highlights(char* dialog, SymbolTable* st);
 ProError require_input(SymbolTable* st, const char* param_name);
+ProError set_inputpanel_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled);
 
 
 /*=================================================*\
@@ -48,17 +56,39 @@ ProError require_input(SymbolTable* st, const char* param_name);
 * 
 * 
 \*=================================================*/
+ProError set_show_param_enabled(char* dialog, SymbolTable* st, const char* parameter, ProBoolean enabled);
+ProBoolean OnPicture_update_show_param_label_text(char* dialog, const char* parameter, const Variable* var);
 ProBoolean update_show_param_label_text(char* dialog, const char* parameter, const Variable* var); 
+ProError update_show_param_label(char* dialog, const char* param_name, const Variable* var, ProBoolean on_picture);
 void debug_print_symbol_update(const char* param_name, const Variable* var);
+ProError refresh_all_show_params(Block* blk, char* dialog_name, SymbolTable* st);
 
 
+/*=================================================*\
+* 
+* RADIOBUTTON LOGICAL HEADERS
+* 
+* 
+\*=================================================*/
+ProError set_radiobutton_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled);
+
+/*=================================================*\
+* 
+* SUB_PICTURE LOGICAL HEADERS
+* 
+* 
+\*=================================================*/
 ProError rebuild_sub_pictures_only(Block* gui_block, SymbolTable* st);
 
 /* NEW: UI param helpers */
 ProError track_ui_param(SymbolTable* st, const char* param_name);
 ProBoolean is_ui_param(SymbolTable* st, const char* param_name);
 
-/* NEW: select helpers (existing lines continue) */
+//helpers
+
+ProError update_assignments_only_impl(Block* blk, SymbolTable* st, int target_if_id, int in_winner);
+ProError update_assignments_only(Block* gui_block, SymbolTable* st);
+
 
 
 
