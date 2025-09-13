@@ -36,6 +36,7 @@ static const char* get_item_type_str(ProType type) {
     case PRO_SURFACE: return "Surface";
     case PRO_AXIS: return "Axis";
     case PRO_CURVE: return "Curve";
+    case PRO_DATUM_PLANE: return "Plane";
         // Add more types as needed based on ProType enum
     default: return "Unknown";
     }
@@ -312,6 +313,18 @@ ProError addpicture(char* dialog, char* component, ProAppData app_data) {
 * the creo dialog--
 * 
 \*=================================================*/
+
+/* Conservative text->size estimate for on-picture labels. */
+void onpic_label_size_for_text(const wchar_t* txt, int* out_w, int* out_h)
+{
+    size_t n = (txt ? wcslen(txt) : 0);
+    int char_w = 8;      /* dialog-unit approximation per glyph */
+    int pad = 10;     /* breathing room */
+    int min_w = 40;     /* never smaller than this */
+    if (out_w) *out_w = (int)(min_w + (int)n * char_w + pad);
+    if (out_h) *out_h = 16; /* matches your existing ~15 */
+}
+
 ProError OnPictureShowParam(char* dialog, char* draw_area_name, ShowParamNode* node, SymbolTable* st) {
     ProError status;
     if (!dialog || !draw_area_name || !node || !node->parameter || !st) {
@@ -334,6 +347,14 @@ ProError OnPictureShowParam(char* dialog, char* draw_area_name, ShowParamNode* n
     snprintf(label_name, sizeof(label_name), "show_label_%s", node->parameter);
 
     wchar_t* name_w = char_to_wchar(node->parameter);
+    /* NEW: try friendly */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->parameter, &w_friendly)) {
+            free(name_w);
+            name_w = w_friendly;
+        }
+    }
     wchar_t* value_w = variable_value_to_wstring(var);
     if (!name_w || !value_w) {
         free(name_w); free(value_w);
@@ -343,7 +364,7 @@ ProError OnPictureShowParam(char* dialog, char* draw_area_name, ShowParamNode* n
 
     wchar_t label_text[256];
     if (wcslen(value_w) > 0)
-        swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls: %ls", name_w, value_w);
+        swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls", value_w);
     else
         swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls: (undefined)", name_w);
     free(name_w);
@@ -352,6 +373,15 @@ ProError OnPictureShowParam(char* dialog, char* draw_area_name, ShowParamNode* n
     status = ProUIDrawingareaLabelAdd(dialog, draw_area_name, label_name);
     if (status != PRO_TK_NO_ERROR) {
         ProPrintfChar("Error: Could not add label '%s' to drawing area '%s'", label_name, draw_area_name);
+        return status;
+    }
+
+    int lw = 0, lh = 0;
+    onpic_label_size_for_text(label_text, &lw, &lh);
+    status = ProUILabelSizeSet(dialog, label_name, lw, lh);
+    if (status != PRO_TK_NO_ERROR)
+    {
+        ProPrintfChar("Could not set label size");
         return status;
     }
 
@@ -398,24 +428,20 @@ ProError addShowParam(char* dialog_name, char* parent_layout_name, ShowParamNode
 
     // Initialize grid options (unchanged)
     ProUIGridopts label_grid = { 0 };
-    if (node->on_picture) {
-        return OnPictureShowParam(dialog_name, "draw_area", node, st);
-    }
-    else {
-        label_grid.column = column;
-        label_grid.row = *current_row;
-        (*current_row)++;  // Increment row for sequential placement
-    }
+    label_grid.column = column;
+    label_grid.row = *current_row;
+    (*current_row)++;  // Increment row for sequential placement
     label_grid.horz_cells = 1;
     label_grid.vert_cells = 1;
     label_grid.top_offset = 20;
+    label_grid.horz_resize = PRO_B_TRUE;
     label_grid.attach_bottom = PRO_B_TRUE;
     label_grid.attach_left = PRO_B_TRUE;
     label_grid.attach_right = PRO_B_TRUE;
     label_grid.attach_top = PRO_B_TRUE;
 
     // Create label ID (unchanged)
-    char label_id[100];
+    char label_id[512];
     snprintf(label_id, sizeof(label_id), "show_label_%s", node->parameter);
 
     // Add label to layout (unchanged)
@@ -428,9 +454,18 @@ ProError addShowParam(char* dialog_name, char* parent_layout_name, ShowParamNode
     // Get type string (unchanged)
     char* param_type_str = get_variable_type_string(node->var_type, node->subtype);
 
-    // Convert to wide strings (unchanged)
     wchar_t* w_parameter = char_to_wchar(node->parameter);
-    wchar_t* w_type = char_to_wchar(param_type_str);  // Not used in final display per requirement
+    wchar_t* w_type = char_to_wchar(param_type_str);  /* unchanged */
+    if (!w_parameter || !w_type) { /* unchanged error path */ }
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->parameter, &w_friendly)) {
+            free(w_parameter);
+            w_parameter = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
 
     if (!w_parameter || !w_type) {
         free(w_parameter);
@@ -450,7 +485,7 @@ ProError addShowParam(char* dialog_name, char* parent_layout_name, ShowParamNode
    
     // Format label text: "DE_MASTER (1.10)" - exclude type per requirement/example
     wchar_t label_text[200];
-    swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls (%ls)", w_parameter, w_value);
+    swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls:%ls", w_parameter, w_value);
 
     // Set label text (unchanged)
     status = ProUILabelTextSet(dialog_name, label_id, label_text);
@@ -507,6 +542,9 @@ ProError CheckboxCallback(char* dialog, char* component, ProAppData app_data) {
     
     // Optional: Re-validate OK button if this checkbox affects requirements
     validate_ok_button(dialog, st);
+
+
+    EPA_ReactiveRefresh();
     
     return PRO_TK_NO_ERROR;
 }
@@ -581,6 +619,16 @@ ProError OnPictureCheckboxParam(char* dialog, char* draw_area_name, CheckboxPara
         ProPrintfChar("Error: Failed to convert parameter name '%s' to wchar_t", node->parameter);
         return PRO_TK_GENERAL_ERROR;
     }
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->parameter, &w_friendly)) {
+            free(param_w);
+            param_w = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
     wchar_t* tag_w = char_to_wchar(tag_str ? tag_str : "");
     free(tag_str);
     if (!tag_w) {
@@ -700,7 +748,7 @@ ProError addCheckboxParam(char* dialog_name, char* parent_layout_name, CheckboxP
 
     // Create label ID
     char cbp_label_id[100];
-    snprintf(cbp_label_id, sizeof(cbp_label_id), "label_%s_%d", cbNode->parameter, *current_row);
+    snprintf(cbp_label_id, sizeof(cbp_label_id), "checkbox_%s", cbNode->parameter);
 
     // Initialize grid options
     ProUIGridopts grid_opts_cbp = { 0 };
@@ -710,16 +758,10 @@ ProError addCheckboxParam(char* dialog_name, char* parent_layout_name, CheckboxP
     grid_opts_cbp.attach_top = PRO_B_TRUE;
     grid_opts_cbp.horz_cells = 1;
     grid_opts_cbp.vert_cells = 1;
+    grid_opts_cbp.column = column + 1;
+    grid_opts_cbp.row = *current_row;
+    (*current_row)++;  // Increment row for sequential placement
     
-
-    if (cbNode->on_picture) {
-        return OnPictureCheckboxParam(dialog_name, "draw_area", cbNode, st);
-    }
-    else {
-        grid_opts_cbp.column = column + 1;
-        grid_opts_cbp.row = *current_row;
-        (*current_row)++;  // Increment row for sequential placement
-    }
 
     status = ProUILayoutCheckbuttonAdd(dialog_name, parent_layout_name, cbp_label_id, &grid_opts_cbp);
     if (status != PRO_TK_NO_ERROR)
@@ -733,6 +775,15 @@ ProError addCheckboxParam(char* dialog_name, char* parent_layout_name, CheckboxP
     if (!w_parameter) {
         ProPrintf(L"Conversion to wide string failed for parameter\n");
         return PRO_TK_GENERAL_ERROR;
+    }
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(cbNode->parameter, &w_friendly)) {
+            free(w_parameter);
+            w_parameter = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
     }
 
     // Evaluate and convert tag if present
@@ -757,7 +808,7 @@ ProError addCheckboxParam(char* dialog_name, char* parent_layout_name, CheckboxP
     // Format label text: "ALL_SKELS (Y/N)" or "ALL_SKELS" if no tag
     wchar_t cbp_label_text[200];
     if (w_tag) {
-        swprintf(cbp_label_text, sizeof(cbp_label_text) / sizeof(wchar_t), L"(%ls) %ls", w_parameter, w_tag);
+        swprintf(cbp_label_text, sizeof(cbp_label_text) / sizeof(wchar_t), L"(%ls) %ls", w_tag, w_parameter);
     }
     else {
         swprintf(cbp_label_text, sizeof(cbp_label_text) / sizeof(wchar_t), L"%ls", w_parameter);
@@ -965,7 +1016,72 @@ ProError ActivateCallback(char* dialog, char* component, ProAppData app_data) {
     Variable* after = get_symbol(filter_data->st, filter_data->parameter);
     if (after) {
         debug_print_symbol_update(filter_data->parameter, after);
-        update_show_param_label_text(dialog, filter_data->parameter, after);
+        update_show_param_label(dialog, filter_data->parameter, after, PRO_B_FALSE);
+    }
+
+    refresh_required_input_highlights(dialog, filter_data->st);
+    EPA_ReactiveRefresh();  // makes IF branches/picture choice/button gating react now
+
+    filter_data->in_activate = PRO_B_FALSE;
+    return status;
+}
+
+ProError OnPictureActivateCallback(char* dialog, char* component, ProAppData app_data) {
+    InputFilterData* filter_data = (InputFilterData*)app_data;
+    if (!filter_data) {
+        return PRO_TK_BAD_INPUTS;
+    }
+
+    if (filter_data->in_activate == PRO_B_TRUE) {
+        return PRO_TK_NO_ERROR;  // Prevent recursion
+    }
+    filter_data->in_activate = PRO_B_TRUE;
+
+    Variable* var = get_symbol(filter_data->st, filter_data->parameter);
+    if (!var) {
+        ProPrintfChar("Error: Parameter '%s' not found during activation\n", filter_data->parameter);
+        filter_data->in_activate = PRO_B_FALSE;
+        return PRO_TK_GENERAL_ERROR;
+    }
+
+    ProError status = PRO_TK_NO_ERROR;
+    switch (filter_data->subtype) {
+    case PARAM_DOUBLE: {
+        double val; status = ProUIInputpanelDoubleGet(dialog, component, &val);
+        if (status == PRO_TK_NO_ERROR) {
+            if (var->type == TYPE_DOUBLE) var->data.double_value = val;
+            else if (var->type == TYPE_INTEGER || var->type == TYPE_BOOL) var->data.int_value = (int)val;
+        }
+        break;
+    }
+    case PARAM_INT:
+    case PARAM_BOOL: {
+        int val; status = ProUIInputpanelIntegerGet(dialog, component, &val);
+        if (status == PRO_TK_NO_ERROR) {
+            if (var->type == TYPE_INTEGER || var->type == TYPE_BOOL) var->data.int_value = val;
+            else if (var->type == TYPE_DOUBLE) var->data.double_value = (double)val; /* critical sync */
+        }
+        break;
+    }
+    case PARAM_STRING: {
+        char* sval = NULL; status = ProUIInputpanelStringGet(dialog, component, &sval);
+        if (status == PRO_TK_NO_ERROR && sval) {
+            if (var->type == TYPE_STRING) {
+                free(var->data.string_value);
+                var->data.string_value = _strdup(sval);
+            }
+            ProStringFree(sval);
+        }
+        break;
+    }
+    default: break;
+    }
+
+    // debug + SHOW_PARAM label update (if present) 
+    Variable* after = get_symbol(filter_data->st, filter_data->parameter);
+    if (after) {
+        debug_print_symbol_update(filter_data->parameter, after);
+        update_show_param_label(dialog, filter_data->parameter, after, PRO_B_TRUE);
     }
 
     refresh_required_input_highlights(dialog, filter_data->st);
@@ -1036,91 +1152,22 @@ ProError OnPictureUserInputParam(char* dialog, char* draw_area_name, UserInputPa
         ProPrintfChar("Warning: posY missing in ON_PICTURE for '%s'; using y=0", node->parameter);
     }
 
-    // Generate unique IDs
-    char label_id[100];
-    char area_id[100];
+
     char input_id[100];
-    snprintf(label_id, sizeof(label_id), "input_label_%s", node->parameter);
-    snprintf(area_id, sizeof(area_id), "input_area_%s", node->parameter);
     snprintf(input_id, sizeof(input_id), "input_panel_%s", node->parameter);
 
-    // Approximate label width for positioning (e.g., 8 pixels per character + padding)
-    int label_width = (int)(strlen(node->parameter) * 8 + 10);
-
-    // Add label to drawing area
-    status = ProUIDrawingareaLabelAdd(dialog, draw_area_name, label_id);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not add label for '%s' to drawing area '%s'\n", node->parameter, draw_area_name);
-        return status;
-    }
-
-    // Set label text
-    wchar_t* w_parameter = char_to_wchar(node->parameter);
-    if (!w_parameter) {
-        ProPrintf(L"Conversion to wide string failed\n");
-        return PRO_TK_GENERAL_ERROR;
-    }
-    status = ProUILabelTextSet(dialog, label_id, w_parameter);
-    free(w_parameter);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not set text for label '%s'\n", label_id);
-        return status;
-    }
-
-    // Set label position
-    status = ProUILabelPositionSet(dialog, label_id, x_pos + 20, y_pos + 5);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not set position for label '%s'\n", label_id);
-        return status;
-    }
-
-    // Add sub-drawing area to main drawing area for input panel
-    status = ProUIDrawingareaDrawingareaAdd(dialog, draw_area_name, area_id);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not add sub-drawing area for '%s' to '%s'\n", node->parameter, draw_area_name);
-        return status;
-    }
-
-    // Set sub-drawing area position (adjacent to label)
-    status = ProUIDrawingareaPositionSet(dialog, area_id, x_pos + label_width, y_pos);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not set position for sub-drawing area '%s'\n", area_id);
-        return status;
-    }
-
-    // Decorate sub-drawing area
-    status = ProUIDrawingareaDecorate(dialog, area_id);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not decorate sub-drawing area for '%s'\n", node->parameter);
-        return status;
-    }
-
-    // Set sub-drawing area height and width
-    int height = 25;
-    int width = 93;
-    status = ProUIDrawingareaDrawingheightSet(dialog, area_id, height);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not set sub-drawing area height for '%s'\n", node->parameter);
-        return status;
-    }
-
-    status = ProUIDrawingareaDrawingwidthSet(dialog, area_id, width);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Could not set sub-drawing area width for '%s'\n", node->parameter);
-        return status;
-    }
 
     // Add input panel to sub-drawing area
-    status = ProUIDrawingareaInputpanelAdd(dialog, area_id, input_id);
+    status = ProUIDrawingareaInputpanelAdd(dialog, "draw_area", input_id);
     if (status != PRO_TK_NO_ERROR) {
         ProPrintfChar("Could not add input panel for '%s'\n", node->parameter);
         return status;
     }
 
-    status = ProUIInputpanelColumnsSet(dialog, input_id, 7);
+    status = ProUIInputpanelColumnsSet(dialog, input_id, 5);
 
     // Set input panel position (relative to sub-drawing area)
-    status = ProUIInputpanelPositionSet(dialog, input_id, 0, 1);
+    status = ProUIInputpanelPositionSet(dialog, input_id, x_pos, y_pos);
     if (status != PRO_TK_NO_ERROR) {
         ProPrintfChar("Could not set input panel position for '%s'\n", node->parameter);
         return status;
@@ -1243,7 +1290,7 @@ ProError OnPictureUserInputParam(char* dialog, char* draw_area_name, UserInputPa
     }
 
     // Register the activation (submit) callback
-    status = ProUIInputpanelActivateActionSet(dialog, input_id, ActivateCallback, (ProAppData)filter_data);
+    status = ProUIInputpanelActivateActionSet(dialog, input_id, OnPictureActivateCallback, (ProAppData)filter_data);
     if (status != PRO_TK_NO_ERROR) {
         free(filter_data->last_valid);
         free(filter_data->parameter);
@@ -1311,18 +1358,6 @@ ProError OnPictureUserInputParam(char* dialog, char* draw_area_name, UserInputPa
         }
     }
 
-    // Handle WIDTH if present (for display width)
-    if (node->width) {
-        double width_val;
-        status = evaluate_to_double(node->width, st, &width_val);
-        if (status == PRO_TK_NO_ERROR && width_val > 0) {
-            int width_pixels = (int)width_val;
-            status = ProUIDrawingareaDrawingwidthSet(dialog, area_id, width_pixels);
-            if (status != PRO_TK_NO_ERROR) {
-                ProPrintfChar("Warning: Could not set width for '%s'\n", node->parameter);
-            }
-        }
-    }
 
     (void)refresh_required_input_highlights(dialog, st);
 
@@ -1373,15 +1408,9 @@ ProError addUserInputParam(char* dialog_name, char* parent_layout_name, UserInpu
     label_grid.attach_left = PRO_B_TRUE;
     label_grid.attach_right = PRO_B_TRUE;
     label_grid.attach_top = PRO_B_TRUE;
-
-    if (node->on_picture) 
-    {
-        return OnPictureUserInputParam(dialog_name, "draw_area", node, st);
-    }
-    else {
-        label_grid.column = column;
-        label_grid.row = *current_row;
-    }
+    label_grid.column = column;
+    label_grid.row = *current_row;
+    
 
     // Add label to layout
     status = ProUILayoutLabelAdd(dialog_name, parent_layout_name, label_id, &label_grid);
@@ -1396,6 +1425,16 @@ ProError addUserInputParam(char* dialog_name, char* parent_layout_name, UserInpu
         ProPrintf(L"Conversion to wide string failed\n");
         return PRO_TK_GENERAL_ERROR;
     }
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->parameter, &w_friendly)) {
+            free(w_parameter);
+            w_parameter = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
     status = ProUILabelTextSet(dialog_name, label_id, w_parameter);
     free(w_parameter);
     if (status != PRO_TK_NO_ERROR) {
@@ -1680,6 +1719,89 @@ ProError addUserInputParam(char* dialog_name, char* parent_layout_name, UserInpu
 * --this displays the radiobutton within the dialog--
 * 
 \*=================================================*/
+static void ensure_radio_options_map(SymbolTable* st, const char* param, char** names, int count, int required_flag)
+{
+    if (!st || !param) return;
+    if (count < 0) count = 0;
+
+    char key[256];
+    snprintf(key, sizeof(key), "RADIOBUTTON:%s", param);
+
+    /* Already present and well-formed? nothing to do. */
+    Variable* existing = get_symbol(st, key);
+    if (existing && existing->type == TYPE_MAP && existing->data.map) {
+        return;
+    }
+
+    /* Build fresh map: { options: [string...], required: int } */
+    HashTable* map = create_hash_table(8);
+    if (!map) {
+        ProPrintfChar("Error: ensure_radio_options_map: create_hash_table failed for %s\n", param);
+        return;
+    }
+
+    Variable* opts = (Variable*)calloc(1, sizeof(Variable));
+    if (!opts) { free_hash_table(map); return; }
+    opts->type = TYPE_ARRAY;
+    opts->data.array.size = (size_t)count;
+    opts->data.array.elements = NULL;
+
+    if (count > 0) {
+        opts->data.array.elements = (Variable**)calloc((size_t)count, sizeof(Variable*));
+        if (!opts->data.array.elements) {
+            free(opts);
+            free_hash_table(map);
+            return;
+        }
+    }
+
+    /* Fill options array; bail out safely on any failure. */
+    for (int i = 0; i < count; ++i) {
+        Variable* sv = (Variable*)calloc(1, sizeof(Variable));
+        if (!sv) goto fail;
+        sv->type = TYPE_STRING;
+
+        const char* src = (names && names[i]) ? names[i] : "";
+        sv->data.string_value = _strdup(src);
+        if (!sv->data.string_value) { free(sv); goto fail; }
+
+        opts->data.array.elements[i] = sv;
+    }
+
+    Variable* req = (Variable*)calloc(1, sizeof(Variable));
+    if (!req) goto fail;
+    req->type = TYPE_INTEGER;
+    req->data.int_value = required_flag ? 1 : 0;
+
+    Variable* mv = (Variable*)calloc(1, sizeof(Variable));
+    if (!mv) { free_variable(req); goto fail; }
+    mv->type = TYPE_MAP;
+    mv->data.map = map;
+
+    /* Populate map only after all pieces are valid. */
+    add_var_to_map(map, "options", opts);
+    add_var_to_map(map, "required", req);
+
+    set_symbol(st, key, mv);  /* ownership of mv/map/children transfers to the table */
+    return;
+
+fail:
+    /* Clean up partial 'opts' array (strings + elements buffer) */
+    if (opts) {
+        if (opts->type == TYPE_ARRAY && opts->data.array.elements) {
+            for (int j = 0; j < count; ++j) {
+                if (opts->data.array.elements[j]) {
+                    free_variable(opts->data.array.elements[j]);
+                }
+            }
+            free(opts->data.array.elements);
+        }
+        free(opts);
+    }
+    /* No entries were inserted into 'map' yet, so a plain free is safe. */
+    free_hash_table(map);
+}
+
 ProError RadioSelectCallback(char* dialog, char* component, ProAppData app_data) {
     RadioSelectData* data = (RadioSelectData*)app_data;
     if (!data || !data->st || !data->parameter) {
@@ -1776,14 +1898,43 @@ ProError RadioSelectCallback(char* dialog, char* component, ProAppData app_data)
     if (status != PRO_TK_NO_ERROR) {
         ProPrintfChar("Warning: Failed to validate OK button after radio selection in '%s'", data->parameter);
     }
-    EPA_ReactiveRefresh();
+    EPA_ReactiveRefresh(dialog);
 
     return PRO_TK_NO_ERROR;
 }
 
-ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioButtonParamNode* node, int* current_row, int column, SymbolTable* st)
+/* Clamp a radiogroup to its minimum size (plus optional padding). */
+static ProError radiogroup_shrink_to_fit(char* dialog, char* rg_id, int width_hint, int height_hint)  /* <=0 means "use min" */
 {
+    if (!dialog || !rg_id) return PRO_TK_BAD_INPUTS;
+
+    int min_w = 0, min_h = 0;
+    ProError st = ProUIRadiogroupMinimumsizeGet(dialog, rg_id, &min_w, &min_h);
+    if (st != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Warning: MinimumsizeGet failed for radiogroup '%s'\n", rg_id);
+        return st;
+    }
+
+    /* Hints are allowed, but clamp to >= minimums per API contract. */
+    int w = (width_hint > 0 ? width_hint : min_w);
+    int h = (height_hint > 0 ? height_hint : min_h);
+    if (w < min_w) w = min_w;
+    if (h < min_h) h = min_h;
+
+    st = ProUIRadiogroupSizeSet(dialog, rg_id, w, h);
+    if (st != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Warning: SizeSet(%d x %d) failed for radiogroup '%s'\n", w, h, rg_id);
+    }
+    return st;
+}
+
+ProError OnPictureRadioButtonParam(char* dialog, char* draw_area_name, RadioButtonParamNode* node, SymbolTable* st)
+ {
     ProError status;
+    if (!dialog || !draw_area_name || !node || !node->parameter || !st) {
+        ProPrintfChar("Error: Invalid inputs in OnPictureRadioButtonParam");
+        return PRO_TK_BAD_INPUTS;
+    }
 
     // Check if there are options available for the radio buttons
     if (node->option_count == 0) {
@@ -1791,55 +1942,43 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
         return PRO_TK_GENERAL_ERROR;
     }
 
-    // Generate a unique name for the sub-layout using a static counter
-    static int sub_layout_count = 0;
-    char sub_layout_name[100];
-    snprintf(sub_layout_name, sizeof(sub_layout_name), "radio_sub_layout_%d", sub_layout_count++);
-
-    // Set up grid options for the sub-layout in the parent layout
-    ProUIGridopts grid_opts_sub = { 0 };
-    grid_opts_sub.horz_cells = 1;
-    grid_opts_sub.vert_cells = 1;
-    grid_opts_sub.attach_bottom = PRO_B_TRUE;
-    grid_opts_sub.attach_left = PRO_B_TRUE;
-    grid_opts_sub.attach_right = PRO_B_TRUE;
-    grid_opts_sub.attach_top = PRO_B_TRUE;
-
-    if (node->on_picture) {
-        long pos_x;
-        status = evaluate_to_int(node->posX, st, &pos_x);
-        if (status != PRO_TK_NO_ERROR) {
-            ProPrintfChar("Error: Failed to evaluate posX for '%s'\n", node->parameter);
-            return status;
+    // Evaluate positions from expressions (fallback to 0 if missing or evaluation fails)
+    int x_pos = 0;
+    if (node->posX) {
+        long temp_x;
+        status = evaluate_to_int(node->posX, st, &temp_x);
+        if (status == PRO_TK_NO_ERROR) {
+            x_pos = (int)temp_x;
         }
-        long pos_y;
-        status = evaluate_to_int(node->posY, st, &pos_y);
-        if (status != PRO_TK_NO_ERROR) {
-            ProPrintfChar("Error: Failed to evaluate posY for '%s'\n", node->parameter);
-            return status;
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posX for '%s'; using x=0", node->parameter);
         }
-        grid_opts_sub.column = pos_x / 100;  // Map x position to column
-        grid_opts_sub.row = pos_y / 100;      // Map y position to row
     }
     else {
-        grid_opts_sub.column = column;
-        grid_opts_sub.row = *current_row;
-        (*current_row)++;  // Increment row for sequential placement
+        ProPrintfChar("Warning: posX missing in ON_PICTURE for '%s'; using x=0", node->parameter);
     }
 
-    // Add the sub-layout to the parent layout
-    status = ProUILayoutLayoutAdd(dialog_name, parent_layout_name, sub_layout_name, &grid_opts_sub);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Error: Could not add sub-layout for radio group '%s'.\n", node->parameter);
-        return status;
+    int y_pos = 0;
+    if (node->posY) {
+        long temp_y;
+        status = evaluate_to_int(node->posY, st, &temp_y);
+        if (status == PRO_TK_NO_ERROR) {
+            y_pos = (int)temp_y;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posY for '%s'; using y=0", node->parameter);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posY missing in ON_PICTURE for '%s'; using y=0", node->parameter);
     }
 
-    // Decorate the sub-layout
-    status = ProUILayoutDecorate(dialog_name, sub_layout_name);
-    if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Error: Could not decorate sub-layout for radio group '%s'.\n", node->parameter);
-        return status;
-    }
+    // Generate unique names for label and radio group component
+    char label_id[100];
+    snprintf(label_id, sizeof(label_id), "radio_label_%s", node->parameter);
+    static int radio_count = 0;
+    char rb_component_name[100];
+    snprintf(rb_component_name, sizeof(rb_component_name), "radio_group_%s", node->parameter);
 
     // Convert parameter to wide string
     wchar_t* w_parameter = char_to_wchar(node->parameter);
@@ -1848,12 +1987,22 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
         return PRO_TK_GENERAL_ERROR;
     }
 
-    // Determine if the required option is present and format the label accordingly
-    wchar_t layout_text[200];
-    if (node->required) {
-        swprintf(layout_text, sizeof(layout_text) / sizeof(wchar_t), L"%ls (REQUIRED)", w_parameter);
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->parameter, &w_friendly)) {
+            /* swap: caller must free the active pointer later */
+            free(w_parameter);
+            w_parameter = w_friendly;  /* e.g., "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
 
-        // NEW: Add to REQUIRE_RADIOS array in symbol table
+
+    // Determine if the required option is present and format the label accordingly
+    wchar_t label_text[200];
+    if (node->required) {
+        swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls (REQUIRED)", w_parameter);
+
+        // Add to REQUIRE_RADIOS array in symbol table
         Variable* req_var = get_symbol(st, "REQUIRE_RADIOS");
         if (!req_var) {
             req_var = malloc(sizeof(Variable));
@@ -1888,37 +2037,47 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
         req_var->data.array.size = new_size;
     }
     else {
-        swprintf(layout_text, sizeof(layout_text) / sizeof(wchar_t), L"%ls", w_parameter);
+        swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls", w_parameter);
     }
-
-    // Set the sub-layout text using the formatted label
-    status = ProUILayoutTextSet(dialog_name, sub_layout_name, layout_text);
     free(w_parameter);
+
+    // Add label to drawing area
+    status = ProUIDrawingareaLabelAdd(dialog, draw_area_name, label_id);
     if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Error: Could not set text for sub-layout '%s'.\n", node->parameter);
         return status;
     }
 
-    // Generate a unique name for the radio group component
-    char rb_component_name[100];
-    snprintf(rb_component_name, sizeof(rb_component_name), "radio_group_%d", sub_layout_count);
-
-    // Set up grid options for the radio group within the sub-layout
-    ProUIGridopts grid_opts_rb = { 0 };
-    grid_opts_rb.column = 0;
-    grid_opts_rb.row = 0;
-    grid_opts_rb.horz_cells = 1;
-    grid_opts_rb.vert_cells = 1;
-
-    // Add the radio group to the sub-layout
-    status = ProUILayoutRadiogroupAdd(dialog_name, sub_layout_name, rb_component_name, &grid_opts_rb);
+    // Set label text
+    status = ProUILabelTextSet(dialog, label_id, label_text);
     if (status != PRO_TK_NO_ERROR) {
-        ProPrintfChar("Error: Could not add radio group '%s' to sub-layout.\n", node->parameter);
+        return status;
+    }
+
+    // Set label position
+    status = ProUILabelPositionSet(dialog, label_id, x_pos, y_pos);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not set position for label '%s'\n", label_id);
+        return status;
+    }
+
+    // Add the radio group to the drawing area
+    status = ProUIDrawingareaRadiogroupAdd(dialog, draw_area_name, rb_component_name);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not add radio group '%s' to drawing area.\n", node->parameter);
+        return status;
+    }
+
+    (void)radiogroup_shrink_to_fit(dialog, rb_component_name, 4, 2);
+
+    // Set the radio group position (below the label for vertical stacking)
+    status = ProUIRadiogroupPositionSet(dialog, rb_component_name, x_pos, y_pos + 20);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not set position for radio group '%s'\n", rb_component_name);
         return status;
     }
 
     // Set the radio group orientation to vertical
-    status = ProUIRadiogroupOrientationSet(dialog_name, rb_component_name, 1);
+    status = ProUIRadiogroupOrientationSet(dialog, rb_component_name, 1);
     if (status != PRO_TK_NO_ERROR) {
         ProPrintfChar("Error: Could not set orientation for radio group '%s'.\n", node->parameter);
         return status;
@@ -1967,14 +2126,14 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
     }
 
     // Set the radio group names
-    status = ProUIRadiogroupNamesSet(dialog_name, rb_component_name, option_count, button_names);
+    status = ProUIRadiogroupNamesSet(dialog, rb_component_name, option_count, button_names);
     if (status != PRO_TK_NO_ERROR) {
         ProPrintfChar("Error: Could not set names for radio group '%s'.\n", node->parameter);
         goto cleanup;
     }
 
     // Set the radio group labels
-    status = ProUIRadiogroupLabelsSet(dialog_name, rb_component_name, option_count, button_labels);
+    status = ProUIRadiogroupLabelsSet(dialog, rb_component_name, option_count, button_labels);
     if (status != PRO_TK_NO_ERROR) {
         ProPrintfChar("Error: Could not set labels for radio group '%s'.\n", node->parameter);
         goto cleanup;
@@ -1986,12 +2145,12 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
         char* initial_name = button_names[0];  // First option name
         int n_names = 1;
         char* names[1] = { initial_name };
-        status = ProUIRadiogroupSelectednamesSet(dialog_name, rb_component_name, n_names, names);
+        status = ProUIRadiogroupSelectednamesSet(dialog, rb_component_name, n_names, names);
         if (status != PRO_TK_NO_ERROR) {
             ProPrintfChar("Error: Could not set initial selection for radio group '%s'.\n", node->parameter);
             goto cleanup;
         }
-        var->data.int_value = 0;  // Ensure variable matches UI (overrides any prior -1, aligns with semantics)
+        var->data.int_value = 0;  // Ensure variable matches UI
 
         // Log the default selection
         LogOnlyPrintfChar("Default Selection Index: %d ", var->data.int_value);
@@ -2001,7 +2160,7 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
     RadioSelectData* select_data = (RadioSelectData*)malloc(sizeof(RadioSelectData));
     if (!select_data) {
         ProPrintfChar("Error: Memory allocation failed for RadioSelectData of '%s'\n", node->parameter);
-        goto cleanup;  // Assuming existing cleanup label handles freeing resources
+        goto cleanup;
     }
     select_data->st = st;
     select_data->parameter = _strdup(node->parameter);
@@ -2010,9 +2169,11 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
         ProPrintfChar("Error: Memory allocation failed for parameter name '%s'\n", node->parameter);
         goto cleanup;
     }
+    ensure_radio_options_map(st, node->parameter, button_names, option_count, node->required ? 1 : 0);
+
 
     // Register the selection callback
-    status = ProUIRadiogroupSelectActionSet(dialog_name, rb_component_name, RadioSelectCallback, (ProAppData)select_data);
+    status = ProUIRadiogroupSelectActionSet(dialog, rb_component_name, RadioSelectCallback, (ProAppData)select_data);
     if (status != PRO_TK_NO_ERROR) {
         free(select_data->parameter);
         free(select_data);
@@ -2027,7 +2188,7 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
         if (status == PRO_TK_NO_ERROR && tooltip_str) {
             wchar_t* w_tooltip = char_to_wchar(tooltip_str);
             if (w_tooltip) {
-                ProUIRadiogroupHelptextSet(dialog_name, rb_component_name, w_tooltip);
+                ProUIRadiogroupHelptextSet(dialog, rb_component_name, w_tooltip);
                 free(w_tooltip);
             }
             free(tooltip_str);
@@ -2036,6 +2197,242 @@ ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioB
 
 cleanup:
     // Free allocated memory
+    for (int i = 0; i < option_count; i++) {
+        free(button_names[i]);
+        free(button_labels[i]);
+    }
+    free(button_names);
+    free(button_labels);
+
+    return status;
+}
+
+ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioButtonParamNode* node, int* current_row, int column, SymbolTable* st)
+{
+    ProError status;
+
+    if (node->option_count == 0) {
+        ProPrintfChar("Error: No options provided for radio button group '%s'.\n", node->parameter);
+        return PRO_TK_GENERAL_ERROR;
+    }
+
+    static int sub_layout_count = 0;
+    char sub_layout_name[100];
+    snprintf(sub_layout_name, sizeof(sub_layout_name), "radio_sub_layout_%d", sub_layout_count++);
+
+    ProUIGridopts grid_opts_sub = { 0 };
+    grid_opts_sub.horz_cells = 1;
+    grid_opts_sub.vert_cells = 1;
+    grid_opts_sub.attach_bottom = PRO_B_TRUE;
+    grid_opts_sub.attach_left = PRO_B_TRUE;
+    grid_opts_sub.attach_right = PRO_B_TRUE;
+    grid_opts_sub.attach_top = PRO_B_TRUE;
+    grid_opts_sub.column = column;
+    grid_opts_sub.row = *current_row;
+    (*current_row)++;
+
+    status = ProUILayoutLayoutAdd(dialog_name, parent_layout_name, sub_layout_name, &grid_opts_sub);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not add sub-layout for radio group '%s'.\n", node->parameter);
+        return status;
+    }
+
+    status = ProUILayoutDecorate(dialog_name, sub_layout_name);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not decorate sub-layout for radio group '%s'.\n", node->parameter);
+        return status;
+    }
+
+    /* Build group title */
+    wchar_t* w_parameter = char_to_wchar(node->parameter);
+    if (!w_parameter) {
+        ProPrintf(L"Conversion to wide string failed for parameter\n");
+        return PRO_TK_GENERAL_ERROR;
+    }
+
+    /* === NEW: replace with friendly name from sel_list.txt if available === */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->parameter, &w_friendly)) {
+            /* swap: caller must free the active pointer later */
+            free(w_parameter);
+            w_parameter = w_friendly;  /* e.g., "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+    /* === END NEW === */
+
+    wchar_t layout_text[200];
+    if (node->required) {
+        swprintf(layout_text, sizeof(layout_text) / sizeof(wchar_t), L"%ls (REQUIRED)", w_parameter);
+
+        /* Track required radio groups in symbol table (unchanged) */
+        Variable* req_var = get_symbol(st, "REQUIRE_RADIOS");
+        if (!req_var) {
+            req_var = (Variable*)malloc(sizeof(Variable));
+            if (!req_var) { free(w_parameter); return PRO_TK_GENERAL_ERROR; }
+            req_var->type = TYPE_ARRAY;
+            req_var->data.array.size = 0;
+            req_var->data.array.elements = NULL;
+            set_symbol(st, "REQUIRE_RADIOS", req_var);
+        }
+        else if (req_var->type != TYPE_ARRAY) {
+            free(w_parameter);
+            return PRO_TK_GENERAL_ERROR;
+        }
+
+        Variable* param_name_var = (Variable*)malloc(sizeof(Variable));
+        if (!param_name_var) { free(w_parameter); return PRO_TK_GENERAL_ERROR; }
+        param_name_var->type = TYPE_STRING;
+        param_name_var->data.string_value = _strdup(node->parameter);
+        if (!param_name_var->data.string_value) { free(param_name_var); free(w_parameter); return PRO_TK_GENERAL_ERROR; }
+
+        size_t new_size = req_var->data.array.size + 1;
+        Variable** new_elements = (Variable**)realloc(req_var->data.array.elements, new_size * sizeof(Variable*));
+        if (!new_elements) {
+            free(param_name_var->data.string_value);
+            free(param_name_var);
+            free(w_parameter);
+            return PRO_TK_GENERAL_ERROR;
+        }
+        req_var->data.array.elements = new_elements;
+        req_var->data.array.elements[new_size - 1] = param_name_var;
+        req_var->data.array.size = new_size;
+    }
+    else {
+        swprintf(layout_text, sizeof(layout_text) / sizeof(wchar_t), L"%ls", w_parameter);
+    }
+
+    status = ProUILayoutTextSet(dialog_name, sub_layout_name, layout_text);
+    free(w_parameter);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not set text for sub-layout '%s'.\n", node->parameter);
+        return status;
+    }
+
+    char rb_component_name[100];
+    snprintf(rb_component_name, sizeof(rb_component_name), "radio_group_%s", node->parameter);
+
+    ProUIGridopts grid_opts_rb = { 0 };
+    grid_opts_rb.column = 0;
+    grid_opts_rb.row = 0;
+    grid_opts_rb.horz_cells = 1;
+    grid_opts_rb.vert_cells = 1;
+
+    status = ProUILayoutRadiogroupAdd(dialog_name, sub_layout_name, rb_component_name, &grid_opts_rb);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not add radio group '%s' to sub-layout.\n", node->parameter);
+        return status;
+    }
+
+    status = ProUIRadiogroupOrientationSet(dialog_name, rb_component_name, 1);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not set orientation for radio group '%s'.\n", node->parameter);
+        return status;
+    }
+
+    int option_count = (int)node->option_count;
+    char** button_names = (char**)malloc(option_count * sizeof(char*));
+    wchar_t** button_labels = (wchar_t**)malloc(option_count * sizeof(wchar_t*));
+    if (!button_names || !button_labels) {
+        ProPrintfChar("Error: Memory allocation failed for radio group '%s'.\n", node->parameter);
+        free(button_names);
+        free(button_labels);
+        return PRO_TK_GENERAL_ERROR;
+    }
+
+    for (int i = 0; i < option_count; i++) {
+        char* option_str = NULL;
+        status = evaluate_to_string(node->options[i], st, &option_str);
+        if (status != PRO_TK_NO_ERROR || !option_str) {
+            ProPrintfChar("Error: Failed to evaluate option %d for '%s'.\n", i, node->parameter);
+            for (int j = 0; j < i; j++) {
+                free(button_names[j]);
+                free(button_labels[j]);
+            }
+            free(button_names);
+            free(button_labels);
+            return status;
+        }
+
+        button_labels[i] = char_to_wchar(option_str);
+        if (!button_labels[i]) {
+            ProPrintfChar("Error: Wide string conversion failed for option %d.\n", i);
+            free(option_str);
+            for (int j = 0; j < i; j++) {
+                free(button_names[j]);
+                free(button_labels[j]);
+            }
+            free(button_names);
+            free(button_labels);
+            return PRO_TK_GENERAL_ERROR;
+        }
+
+        button_names[i] = option_str; /* keep; freed in cleanup */
+    }
+
+    status = ProUIRadiogroupNamesSet(dialog_name, rb_component_name, option_count, button_names);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not set names for radio group '%s'.\n", node->parameter);
+        goto cleanup;
+    }
+
+    status = ProUIRadiogroupLabelsSet(dialog_name, rb_component_name, option_count, button_labels);
+    if (status != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Error: Could not set labels for radio group '%s'.\n", node->parameter);
+        goto cleanup;
+    }
+
+    Variable* var = get_symbol(st, node->parameter);
+    if (var && var->type == TYPE_INTEGER && option_count > 0) {
+        char* initial_name = button_names[0];
+        int n_names = 1;
+        char* names[1] = { initial_name };
+        status = ProUIRadiogroupSelectednamesSet(dialog_name, rb_component_name, n_names, names);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Error: Could not set initial selection for radio group '%s'.\n", node->parameter);
+            goto cleanup;
+        }
+        var->data.int_value = 0;
+        LogOnlyPrintfChar("Default Selection Index: %d ", var->data.int_value);
+    }
+
+    RadioSelectData* select_data = (RadioSelectData*)malloc(sizeof(RadioSelectData));
+    if (!select_data) {
+        ProPrintfChar("Error: Memory allocation failed for RadioSelectData of '%s'\n", node->parameter);
+        goto cleanup;
+    }
+    select_data->st = st;
+    select_data->parameter = _strdup(node->parameter);
+    if (!select_data->parameter) {
+        free(select_data);
+        ProPrintfChar("Error: Memory allocation failed for parameter name '%s'\n", node->parameter);
+        goto cleanup;
+    }
+
+    ensure_radio_options_map(st, node->parameter, button_names, option_count, node->required ? 1 : 0);
+
+    status = ProUIRadiogroupSelectActionSet(dialog_name, rb_component_name, RadioSelectCallback, (ProAppData)select_data);
+    if (status != PRO_TK_NO_ERROR) {
+        free(select_data->parameter);
+        free(select_data);
+        ProPrintfChar("Error: Could not set selection action for radio group '%s'.\n", node->parameter);
+        goto cleanup;
+    }
+
+    if (node->tooltip_message) {
+        char* tooltip_str = NULL;
+        status = evaluate_to_string(node->tooltip_message, st, &tooltip_str);
+        if (status == PRO_TK_NO_ERROR && tooltip_str) {
+            wchar_t* w_tooltip = char_to_wchar(tooltip_str);
+            if (w_tooltip) {
+                ProUIRadiogroupHelptextSet(dialog_name, rb_component_name, w_tooltip);
+                free(w_tooltip);
+            }
+            free(tooltip_str);
+        }
+    }
+
+cleanup:
     for (int i = 0; i < option_count; i++) {
         free(button_names[i]);
         free(button_labels[i]);
@@ -2070,6 +2467,228 @@ void set_bool_in_map(HashTable* map, const char* key, int on)
         v->type = TYPE_BOOL;
         v->data.int_value = on ? 1 : 0;
     }
+}
+
+ProError OnPictureUserSelect(char* dialog, char* draw_area_name, UserSelectNode* node, SymbolTable* st)
+{
+    if (!dialog || !draw_area_name || !node || !node->reference || !st)
+        return PRO_TK_BAD_INPUTS;
+    LogOnlyPrintfChar("Entering OnPIctureUserSelect");
+    ProError status;
+
+    // Idempotence guard: if we already created this ref's widgets, do nothing
+    {
+        Variable* guard = get_symbol(st, node->reference);
+        if (guard && guard->type == TYPE_MAP) {
+            Variable* existed = hash_table_lookup(guard->data.map, "button_id");
+            if (existed && existed->type == TYPE_STRING && existed->data.string_value) {
+                ProPrintfChar("Info: USER_SELECT '%s' already exists; skipping re-create", node->reference);
+                return PRO_TK_NO_ERROR;
+            }
+        }
+    }
+
+    // Unique ids (reference-based)
+    char button_draw[128];
+    char button_id[128];
+    snprintf(button_draw, sizeof(button_draw), "button_draw_%s", node->reference);
+    snprintf(button_id, sizeof(button_id), "user_select_button_%s", node->reference);
+
+    // Persist control IDs and initialize flags if absent (pre-tagged IF flags are preserved)
+    {
+        Variable* sel_var = get_symbol(st, node->reference);
+        if (sel_var && sel_var->type == TYPE_MAP && sel_var->data.map) {
+            Variable* vbtn = (Variable*)malloc(sizeof(Variable));
+            Variable* vdar = (Variable*)malloc(sizeof(Variable));
+            if (vbtn && vdar) {
+                vbtn->type = TYPE_STRING; vbtn->data.string_value = _strdup(button_id);
+                vdar->type = TYPE_STRING; vdar->data.string_value = _strdup(button_draw);
+                hash_table_insert(sel_var->data.map, "button_id", vbtn);
+                hash_table_insert(sel_var->data.map, "draw_area_id", vdar);
+            }
+
+            if (!hash_table_lookup(sel_var->data.map, "ui_enabled"))
+                set_bool_in_map(sel_var->data.map, "ui_enabled", 1);
+            if (!hash_table_lookup(sel_var->data.map, "ui_required"))
+                set_bool_in_map(sel_var->data.map, "ui_required", 1);
+        }
+    }
+
+    // Read flags after persistence (respect any IF pre-tagging)
+    int ui_enabled = 1;
+    int ui_required = 1;
+    {
+        Variable* sel_var = get_symbol(st, node->reference);
+        if (sel_var && sel_var->type == TYPE_MAP && sel_var->data.map) {
+            Variable* en = hash_table_lookup(sel_var->data.map, "ui_enabled");
+            Variable* rq = hash_table_lookup(sel_var->data.map, "ui_required");
+            ui_enabled = (en && (en->type == TYPE_BOOL || en->type == TYPE_INTEGER)) ? (en->data.int_value != 0) : 1;
+            ui_required = (rq && (rq->type == TYPE_BOOL || rq->type == TYPE_INTEGER)) ? (rq->data.int_value != 0) : 1;
+        }
+    }
+
+    // Evaluate positions from expressions (fallback to 0 if missing or evaluation fails)
+    int x_pos = 0;
+    if (node->posX) {
+        long temp_x;
+        status = evaluate_to_int(node->posX, st, &temp_x);
+        if (status == PRO_TK_NO_ERROR) {
+            x_pos = (int)temp_x;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posX for '%s'; using x=0", node->reference);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posX missing in ON_PICTURE for '%s'; using x=0", node->reference);
+    }
+
+    int y_pos = 0;
+    if (node->posY) {
+        long temp_y;
+        status = evaluate_to_int(node->posY, st, &temp_y);
+        if (status == PRO_TK_NO_ERROR) {
+            y_pos = (int)temp_y;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posY for '%s'; using y=0", node->reference);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posY missing in ON_PICTURE for '%s'; using y=0", node->reference);
+    }
+
+    // Container drawing area
+    status = ProUIDrawingareaDrawingareaAdd(dialog, draw_area_name, button_draw);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    if (ui_required) {
+        ProUILayoutTextSet(dialog, button_draw, L"REQUIRED");
+    }
+
+    status = ProUIDrawingareaDrawingheightSet(dialog, button_draw, 25);
+    if (status != PRO_TK_NO_ERROR) return status;
+    status = ProUIDrawingareaDrawingwidthSet(dialog, button_draw, 146);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    ProUIDrawingareaPositionSet(dialog, button_draw, x_pos, y_pos);
+
+    // Pushbutton inside the child drawing area
+    status = ProUIDrawingareaPushbuttonAdd(dialog, button_draw, button_id);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Place the button; final fit later
+    ProUIPushbuttonPositionSet(dialog, button_id, 0, 1);
+
+    // Keep REQUIRED_SELECTS in sync with ui_required
+    if (ui_required) require_select(st, node->reference);
+    else             unrequire_select(st, node->reference);
+
+    // Button text
+    char ref_text[160];
+    snprintf(ref_text, sizeof(ref_text), "%s", node->reference);
+
+    char button_text[256];
+    snprintf(button_text, sizeof(button_text), "%s", ref_text);
+
+    {
+        Variable* select_var = get_symbol(st, node->reference);
+        if (select_var && select_var->type == TYPE_MAP) {
+            Variable* tag_var = hash_table_lookup(select_var->data.map, "tag");
+            if (tag_var && tag_var->type == TYPE_STRING && tag_var->data.string_value && tag_var->data.string_value[0] != '\0') {
+                snprintf(button_text, sizeof(button_text), "(%s) %s", tag_var->data.string_value, ref_text);
+            }
+        }
+    }
+
+    wchar_t* w_button_text = char_to_wchar(button_text);
+    if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->reference, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
+
+    status = ProUIPushbuttonTextSet(dialog, button_id, w_button_text);
+    free(w_button_text);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Tooltip (optional)
+    if (node->tooltip_message) {
+        char* tip = NULL;
+        if (evaluate_to_string(node->tooltip_message, st, &tip) == PRO_TK_NO_ERROR && tip) {
+            wchar_t* wtip = char_to_wchar(tip);
+            if (wtip) {
+                ProUIPushbuttonHelptextSet(dialog, button_id, wtip);
+                free(wtip);
+            }
+            free(tip);
+        }
+    }
+
+    // Wire collector callback
+    {
+        UserSelectData* sel_data = (UserSelectData*)calloc(1, sizeof(UserSelectData));
+        if (!sel_data) return PRO_TK_GENERAL_ERROR;
+        sel_data->st = st;
+        sel_data->node = node;
+        snprintf(sel_data->draw_area_id, sizeof(sel_data->draw_area_id), "%s", button_draw);
+        snprintf(sel_data->button_id, sizeof(sel_data->button_id), "%s", button_id);
+
+        status = ProUIPushbuttonActivateActionSet(dialog, button_id, UserSelectCallback, (ProAppData)sel_data);
+        if (status != PRO_TK_NO_ERROR) { free(sel_data); return status; }
+    }
+
+    // Auto-fit the button inside its drawing area
+    {
+        status = fit_pushbutton_to_drawingarea(dialog, button_draw, button_id);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not fit pushbutton '%s' inside '%s'\n", button_id, button_draw);
+        }
+
+        ButtonFitData* fit_data = (ButtonFitData*)calloc(1, sizeof(ButtonFitData));
+        if (fit_data) {
+            snprintf(fit_data->draw_area, sizeof(fit_data->draw_area), "%s", button_draw);
+            snprintf(fit_data->button_id, sizeof(fit_data->button_id), "%s", button_id);
+            status = ProUIDrawingareaPostmanagenotifyActionSet(dialog, button_draw, UserSelectResizeCallback, (ProAppData)fit_data);
+            if (status != PRO_TK_NO_ERROR) {
+                ProPrintfChar("Warning: Could not set resize callback for '%s'\n", button_draw);
+                free(fit_data);
+            }
+        }
+    }
+
+    // Now apply initial enabled/disabled state to actual widgets
+    if (!ui_enabled) {
+        ProUIPushbuttonDisable(dialog, button_id);
+        ProUIDrawingareaDisable(dialog, button_draw);
+    }
+    else {
+        ProUIPushbuttonEnable(dialog, button_id);
+        ProUIDrawingareaEnable(dialog, button_draw);
+    }
+
+    // Allocate and set update data
+    UpdateData* update_data = (UpdateData*)calloc(1, sizeof(UpdateData));
+    if (update_data) {
+        update_data->st = st;
+        snprintf(update_data->reference, sizeof(update_data->reference), "%s", node->reference);
+        status = ProUIDrawingareaUpdateActionSet(dialog, button_draw, UserSelectUpdateCallback, (ProAppData)update_data);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not set update callback for '%s'\n", button_draw);
+            free(update_data);
+        }
+    }
+
+    /* Force initial repaint to apply color via callback */
+    (void)ProUIDrawingareaClear(dialog, button_draw);  /* Triggers update callback for redraw */
+
+    return PRO_TK_NO_ERROR;
 }
 
 ProError addUserSelect(char* dialog_name, char* parent_layout_name, UserSelectNode* node, int* current_row, int column, SymbolTable* st)
@@ -2140,6 +2759,7 @@ ProError addUserSelect(char* dialog_name, char* parent_layout_name, UserSelectNo
     grid.attach_right = PRO_B_TRUE;
     grid.bottom_offset = 3;
 
+
     status = ProUILayoutDrawingareaAdd(dialog_name, parent_layout_name, button_draw, &grid);
     if (status != PRO_TK_NO_ERROR) return status;
 
@@ -2184,6 +2804,16 @@ ProError addUserSelect(char* dialog_name, char* parent_layout_name, UserSelectNo
 
     wchar_t* w_button_text = char_to_wchar(button_text);
     if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->reference, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
     status = ProUIPushbuttonTextSet(dialog_name, button_id, w_button_text);
     free(w_button_text);
     if (status != PRO_TK_NO_ERROR) return status;
@@ -2260,6 +2890,202 @@ ProError addUserSelect(char* dialog_name, char* parent_layout_name, UserSelectNo
 
     (*current_row)++;
     return PRO_TK_NO_ERROR;
+}
+
+ProError OnPictureUserSelectOptional(char* dialog, char* draw_area_name, UserSelectOptionalNode* node, SymbolTable* st)
+{
+    if (!dialog || !draw_area_name || !node || !node->reference || !st)
+        return PRO_TK_BAD_INPUTS;
+
+    ProError status;
+
+    // idempotence guard (unchanged) 
+    Variable* sel_var_guard = get_symbol(st, node->reference);
+    if (sel_var_guard && sel_var_guard->type == TYPE_MAP) {
+        Variable* existed = hash_table_lookup(sel_var_guard->data.map, "button_id");
+        if (existed && existed->type == TYPE_STRING && existed->data.string_value) {
+            ProPrintfChar("Info: USER_SELECT '%s' already exists; skipping re-create", node->reference);
+            return PRO_TK_NO_ERROR;
+        }
+    }
+    // Unique ids (reference-based)
+    char button_draw[128];
+    char button_id[128];
+    snprintf(button_draw, sizeof(button_draw), "button_draw_%s", node->reference);
+    snprintf(button_id, sizeof(button_id), "user_select_button_%s", node->reference);
+
+    // Persist control IDs into the select variable's map for later toggling 
+    Variable* sel_var = get_symbol(st, node->reference);
+    if (sel_var && sel_var->type == TYPE_MAP)
+    {
+        Variable* vbtn = (Variable*)malloc(sizeof(Variable));
+        Variable* vdar = (Variable*)malloc(sizeof(Variable));
+        if (vbtn && vdar)
+        {
+            vbtn->type = TYPE_STRING;
+            vbtn->data.string_value = _strdup(button_id);
+            vdar->type = TYPE_STRING;
+            vdar->data.string_value = _strdup(button_draw);
+            hash_table_insert(sel_var->data.map, "button_id", vbtn);
+            hash_table_insert(sel_var->data.map, "draw_area_id", vdar);
+
+            // initialize runtime UI state flags 
+            set_bool_in_map(sel_var->data.map, "ui_enabled", 1);  // starts enabled 
+            // ui_required mirrors enabled; REQUIRED_SELECTS is the source of truth 
+            set_bool_in_map(sel_var->data.map, "ui_required", 1);
+
+            LogOnlyPrintfChar("Drawingarea ID: %s", vdar->data.string_value);
+        }
+    }
+
+    // Evaluate positions from expressions (fallback to 0 if missing or evaluation fails)
+    int x_pos = 0;
+    if (node->posX) {
+        long temp_x;
+        status = evaluate_to_int(node->posX, st, &temp_x);
+        if (status == PRO_TK_NO_ERROR) {
+            x_pos = (int)temp_x;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posX for '%s'; using x=0", node->reference);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posX missing in ON_PICTURE for '%s'; using x=0", node->reference);
+    }
+
+    int y_pos = 0;
+    if (node->posY) {
+        long temp_y;
+        status = evaluate_to_int(node->posY, st, &temp_y);
+        if (status == PRO_TK_NO_ERROR) {
+            y_pos = (int)temp_y;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posY for '%s'; using y=0", node->reference);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posY missing in ON_PICTURE for '%s'; using y=0", node->reference);
+    }
+
+    // Container drawing area
+    status = ProUIDrawingareaDrawingareaAdd(dialog, draw_area_name, button_draw);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+
+    status = ProUIDrawingareaDrawingheightSet(dialog, button_draw, 25);
+    if (status != PRO_TK_NO_ERROR) return status;
+    status = ProUIDrawingareaDrawingwidthSet(dialog, button_draw, 146);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    ProUIDrawingareaPositionSet(dialog, button_draw, x_pos, y_pos);
+
+    // Pushbutton inside the child drawing area
+    status = ProUIDrawingareaPushbuttonAdd(dialog, button_draw, button_id);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Place the button; final fit later
+    ProUIPushbuttonPositionSet(dialog, button_id, 0, 1);
+
+    unrequire_select(st, node->reference);
+
+    // Button text
+    char ref_text[160];
+    snprintf(ref_text, sizeof(ref_text), "%s", node->reference);
+
+    char button_text[256];
+    snprintf(button_text, sizeof(button_text), "%s", ref_text);
+
+    {
+        Variable* select_var = get_symbol(st, node->reference);
+        if (select_var && select_var->type == TYPE_MAP) {
+            Variable* tag_var = hash_table_lookup(select_var->data.map, "tag");
+            if (tag_var && tag_var->type == TYPE_STRING && tag_var->data.string_value && tag_var->data.string_value[0] != '\0') {
+                snprintf(button_text, sizeof(button_text), "(%s) %s", tag_var->data.string_value, ref_text);
+            }
+        }
+    }
+
+    wchar_t* w_button_text = char_to_wchar(button_text);
+    if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->reference, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
+
+    status = ProUIPushbuttonTextSet(dialog, button_id, w_button_text);
+    free(w_button_text);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Tooltip (optional)
+    if (node->tooltip_message) {
+        char* tip = NULL;
+        if (evaluate_to_string(node->tooltip_message, st, &tip) == PRO_TK_NO_ERROR && tip) {
+            wchar_t* wtip = char_to_wchar(tip);
+            if (wtip) {
+                ProUIPushbuttonHelptextSet(dialog, button_id, wtip);
+                free(wtip);
+            }
+            free(tip);
+        }
+    }
+
+    // Wire collector callback
+    {
+        UserSelectOptionalData* sel_data = (UserSelectOptionalData*)calloc(1, sizeof(UserSelectOptionalData));
+        if (!sel_data) return PRO_TK_GENERAL_ERROR;
+        sel_data->st = st;
+        sel_data->node = node;
+        snprintf(sel_data->draw_area_id, sizeof(sel_data->draw_area_id), "%s", button_draw);
+        snprintf(sel_data->button_id, sizeof(sel_data->button_id), "%s", button_id);
+
+        status = ProUIPushbuttonActivateActionSet(dialog, button_id, UserSelectCallback, (ProAppData)sel_data);
+        if (status != PRO_TK_NO_ERROR) { free(sel_data); return status; }
+    }
+
+    // Auto-fit the button inside its drawing area
+    {
+        status = fit_pushbutton_to_drawingarea(dialog, button_draw, button_id);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not fit pushbutton '%s' inside '%s'\n", button_id, button_draw);
+        }
+
+        ButtonFitData* fit_data = (ButtonFitData*)calloc(1, sizeof(ButtonFitData));
+        if (fit_data) {
+            snprintf(fit_data->draw_area, sizeof(fit_data->draw_area), "%s", button_draw);
+            snprintf(fit_data->button_id, sizeof(fit_data->button_id), "%s", button_id);
+            status = ProUIDrawingareaPostmanagenotifyActionSet(dialog, button_draw, UserSelectResizeCallback, (ProAppData)fit_data);
+            if (status != PRO_TK_NO_ERROR) {
+                ProPrintfChar("Warning: Could not set resize callback for '%s'\n", button_draw);
+                free(fit_data);
+            }
+        }
+    }
+
+    // Allocate and set update data
+    UpdateData* update_data = (UpdateData*)calloc(1, sizeof(UpdateData));
+    if (update_data) {
+        update_data->st = st;
+        snprintf(update_data->reference, sizeof(update_data->reference), "%s", node->reference);
+        status = ProUIDrawingareaUpdateActionSet(dialog, button_draw, UserSelectUpdateCallback, (ProAppData)update_data);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not set update callback for '%s'\n", button_draw);
+            free(update_data);
+        }
+    }
+
+    /* Force initial repaint to apply color via callback */
+    (void)ProUIDrawingareaClear(dialog, button_draw);  /* Triggers update callback for redraw */
+
+    return PRO_TK_NO_ERROR;
+
 }
 
 ProError addUserSelectOptional(char* dialog_name, char* parent_layout_name, UserSelectOptionalNode* node, int* current_row, int column, SymbolTable* st)
@@ -2359,6 +3185,16 @@ ProError addUserSelectOptional(char* dialog_name, char* parent_layout_name, User
 
     wchar_t* w_button_text = char_to_wchar(button_text);
     if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->reference, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
     status = ProUIPushbuttonTextSet(dialog_name, button_id, w_button_text);
     free(w_button_text);
     if (status != PRO_TK_NO_ERROR) return status;
@@ -2429,6 +3265,229 @@ ProError addUserSelectOptional(char* dialog_name, char* parent_layout_name, User
 * 
 * 
 \*=================================================*/
+ProError OnPictureUserSelectMultiple(char* dialog, char* draw_area_name, UserSelectMultipleNode* node, SymbolTable* st)
+{
+    if (!dialog || !draw_area_name || !node || !node->array || !st)
+        return PRO_TK_BAD_INPUTS;
+
+    ProError status;
+
+    // Idempotence guard: if we already created this ref's widgets, do nothing
+    {
+        Variable* guard = get_symbol(st, node->array);
+        if (guard && guard->type == TYPE_MAP) {
+            Variable* existed = hash_table_lookup(guard->data.map, "button_id");
+            if (existed && existed->type == TYPE_STRING && existed->data.string_value) {
+                ProPrintfChar("Info: USER_SELECT '%s' already exists; skipping re-create", node->array);
+                return PRO_TK_NO_ERROR;
+            }
+        }
+    }
+
+    // Unique ids (reference-based)
+    char button_draw[128];
+    char button_id[128];
+    snprintf(button_draw, sizeof(button_draw), "button_draw_%s", node->array);
+    snprintf(button_id, sizeof(button_id), "user_select_button_%s", node->array);
+
+    // Persist control IDs and initialize flags if absent (pre-tagged IF flags are preserved)
+    {
+        Variable* sel_var = get_symbol(st, node->array);
+        if (sel_var && sel_var->type == TYPE_MAP && sel_var->data.map) {
+            Variable* vbtn = (Variable*)malloc(sizeof(Variable));
+            Variable* vdar = (Variable*)malloc(sizeof(Variable));
+            if (vbtn && vdar) {
+                vbtn->type = TYPE_STRING; vbtn->data.string_value = _strdup(button_id);
+                vdar->type = TYPE_STRING; vdar->data.string_value = _strdup(button_draw);
+                hash_table_insert(sel_var->data.map, "button_id", vbtn);
+                hash_table_insert(sel_var->data.map, "draw_area_id", vdar);
+            }
+
+            if (!hash_table_lookup(sel_var->data.map, "ui_enabled"))
+                set_bool_in_map(sel_var->data.map, "ui_enabled", 1);
+            if (!hash_table_lookup(sel_var->data.map, "ui_required"))
+                set_bool_in_map(sel_var->data.map, "ui_required", 1);
+        }
+    }
+
+    // Read flags after persistence (respect any IF pre-tagging)
+    int ui_enabled = 1;
+    int ui_required = 1;
+    {
+        Variable* sel_var = get_symbol(st, node->array);
+        if (sel_var && sel_var->type == TYPE_MAP && sel_var->data.map) {
+            Variable* en = hash_table_lookup(sel_var->data.map, "ui_enabled");
+            Variable* rq = hash_table_lookup(sel_var->data.map, "ui_required");
+            ui_enabled = (en && (en->type == TYPE_BOOL || en->type == TYPE_INTEGER)) ? (en->data.int_value != 0) : 1;
+            ui_required = (rq && (rq->type == TYPE_BOOL || rq->type == TYPE_INTEGER)) ? (rq->data.int_value != 0) : 1;
+        }
+    }
+
+    // Evaluate positions from expressions (fallback to 0 if missing or evaluation fails)
+    int x_pos = 0;
+    if (node->posX) {
+        long temp_x;
+        status = evaluate_to_int(node->posX, st, &temp_x);
+        if (status == PRO_TK_NO_ERROR) {
+            x_pos = (int)temp_x;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posX for '%s'; using x=0", node->array);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posX missing in ON_PICTURE for '%s'; using x=0", node->array);
+    }
+
+    int y_pos = 0;
+    if (node->posY) {
+        long temp_y;
+        status = evaluate_to_int(node->posY, st, &temp_y);
+        if (status == PRO_TK_NO_ERROR) {
+            y_pos = (int)temp_y;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posY for '%s'; using y=0", node->array);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posY missing in ON_PICTURE for '%s'; using y=0", node->array);
+    }
+
+    // Container drawing area
+    status = ProUIDrawingareaDrawingareaAdd(dialog, draw_area_name, button_draw);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    if (ui_required) {
+        ProUILayoutTextSet(dialog, button_draw, L"REQUIRED");
+    }
+
+    status = ProUIDrawingareaDrawingheightSet(dialog, button_draw, 25);
+    if (status != PRO_TK_NO_ERROR) return status;
+    status = ProUIDrawingareaDrawingwidthSet(dialog, button_draw, 146);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    ProUIDrawingareaPositionSet(dialog, button_draw, x_pos, y_pos);
+
+    // Pushbutton inside the child drawing area
+    status = ProUIDrawingareaPushbuttonAdd(dialog, button_draw, button_id);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Place the button; final fit later
+    ProUIPushbuttonPositionSet(dialog, button_id, 0, 1);
+
+    // Keep REQUIRED_SELECTS in sync with ui_required
+    if (ui_required) require_select(st, node->array);
+    else             unrequire_select(st, node->array);
+
+    // Button text
+    char ref_text[160];
+    snprintf(ref_text, sizeof(ref_text), "%s", node->array);
+
+    char button_text[256];
+    snprintf(button_text, sizeof(button_text), "%s", ref_text);
+
+    {
+        Variable* select_var = get_symbol(st, node->array);
+        if (select_var && select_var->type == TYPE_MAP) {
+            Variable* tag_var = hash_table_lookup(select_var->data.map, "tag");
+            if (tag_var && tag_var->type == TYPE_STRING && tag_var->data.string_value && tag_var->data.string_value[0] != '\0') {
+                snprintf(button_text, sizeof(button_text), "(%s) %s", tag_var->data.string_value, ref_text);
+            }
+        }
+    }
+
+    wchar_t* w_button_text = char_to_wchar(button_text);
+    if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->array, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
+
+    status = ProUIPushbuttonTextSet(dialog, button_id, w_button_text);
+    free(w_button_text);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Tooltip (optional)
+    if (node->tooltip_message) {
+        char* tip = NULL;
+        if (evaluate_to_string(node->tooltip_message, st, &tip) == PRO_TK_NO_ERROR && tip) {
+            wchar_t* wtip = char_to_wchar(tip);
+            if (wtip) {
+                ProUIPushbuttonHelptextSet(dialog, button_id, wtip);
+                free(wtip);
+            }
+            free(tip);
+        }
+    }
+
+    // Wire collector callback
+    {
+        UserSelectMultipleData* sel_data = (UserSelectMultipleData*)calloc(1, sizeof(UserSelectMultipleData));
+        if (!sel_data) return PRO_TK_GENERAL_ERROR;
+        sel_data->st = st;
+        sel_data->node = node;
+        snprintf(sel_data->draw_area_id, sizeof(sel_data->draw_area_id), "%s", button_draw);
+        snprintf(sel_data->button_id, sizeof(sel_data->button_id), "%s", button_id);
+
+        status = ProUIPushbuttonActivateActionSet(dialog, button_id, UserSelectCallback, (ProAppData)sel_data);
+        if (status != PRO_TK_NO_ERROR) { free(sel_data); return status; }
+    }
+
+    // Auto-fit the button inside its drawing area
+    {
+        status = fit_pushbutton_to_drawingarea(dialog, button_draw, button_id);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not fit pushbutton '%s' inside '%s'\n", button_id, button_draw);
+        }
+
+        ButtonFitData* fit_data = (ButtonFitData*)calloc(1, sizeof(ButtonFitData));
+        if (fit_data) {
+            snprintf(fit_data->draw_area, sizeof(fit_data->draw_area), "%s", button_draw);
+            snprintf(fit_data->button_id, sizeof(fit_data->button_id), "%s", button_id);
+            status = ProUIDrawingareaPostmanagenotifyActionSet(dialog, button_draw, UserSelectResizeCallback, (ProAppData)fit_data);
+            if (status != PRO_TK_NO_ERROR) {
+                ProPrintfChar("Warning: Could not set resize callback for '%s'\n", button_draw);
+                free(fit_data);
+            }
+        }
+    }
+
+    // Now apply initial enabled/disabled state to actual widgets
+    if (!ui_enabled) {
+        ProUIPushbuttonDisable(dialog, button_id);
+        ProUIDrawingareaDisable(dialog, button_draw);
+    }
+    else {
+        ProUIPushbuttonEnable(dialog, button_id);
+        ProUIDrawingareaEnable(dialog, button_draw);
+    }
+
+    // Allocate and set update data
+    UpdateData* update_data = (UpdateData*)calloc(1, sizeof(UpdateData));
+    if (update_data) {
+        update_data->st = st;
+        snprintf(update_data->reference, sizeof(update_data->reference), "%s", node->array);
+        status = ProUIDrawingareaUpdateActionSet(dialog, button_draw, UserSelectUpdateCallback, (ProAppData)update_data);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not set update callback for '%s'\n", button_draw);
+            free(update_data);
+        }
+    }
+
+    /* Force initial repaint to apply color via callback */
+    (void)ProUIDrawingareaClear(dialog, button_draw);  /* Triggers update callback for redraw */
+
+    return PRO_TK_NO_ERROR;
+
+}
+
 ProError addUserSelectMultiple(char* dialog_name, char* parent_layout_name, UserSelectMultipleNode* node, int* current_row, int column, SymbolTable* st)
 {
     if (!dialog_name || !parent_layout_name || !node || !node->array || !st)
@@ -2447,6 +3506,7 @@ ProError addUserSelectMultiple(char* dialog_name, char* parent_layout_name, User
             }
         }
     }
+
 
     // Unique ids (row-aware)
     char button_draw[128];
@@ -2541,6 +3601,16 @@ ProError addUserSelectMultiple(char* dialog_name, char* parent_layout_name, User
 
     wchar_t* w_button_text = char_to_wchar(button_text);
     if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->array, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
     status = ProUIPushbuttonTextSet(dialog_name, button_id, w_button_text);
     free(w_button_text);
     if (status != PRO_TK_NO_ERROR) return status;
@@ -2617,6 +3687,202 @@ ProError addUserSelectMultiple(char* dialog_name, char* parent_layout_name, User
 
     (*current_row)++;
     return PRO_TK_NO_ERROR;
+}
+
+ProError OnPictureUserSelectMultipleOptional(char* dialog, char* draw_area_name, UserSelectMultipleOptionalNode* node, SymbolTable* st)
+{
+    if (!dialog || !draw_area_name || !node || !node->array || !st)
+        return PRO_TK_BAD_INPUTS;
+
+    ProError status;
+
+    // idempotence guard (unchanged) 
+    Variable* sel_var_guard = get_symbol(st, node->array);
+    if (sel_var_guard && sel_var_guard->type == TYPE_MAP) {
+        Variable* existed = hash_table_lookup(sel_var_guard->data.map, "button_id");
+        if (existed && existed->type == TYPE_STRING && existed->data.string_value) {
+            ProPrintfChar("Info: USER_SELECT '%s' already exists; skipping re-create", node->array);
+            return PRO_TK_NO_ERROR;
+        }
+    }
+    // Unique ids (reference-based)
+    char button_draw[128];
+    char button_id[128];
+    snprintf(button_draw, sizeof(button_draw), "button_draw_%s", node->array);
+    snprintf(button_id, sizeof(button_id), "user_select_button_%s", node->array);
+
+    // Persist control IDs into the select variable's map for later toggling 
+    Variable* sel_var = get_symbol(st, node->array);
+    if (sel_var && sel_var->type == TYPE_MAP)
+    {
+        Variable* vbtn = (Variable*)malloc(sizeof(Variable));
+        Variable* vdar = (Variable*)malloc(sizeof(Variable));
+        if (vbtn && vdar)
+        {
+            vbtn->type = TYPE_STRING;
+            vbtn->data.string_value = _strdup(button_id);
+            vdar->type = TYPE_STRING;
+            vdar->data.string_value = _strdup(button_draw);
+            hash_table_insert(sel_var->data.map, "button_id", vbtn);
+            hash_table_insert(sel_var->data.map, "draw_area_id", vdar);
+
+            // initialize runtime UI state flags 
+            set_bool_in_map(sel_var->data.map, "ui_enabled", 1);  // starts enabled 
+            // ui_required mirrors enabled; REQUIRED_SELECTS is the source of truth 
+            set_bool_in_map(sel_var->data.map, "ui_required", 1);
+
+            LogOnlyPrintfChar("Drawingarea ID: %s", vdar->data.string_value);
+        }
+    }
+
+    // Evaluate positions from expressions (fallback to 0 if missing or evaluation fails)
+    int x_pos = 0;
+    if (node->posX) {
+        long temp_x;
+        status = evaluate_to_int(node->posX, st, &temp_x);
+        if (status == PRO_TK_NO_ERROR) {
+            x_pos = (int)temp_x;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posX for '%s'; using x=0", node->array);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posX missing in ON_PICTURE for '%s'; using x=0", node->array);
+    }
+
+    int y_pos = 0;
+    if (node->posY) {
+        long temp_y;
+        status = evaluate_to_int(node->posY, st, &temp_y);
+        if (status == PRO_TK_NO_ERROR) {
+            y_pos = (int)temp_y;
+        }
+        else {
+            ProPrintfChar("Warning: Failed to evaluate posY for '%s'; using y=0", node->array);
+        }
+    }
+    else {
+        ProPrintfChar("Warning: posY missing in ON_PICTURE for '%s'; using y=0", node->array);
+    }
+
+    // Container drawing area
+    status = ProUIDrawingareaDrawingareaAdd(dialog, draw_area_name, button_draw);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+
+    status = ProUIDrawingareaDrawingheightSet(dialog, button_draw, 25);
+    if (status != PRO_TK_NO_ERROR) return status;
+    status = ProUIDrawingareaDrawingwidthSet(dialog, button_draw, 146);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    ProUIDrawingareaPositionSet(dialog, button_draw, x_pos, y_pos);
+
+    // Pushbutton inside the child drawing area
+    status = ProUIDrawingareaPushbuttonAdd(dialog, button_draw, button_id);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Place the button; final fit later
+    ProUIPushbuttonPositionSet(dialog, button_id, 0, 1);
+
+    unrequire_select(st, node->array);
+
+    // Button text
+    char ref_text[160];
+    snprintf(ref_text, sizeof(ref_text), "%s", node->array);
+
+    char button_text[256];
+    snprintf(button_text, sizeof(button_text), "%s", ref_text);
+
+    {
+        Variable* select_var = get_symbol(st, node->array);
+        if (select_var && select_var->type == TYPE_MAP) {
+            Variable* tag_var = hash_table_lookup(select_var->data.map, "tag");
+            if (tag_var && tag_var->type == TYPE_STRING && tag_var->data.string_value && tag_var->data.string_value[0] != '\0') {
+                snprintf(button_text, sizeof(button_text), "(%s) %s", tag_var->data.string_value, ref_text);
+            }
+        }
+    }
+
+    wchar_t* w_button_text = char_to_wchar(button_text);
+    if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->array, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
+
+    status = ProUIPushbuttonTextSet(dialog, button_id, w_button_text);
+    free(w_button_text);
+    if (status != PRO_TK_NO_ERROR) return status;
+
+    // Tooltip (optional)
+    if (node->tooltip_message) {
+        char* tip = NULL;
+        if (evaluate_to_string(node->tooltip_message, st, &tip) == PRO_TK_NO_ERROR && tip) {
+            wchar_t* wtip = char_to_wchar(tip);
+            if (wtip) {
+                ProUIPushbuttonHelptextSet(dialog, button_id, wtip);
+                free(wtip);
+            }
+            free(tip);
+        }
+    }
+
+    // Wire collector callback
+    {
+        UserSelectMultipleOptionalData* sel_data = (UserSelectMultipleOptionalData*)calloc(1, sizeof(UserSelectMultipleOptionalData));
+        if (!sel_data) return PRO_TK_GENERAL_ERROR;
+        sel_data->st = st;
+        sel_data->node = node;
+        snprintf(sel_data->draw_area_id, sizeof(sel_data->draw_area_id), "%s", button_draw);
+        snprintf(sel_data->button_id, sizeof(sel_data->button_id), "%s", button_id);
+
+        status = ProUIPushbuttonActivateActionSet(dialog, button_id, UserSelectCallback, (ProAppData)sel_data);
+        if (status != PRO_TK_NO_ERROR) { free(sel_data); return status; }
+    }
+
+    // Auto-fit the button inside its drawing area
+    {
+        status = fit_pushbutton_to_drawingarea(dialog, button_draw, button_id);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not fit pushbutton '%s' inside '%s'\n", button_id, button_draw);
+        }
+
+        ButtonFitData* fit_data = (ButtonFitData*)calloc(1, sizeof(ButtonFitData));
+        if (fit_data) {
+            snprintf(fit_data->draw_area, sizeof(fit_data->draw_area), "%s", button_draw);
+            snprintf(fit_data->button_id, sizeof(fit_data->button_id), "%s", button_id);
+            status = ProUIDrawingareaPostmanagenotifyActionSet(dialog, button_draw, UserSelectResizeCallback, (ProAppData)fit_data);
+            if (status != PRO_TK_NO_ERROR) {
+                ProPrintfChar("Warning: Could not set resize callback for '%s'\n", button_draw);
+                free(fit_data);
+            }
+        }
+    }
+
+    // Allocate and set update data
+    UpdateData* update_data = (UpdateData*)calloc(1, sizeof(UpdateData));
+    if (update_data) {
+        update_data->st = st;
+        snprintf(update_data->reference, sizeof(update_data->reference), "%s", node->array);
+        status = ProUIDrawingareaUpdateActionSet(dialog, button_draw, UserSelectOptionalUpdateCallback, (ProAppData)update_data);
+        if (status != PRO_TK_NO_ERROR) {
+            ProPrintfChar("Warning: Could not set update callback for '%s'\n", button_draw);
+            free(update_data);
+        }
+    }
+
+    /* Force initial repaint to apply color via callback */
+    (void)ProUIDrawingareaClear(dialog, button_draw);  /* Triggers update callback for redraw */
+
+    return PRO_TK_NO_ERROR;
+
 }
 
 ProError addUserSelectMultipleOptional (char* dialog_name, char* parent_layout_name, UserSelectMultipleOptionalNode* node, int* current_row, int column, SymbolTable* st)
@@ -2717,6 +3983,17 @@ ProError addUserSelectMultipleOptional (char* dialog_name, char* parent_layout_n
 
     wchar_t* w_button_text = char_to_wchar(button_text);
     if (!w_button_text) return PRO_TK_GENERAL_ERROR;
+
+    /* NEW: override w_parameter with sel_list friendly name if available */
+    {
+        wchar_t* w_friendly = NULL;
+        if (selmap_lookup_w(node->array, &w_friendly)) {
+            free(w_button_text);
+            w_button_text = w_friendly; /* now shows e.g. "ALL SKELS" instead of "ALL_SKELS" */
+        }
+    }
+
+
     status = ProUIPushbuttonTextSet(dialog_name, button_id, w_button_text);
     free(w_button_text);
     if (status != PRO_TK_NO_ERROR) return status;
@@ -2788,7 +4065,6 @@ ProError addUserSelectMultipleOptional (char* dialog_name, char* parent_layout_n
 
 
 
-
 /*=================================================*\
 * 
 * Resizing of the GLOBAL_PICTURE to make sure it is 
@@ -2797,11 +4073,9 @@ ProError addUserSelectMultipleOptional (char* dialog_name, char* parent_layout_n
 \*=================================================*/
 ProError MyPostManageCallback(char* dialog, char* component, ProAppData app_data) {
     (void)component; // Unused, as in original
-
     ProError status;
     int da_width = 0, da_height = 0;
     int imageW = 0, imageH = 0;
-
     // Get drawing area dimensions
     status = ProUIDrawingareaDrawingwidthGet(dialog, "drawA1", &da_width);
     if (status != PRO_TK_NO_ERROR)
@@ -2809,14 +4083,12 @@ ProError MyPostManageCallback(char* dialog, char* component, ProAppData app_data
         ProPrintfChar("GLOBAL_PICTURE Command does not exist: Resorting to default size");
         return status;
     }
-
     status = ProUIDrawingareaDrawingheightGet(dialog, "drawA1", &da_height);
     if (status != PRO_TK_NO_ERROR)
     {
         ProPrintfChar("Could not get drawingarea height");
         return status;
     }
-
     // Cast app_data back to SymbolTable*
     SymbolTable* st = (SymbolTable*)app_data;
     if (!st)
@@ -2824,7 +4096,6 @@ ProError MyPostManageCallback(char* dialog, char* component, ProAppData app_data
         ProPrintfChar("Error: Invalid symbol table in addpicture");
         return PRO_TK_BAD_INPUTS;
     }
-
     // Retrieve filepath from symbol table(centralized access)
     Variable* pic_var = get_symbol(st, "GLOBAL_PICTURE");
     if (pic_var && pic_var->type == TYPE_STRING && pic_var->data.string_value &&
@@ -2842,10 +4113,8 @@ ProError MyPostManageCallback(char* dialog, char* component, ProAppData app_data
         ProPrintfChar("GLOBAL_PICTURE not found or has no value");
         imageW = imageH = 0; // Default if entry is missing or empty.
     }
-
     int offsetX = da_width > 0 ? (da_width - imageW) / 2 : 0;
     if (offsetX < 0) offsetX = 0;
-
     // Set the position of draw_area
     status = ProUIDrawingareaPositionSet(dialog, "draw_area", offsetX, 0);
     if (status != PRO_TK_NO_ERROR)
@@ -2853,10 +4122,24 @@ ProError MyPostManageCallback(char* dialog, char* component, ProAppData app_data
         ProPrintfChar("Could not set draw_area position");
         return status;
     }
-
+    // Resize the root table using stored table_id (after dialog is displayed)
+    Variable* root_table_var = get_symbol(st, "ROOT_TABLE_ID");
+    if (root_table_var && root_table_var->type == TYPE_STRING && root_table_var->data.string_value) {
+        char* table_id = root_table_var->data.string_value;
+        int da_table_height; int da_table_width;
+        status = ProUIDrawingareaSizeGet(dialog, "drawarea_tableid", &da_table_width, &da_table_height);
+        if (status == PRO_TK_NO_ERROR && da_table_width > 0 && da_table_height > 0) {
+            LogOnlyPrintfChar("Drawingarea size %d %d", da_table_width, da_table_height);
+            status = ProUITableSizeSet(dialog, table_id, da_table_width, da_table_height);
+            if (status != PRO_TK_NO_ERROR) {
+                ProPrintfChar("Error: Could not set table size for '%s'\n", table_id);
+            }
+        }
+        else {
+            ProPrintfChar("Error: Could not get valid drawing area size for table resizing\n");
+        }
+    }
     return PRO_TK_NO_ERROR;
-
-
 }
 
 /*=================================================*\
