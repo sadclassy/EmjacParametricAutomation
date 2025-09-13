@@ -871,6 +871,53 @@ ProError UserSelectOptionalCallback(char* dialog, char* component, ProAppData ap
 }
 
 
+/*=================================================*\
+* 
+* CHECKBOX_PARAM Logic
+* 
+* 
+\*=================================================*/
+ProError set_checkbox_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled)
+{
+    if (!dialog || !st || !param || !param[0]) return PRO_TK_BAD_INPUTS;
+
+    char id[128];
+    snprintf(id, sizeof(id), "checkbox_%s", param);  // matches creation path
+    // created here: OnPictureCheckboxParam(...): "checkbox_<param>"
+    // (and similarly in addCheckboxParam when not ON_PICTURE)
+
+    ProBoolean cur_enabled = PRO_B_TRUE;
+    ProError s = ProUICheckbuttonIsEnabled(dialog, id, &cur_enabled);
+    if (s != PRO_TK_NO_ERROR) {
+        // If we can't query, try to proceed anyway
+        cur_enabled = PRO_B_TRUE;
+    }
+
+    if (enabled) {
+        if (!cur_enabled) {
+            // Enable the UI control
+            // (Most Pro/TOOLKITs provide ProUICheckbuttonEnable; if not, use the generic component enable API.)
+            ProError e1 = ProUICheckbuttonEnable(dialog, id);
+            (void)e1;
+        }
+    }
+    else {
+        if (cur_enabled) {
+            // Disable the UI control
+            ProError e2 = ProUICheckbuttonDisable(dialog, id);
+            (void)e2;
+
+            // Sync the backing variable to 0 so logic doesn't see stale TRUE
+            Variable* v = get_symbol(st, (char*)param);
+            if (v && (v->type == TYPE_INTEGER || v->type == TYPE_BOOL)) {
+                v->data.int_value = 0;
+            }
+        }
+    }
+
+    return PRO_TK_NO_ERROR;
+}
+
 
 /*=================================================*\
 * 
@@ -1233,16 +1280,6 @@ int var_to_bool(const Variable* v, int dflt)
     return dflt;
 }
 
-// Helper to map ProUIColor to string for logging
-const char* uicolor_to_string(ProUIColor color) {
-    switch (color) {
-    case PRO_UI_COLOR_WHITE: return "WHITE";
-    case PRO_UI_COLOR_RED: return "RED";
-        // Add other colors if your policy expands (e.g., PRO_UI_COLOR_LT_GREY)
-    default: return "UNKNOWN";
-    }
-}
-
 ProError UserSelectOptionalUpdateCallback(char* dialog, char* component, ProAppData app_data)
 {
     if (!dialog || !component || !app_data) return PRO_TK_BAD_INPUTS;
@@ -1276,16 +1313,12 @@ ProError UserSelectOptionalUpdateCallback(char* dialog, char* component, ProAppD
         target = (satisfied == PRO_B_TRUE) ? PRO_UI_COLOR_WHITE : PRO_UI_COLOR_GREEN;
     }
 
-    /* Log the full state for debugging */
-    LogOnlyPrintfChar("Debug: Paint '%s' (draw_id '%s'): enabled=%d required=%d satisfied=%d target=%s disabled=%d\n",
-        reference, component, enabled, required, satisfied,
-        uicolor_to_string(target), !enabled);
 
     /* Set the foreground color */
     ProError status = ProUIDrawingareaFgcolorSet(dialog, component, target);
     if (status != PRO_TK_NO_ERROR) {
-        LogOnlyPrintfChar("Debug: Set failed for '%s' (target %s): status=%d\n",
-            reference, uicolor_to_string(target), status);
+        LogOnlyPrintfChar("Debug: Set failed for '%s' status=%d\n",
+            reference, status);
         return status;
     }
 
@@ -1320,9 +1353,6 @@ ProError UserSelectOptionalUpdateCallback(char* dialog, char* component, ProAppD
         return status;
     }
 
-    /* Log confirmation after set and redraw */
-    LogOnlyPrintfChar("Debug: Set and redraw succeeded for '%s': new color=%s\n",
-        reference, uicolor_to_string(target));
 
     return PRO_TK_NO_ERROR;
 }
@@ -1360,16 +1390,11 @@ ProError UserSelectUpdateCallback(char* dialog, char* component, ProAppData app_
         target = (satisfied == PRO_B_TRUE) ? PRO_UI_COLOR_WHITE : PRO_UI_COLOR_RED;
     }
 
-    /* Log the full state for debugging */
-    LogOnlyPrintfChar("Debug: Paint '%s' (draw_id '%s'): enabled=%d required=%d satisfied=%d target=%s disabled=%d\n",
-        reference, component, enabled, required, satisfied,
-        uicolor_to_string(target), !enabled);
-
     /* Set the foreground color */
     ProError status = ProUIDrawingareaFgcolorSet(dialog, component, target);
     if (status != PRO_TK_NO_ERROR) {
-        LogOnlyPrintfChar("Debug: Set failed for '%s' (target %s): status=%d\n",
-            reference, uicolor_to_string(target), status);
+        LogOnlyPrintfChar("Debug: Set failed for '%s' status=%d\n",
+            reference, status);
         return status;
     }
 
@@ -1404,9 +1429,6 @@ ProError UserSelectUpdateCallback(char* dialog, char* component, ProAppData app_
         return status;
     }
 
-    /* Log confirmation after set and redraw */
-    LogOnlyPrintfChar("Debug: Set and redraw succeeded for '%s': new color=%s\n",
-        reference, uicolor_to_string(target));
 
     return PRO_TK_NO_ERROR;
 }
@@ -1491,15 +1513,6 @@ ProError set_user_select_enabled(char* dialog, SymbolTable* st, const char* refe
         (void)UserSelectUpdateCallback(dialog, draw_id, (ProAppData)&temp_data);
     }
 
-    /* Single-line debug: shows what you asked for */
-    LogOnlyPrintfChar(
-        "Debug: USER_SELECT '%s' -> enabled=%d required=%d | button=%s draw=%s\n",
-        reference,
-        en,
-        rq,
-        button_id ? button_id : "<none>",
-        draw_id ? draw_id : "<none>"
-    );
 
     return PRO_TK_NO_ERROR;
 }
@@ -1584,16 +1597,6 @@ ProError set_user_select_optional_enabled(char* dialog, SymbolTable* st, const c
         (void)UserSelectOptionalUpdateCallback(dialog, draw_id, (ProAppData)&temp_data);
     }
 
-    /* Single-line debug: shows what you asked for */
-    LogOnlyPrintfChar(
-        "Debug: USER_SELECT '%s' -> enabled=%d required=%d | button=%s draw=%s\n",
-        reference,
-        en,
-        rq,
-        button_id ? button_id : "<none>",
-        draw_id ? draw_id : "<none>"
-    );
-
     return PRO_TK_NO_ERROR;
 }
 
@@ -1668,7 +1671,7 @@ ProError UserSelectResizeCallback(char* dialog, char* component, ProAppData app_
 * 
 \*=================================================*/
 
-/* Is a parameter name present in REQUIRED_INPUTS? */
+/* Is a parameter name present in REQUIRED_INPUTS */
 ProBoolean is_required_input(SymbolTable* st, const char* param_name) {
     if (!st || !param_name) return PRO_B_FALSE;
     Variable* req_inputs = get_symbol(st, "REQUIRED_INPUTS");
@@ -1795,53 +1798,318 @@ ProError refresh_required_input_highlights(char* dialog, SymbolTable* st) {
     return final_status;
 }
 
+ProError set_inputpanel_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled)
+{
+    if (!dialog || !st || !param || !param[0]) return PRO_TK_BAD_INPUTS;
+
+    /* Your input panels are created with id "input_panel_<param>" */
+    char id[128];
+    snprintf(id, sizeof(id), "input_panel_%s", param); /* matches creation/paint path */
+
+    /* Query current state; if toolkit cannot report it, proceed conservatively */
+    ProBoolean cur_enabled = PRO_B_TRUE;
+    ProError s = ProUIInputpanelIsEnabled(dialog, id, &cur_enabled);
+    if (s != PRO_TK_NO_ERROR) {
+        cur_enabled = PRO_B_TRUE; /* behave like checkbox helper: assume enabled */
+    }
+
+    if (enabled) {
+        if (!cur_enabled) {
+            (void)ProUIInputpanelEnable(dialog, id);
+
+            /* Restore required/missing highlight logic for just this field */
+            (void)paint_one_input(dialog, st, param); /* uses "input_panel_%s" and your rules */
+        }
+    }
+    else {
+        if (cur_enabled) {
+            (void)ProUIInputpanelDisable(dialog, id);
+
+            (void)ProUIInputpanelBackgroundcolorSet(dialog, id, PRO_UI_COLOR_WHITE);
+ 
+        }
+    }
+
+    /* Keep your dialog-wide validation consistent with other UI updates */
+    (void)validate_ok_button(dialog, st);
+
+    return PRO_TK_NO_ERROR;
+}
+
+
+/*=================================================*\
+* 
+* RADIOBUTTON LOGIC
+* 
+* 
+\*=================================================*/
+ProError set_radiobutton_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled)
+{
+    if (!dialog || !st || !param || !param[0]) return PRO_TK_BAD_INPUTS;
+
+    /* Your input panels are created with id "input_panel_<param>" */
+    char id[128];
+    snprintf(id, sizeof(id), "radio_group_%s", param); /* matches creation/paint path */
+
+    /* Query current state; if toolkit cannot report it, proceed conservatively */
+    ProBoolean cur_enabled = PRO_B_TRUE;
+    ProError s = ProUIRadiogroupIsEnabled(dialog, id, &cur_enabled);
+    if (s != PRO_TK_NO_ERROR) {
+        cur_enabled = PRO_B_TRUE; /* behave like checkbox helper: assume enabled */
+    }
+
+    if (enabled) {
+        if (!cur_enabled) {
+            (void)ProUIRadiogroupEnable(dialog, id);
+
+        }
+    }
+    else {
+        if (cur_enabled) {
+            (void)ProUIRadiogroupDisable(dialog, id);
+
+
+        }
+    }
+
+
+    return PRO_TK_NO_ERROR;
+
+}
+
+ProError set_onPictureradiobutton_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled)
+{
+    if (!dialog || !st || !param || !param[0]) return PRO_TK_BAD_INPUTS;
+
+    char id[128];
+    snprintf(id, sizeof(id), "radio_group_%s", param); /* matches creation/paint path */
+
+    /* Query current state; if toolkit cannot report it, proceed conservatively */
+    ProBoolean cur_enabled = PRO_B_TRUE;
+    ProError s = ProUIRadiogroupIsEnabled(dialog, id, &cur_enabled);
+    if (s != PRO_TK_NO_ERROR) {
+        cur_enabled = PRO_B_TRUE; /* behave like checkbox helper: assume enabled */
+    }
+
+    if (enabled) {
+        if (!cur_enabled) {
+            (void)ProUIRadiogroupEnable(dialog, id);
+
+        }
+    }
+    else {
+        if (cur_enabled) {
+            (void)ProUIRadiogroupDisable(dialog, id);
+
+
+        }
+    }
+
+
+    return PRO_TK_NO_ERROR;
+
+}
+
 
 /*=================================================*\
 * 
 * SHOW_PARAM GUI LOGIC
 * 
 * 
-\*=================================================*/
-ProBoolean update_show_param_label_text(char* dialog, const char* parameter, const Variable* var)
-{
-    if (!dialog || !parameter || !var) return PRO_B_FALSE;
 
-    wchar_t* w_parameter = char_to_wchar(parameter);
-    wchar_t* w_value = variable_value_to_wstring(var);
-    if (!w_parameter || !w_value) {
-        free(w_parameter);
-        free(w_value);
-        return PRO_B_FALSE;
+\*=================================================*/
+ProError set_show_param_enabled(char* dialog, SymbolTable* st, const char* param, ProBoolean enabled)
+{
+    if (!dialog || !st || !param || !param[0]) return PRO_TK_BAD_INPUTS;
+
+    /* Construct label ID (matching creation path) */
+    char label_id[128];
+    snprintf(label_id, sizeof(label_id), "show_label_%s", param);
+
+    /* Verify the label exists (non-fatal if not yet created) */
+    wchar_t* existing_text = NULL;
+    if (ProUILabelTextGet(dialog, label_id, &existing_text) != PRO_TK_NO_ERROR) {
+        ProPrintfChar("Warning: Label '%s' not found during gating for param '%s'\n", label_id, param);
+        return PRO_TK_NO_ERROR;
+    }
+    if (existing_text) ProWstringFree(existing_text);
+
+    /* Proper enable/disable instead of hiding */
+    if (enabled == PRO_B_TRUE) {
+        (void)ProUILabelEnable(dialog, label_id);
+    }
+    else {
+        (void)ProUILabelDisable(dialog, label_id);
     }
 
+    return PRO_TK_NO_ERROR;
+}
+
+ProError update_show_param_label(char* dialog, const char* param_name, const Variable* var, ProBoolean on_picture)
+{
+    if (!dialog || !param_name || !var) return PRO_TK_BAD_INPUTS;
+
+    /* Construct label ID (consistent across create paths) */
+    char label_id[128];
+    snprintf(label_id, sizeof(label_id), "show_label_%s", param_name);
+
+    /* Verify the label exists before updating; bail softly if not */
+    wchar_t* dummy_existing = NULL;
+    ProError status = ProUILabelTextGet(dialog, label_id, &dummy_existing);
+    if (status != PRO_TK_NO_ERROR) {
+        LogOnlyPrintfChar("Warning: Label '%s' not found for SHOW_PARAM '%s'",
+            label_id, param_name);
+        return PRO_TK_GENERAL_ERROR;
+    }
+    if (dummy_existing) ProWstringFree(dummy_existing);
+
+    /* Convert value to wide string */
+    wchar_t* w_value = variable_value_to_wstring(var);
+    if (!w_value) return PRO_TK_GENERAL_ERROR;
+
+    /* Format text.
+       - ON_PICTURE: only show the value (your existing convention)
+       - Off-picture: "<friendly-or-raw-name>: <value>"
+         Friendly name comes from component_engine.txt via selmap_lookup_w().
+    */
     wchar_t label_text[200];
-    swprintf(label_text, sizeof(label_text) / sizeof(wchar_t), L"%ls (%ls)", w_parameter, w_value);
+    if (on_picture) {
+        _snwprintf_s(label_text,
+            (size_t)(sizeof(label_text) / sizeof(label_text[0])),
+            _TRUNCATE, L"%ls", w_value);
+    }
+    else {
+        wchar_t* w_param = NULL;
+        /* Try friendly label from selmap; fall back to raw param name */
+        if (!selmap_lookup_w(param_name, &w_param)) { /* friendly not found */
+            w_param = char_to_wchar(param_name);
+        }
+        if (!w_param) { free(w_value); return PRO_TK_GENERAL_ERROR; }
 
-    /* Support both potential IDs so we don't miss existing dialogs */
-    const char* ids[2] = { "show_label_%s", "label_%s" }; /* legacy fallback */
-    ProBoolean updated = PRO_B_FALSE;
+        _snwprintf_s(label_text,
+            (size_t)(sizeof(label_text) / sizeof(label_text[0])),
+            _TRUNCATE, L"%ls: %ls", w_param, w_value);
+        free(w_param);
+    }
 
-    for (int i = 0; i < 2; ++i) {
-        char idbuf[128];
-        snprintf(idbuf, sizeof(idbuf), ids[i], parameter);
+    /* Update text then recompute size (keeps long values from clipping) */
+    status = ProUILabelTextSet(dialog, label_id, label_text);
+    if (status == PRO_TK_NO_ERROR) {
+        int lw = 0, lh = 0;
+        onpic_label_size_for_text(label_text, &lw, &lh);
+        (void)ProUILabelSizeSet(dialog, label_id, lw, lh);
+    }
 
-        wchar_t* existing = NULL;
-        if (ProUILabelTextGet(dialog, idbuf, &existing) == PRO_TK_NO_ERROR) {
-            (void)ProUILabelTextSet(dialog, idbuf, label_text);
-            if (existing) ProWstringFree(existing);
-            updated = PRO_B_TRUE;
+    /* Log the update and clean up */
+    if (status == PRO_TK_NO_ERROR) {
+        LogOnlyPrintfChar("SHOW_PARAM refresh: '%s' -> ", param_name);
+        LogOnlyPrintf(L"%ls\n", label_text);
+        debug_print_symbol_update(param_name, var);
+    }
+
+    free(w_value);
+    return status;
+}
+
+/* Winner-aware SHOW_PARAM refresh
+ * Walks only the active IF branch (or ELSE), like the sub-picture and assignment walkers.
+ * Honors TARGET_IF_ID to support targeted reactive refreshes.
+ */
+static ProError refresh_all_show_params_impl(Block* blk, char* dialog_name, SymbolTable* st, int target_if_id, int in_winner)
+{
+    if (!blk || !dialog_name || !st) return PRO_TK_NO_ERROR;
+
+    for (size_t i = 0; i < blk->command_count; ++i) {
+        CommandNode* cmd = blk->commands[i];
+        if (!cmd) continue;
+
+        if (cmd->type == COMMAND_IF) {
+            IfNode* node = (IfNode*)cmd->data;
+            if (!node) continue;
+
+            /* Determine this IF's gate id and skip unrelated trees when targeting */
+            int gate_id = if_gate_id_of(node, st);
+            if (target_if_id != 0 && !in_winner && gate_id != target_if_id) {
+                continue;
+            }
+
+            /* Pick the winning branch (same logic as in rebuild_sub_pictures_only_impl / update_assignments_only_impl) */
+            size_t winner = (size_t)-1;
+            for (size_t b = 0; b < node->branch_count; ++b) {
+                IfBranch* br = node->branches[b];
+                Variable* cv = NULL;
+                if (evaluate_expression(br->condition, st, &cv) == 0 && cv) {
+                    int truth = 0;
+                    if (cv->type == TYPE_BOOL || cv->type == TYPE_INTEGER) truth = (cv->data.int_value != 0);
+                    else if (cv->type == TYPE_DOUBLE) truth = (cv->data.double_value != 0.0);
+                    free_variable(cv);
+                    if (truth) { winner = b; break; }
+                }
+            }
+
+            /* Push __CURRENT_IF_ID while walking the chosen branch (mirrors other walkers) */
+            int old_cur = 0;
+            int had_old = st_get_int(st, "__CURRENT_IF_ID", &old_cur);
+            st_put_int(st, "__CURRENT_IF_ID", gate_id);
+
+            if (winner != (size_t)-1) {
+                IfBranch* br = node->branches[winner];
+                Block nb; nb.command_count = br->command_count; nb.commands = br->commands;
+                (void)refresh_all_show_params_impl(&nb, dialog_name, st, target_if_id, 1 /* in_winner */);
+            }
+            else if (node->else_command_count > 0) {
+                Block eb; eb.command_count = node->else_command_count; eb.commands = node->else_commands;
+                (void)refresh_all_show_params_impl(&eb, dialog_name, st, target_if_id, 1 /* in_winner */);
+            }
+
+            /* Pop __CURRENT_IF_ID */
+            if (had_old) st_put_int(st, "__CURRENT_IF_ID", old_cur);
+            else remove_symbol(st, "__CURRENT_IF_ID");
+
+            /* Done with this IF node */
+            continue;
+        }
+
+        /* Non-IF commands: in targeted mode, only act when we're inside the winner path */
+        if (target_if_id != 0 && !in_winner) {
+            continue;
+        }
+
+        if (cmd->type == COMMAND_SHOW_PARAM) {
+            ShowParamNode* node = (ShowParamNode*)cmd->data;
+            if (!node || !node->parameter) continue;
+
+            Variable* var = get_symbol(st, (char*)node->parameter);
+            if (!var) {
+                /* This will be rare now because we avoid inactive branches. Keep a soft warning. */
+                ProPrintfChar("Warning: SHOW_PARAM '%s' not found during refresh\n", node->parameter);
+                continue;
+            }
+
+            if (node->on_picture) {
+                (void)update_show_param_label(dialog_name, node->parameter, var, PRO_B_TRUE);
+            }
+            else {
+                (void)update_show_param_label(dialog_name, node->parameter, var, PRO_B_FALSE);
+            }
         }
     }
 
-    /* Print only if we actually refreshed a SHOW_PARAM label */
-    if (updated == PRO_B_TRUE) {
-        ProPrintfChar("SHOW_PARAM refresh: %s -> ", parameter);
-        ProPrintf(L"%ls\n", label_text);
-    }
+    return PRO_TK_NO_ERROR;
+}
 
-    free(w_parameter);
-    free(w_value);
-    return updated;
+/* Public entry: read __TARGET_IF_ID (0 = full), then delegate to the winner-aware walker. */
+ProError refresh_all_show_params(Block* blk, char* dialog_name, SymbolTable* st)
+{
+    if (!blk || !dialog_name || !st) return PRO_TK_BAD_INPUTS;
+
+    int target_if_id = 0;
+    (void)st_get_int(st, "__TARGET_IF_ID", &target_if_id);
+
+    /* For full refresh, start "in_winner" = 1 so top-level SHOW_PARAMs are updated.
+       For targeted refresh, start "in_winner" = 0; we only refresh inside the chosen IF branch. */
+    return refresh_all_show_params_impl(blk, dialog_name, st, target_if_id,
+        (target_if_id == 0) ? 1 : 0);
 }
 
 // Print the canonical "param := value" after an update.
@@ -1851,24 +2119,24 @@ ProBoolean update_show_param_label_text(char* dialog, const char* parameter, con
 
      switch (var->type) {
      case TYPE_INTEGER:
-         ProPrintfChar("Updated '%s' := %d", param_name, var->data.int_value);
+         LogOnlyPrintfChar("Updated '%s' := %d", param_name, var->data.int_value);
          break;
      case TYPE_BOOL:
-         ProPrintfChar("Updated '%s' := %d", param_name, var->data.int_value ? 1 : 0);
+         LogOnlyPrintfChar("Updated '%s' := %d", param_name, var->data.int_value ? 1 : 0);
          break;
      case TYPE_DOUBLE: {
          // Use a compact, precise format
          char buf[64];
          snprintf(buf, sizeof(buf), "%.15g", var->data.double_value);
-         ProPrintfChar("Updated '%s' := %s", param_name, buf);
+         LogOnlyPrintfChar("Updated '%s' := %s", param_name, buf);
          break;
      }
      case TYPE_STRING:
-         ProPrintfChar("Updated '%s' := \"%s\"", param_name,
+         LogOnlyPrintfChar("Updated '%s' := \"%s\"", param_name,
              var->data.string_value ? var->data.string_value : "");
          break;
      default:
-         ProPrintfChar("Updated '%s' (unsupported type %d)", param_name, (int)var->type);
+         LogOnlyPrintfChar("Updated '%s' (unsupported type %d)", param_name, (int)var->type);
          break;
      }
  }
@@ -1879,79 +2147,397 @@ ProBoolean update_show_param_label_text(char* dialog, const char* parameter, con
  * SUB_PICTURE GUI_LOGIC
  * (walking the IF command in real-time)
  * 
- * 
+ *
  \*=================================================*/
-/* Rebuild only the SUB_PICTURES array from a GUI block */
- ProError rebuild_sub_pictures_only(Block* gui_block, SymbolTable* st)
+ static Variable* clone_scalar_var(const Variable* v) {
+     if (!v) return NULL;
+     Variable* c = (Variable*)calloc(1, sizeof(Variable));
+     if (!c) return NULL;
+     c->type = v->type;
+     switch (v->type) {
+     case TYPE_INTEGER:
+     case TYPE_BOOL:
+         c->data.int_value = v->data.int_value;
+         break;
+     case TYPE_DOUBLE:
+         c->data.double_value = v->data.double_value;
+         break;
+     case TYPE_STRING:
+         c->data.string_value = v->data.string_value ? _strdup(v->data.string_value) : NULL;
+         break;
+     default:
+         /* unsupported -> treat as null */
+         c->type = TYPE_NULL;
+         break;
+     }
+     return c;
+ }
+
+ /* local int getter (kept file-local to avoid cross-TU deps) */
+ static int st_get_int_local(SymbolTable* st, const char* key, int* out) {
+     Variable* v = get_symbol(st, (char*)key);
+     if (!v) return 0;
+     if (v->type == TYPE_INTEGER || v->type == TYPE_BOOL) { *out = v->data.int_value; return 1; }
+     if (v->type == TYPE_DOUBLE) { *out = (int)v->data.double_value; return 1; }
+     return 0;
+ }
+
+ /* Ensure we have ASSIGN_OVERRIDES: map var_name -> array of entries { if_id, snapshot } */
+ static Variable* ensure_assign_overrides_root(SymbolTable* st) {
+     Variable* root = get_symbol(st, "ASSIGN_OVERRIDES");
+     if (!root) {
+         root = (Variable*)calloc(1, sizeof(Variable));
+         if (!root) return NULL;
+         root->type = TYPE_MAP;
+         root->data.map = create_hash_table(64);
+         set_symbol(st, "ASSIGN_OVERRIDES", root);
+     }
+     else if (root->type != TYPE_MAP || !root->data.map) {
+         /* normalize */
+         free_variable(root);
+         root = (Variable*)calloc(1, sizeof(Variable));
+         if (!root) return NULL;
+         root->type = TYPE_MAP;
+         root->data.map = create_hash_table(64);
+         set_symbol(st, "ASSIGN_OVERRIDES", root);
+     }
+     return root;
+ }
+
+ /* Make sure there is an array for this variable inside ASSIGN_OVERRIDES */
+ static Variable* ensure_override_array_for(SymbolTable* st, const char* var_name) {
+     Variable* root = ensure_assign_overrides_root(st);
+     if (!root) return NULL;
+     Variable* arr = hash_table_lookup(root->data.map, var_name);
+     if (!arr || arr->type != TYPE_ARRAY) {
+         if (arr) free_variable(arr);
+         arr = (Variable*)calloc(1, sizeof(Variable));
+         if (!arr) return NULL;
+         arr->type = TYPE_ARRAY;
+         arr->data.array.size = 0;
+         arr->data.array.elements = NULL;
+         hash_table_insert(root->data.map, var_name, arr);
+     }
+     return arr;
+ }
+
+ /* Snapshot current value for this var under if_id (only once) */
+ static void push_override_snapshot(SymbolTable* st, const char* var_name, int if_id) {
+     if (!st || !var_name || if_id <= 0) return;
+     Variable* cur = get_symbol(st, (char*)var_name);
+     if (!cur) return; /* nothing to snapshot */
+
+     Variable* arr = ensure_override_array_for(st, var_name);
+     if (!arr || arr->type != TYPE_ARRAY) return;
+
+     /* already have a snapshot for this if_id? */
+     for (size_t i = 0; i < arr->data.array.size; ++i) {
+         Variable* it = arr->data.array.elements[i];
+         if (!it || it->type != TYPE_MAP || !it->data.map) continue;
+         Variable* idv = hash_table_lookup(it->data.map, "if_id");
+         if (idv && (idv->type == TYPE_INTEGER || idv->type == TYPE_BOOL) &&
+             idv->data.int_value == if_id) {
+             return; /* one snapshot per (var, if_id) */
+         }
+     }
+
+     /* create entry { if_id, snapshot } */
+     HashTable* m = create_hash_table(4);
+     if (!m) return;
+
+     Variable* idv = (Variable*)calloc(1, sizeof(Variable));
+     if (!idv) { free_hash_table(m); return; }
+     idv->type = TYPE_INTEGER;
+     idv->data.int_value = if_id;
+     hash_table_insert(m, "if_id", idv);
+
+     Variable* snap = clone_scalar_var(cur);
+     if (!snap) { free_hash_table(m); return; }
+     hash_table_insert(m, "snapshot", snap);
+
+     Variable* entry = (Variable*)calloc(1, sizeof(Variable));
+     if (!entry) { free_hash_table(m); return; }
+     entry->type = TYPE_MAP;
+     entry->data.map = m;
+
+     size_t n = arr->data.array.size + 1;
+     Variable** grown = (Variable**)realloc(arr->data.array.elements, n * sizeof(Variable*));
+     if (!grown) { free_variable(entry); return; }
+
+     arr->data.array.elements = grown;
+     arr->data.array.elements[n - 1] = entry;
+     arr->data.array.size = n;
+ }
+
+ /* Revert all contributions that were made under this IF gate id */
+ static void revert_if_contributions(SymbolTable* st, int if_id) {
+     if (!st || if_id <= 0) return;
+     Variable* root = get_symbol(st, "ASSIGN_OVERRIDES");
+     if (!root || root->type != TYPE_MAP || !root->data.map) return;
+
+     HashTable* map = root->data.map;
+     for (size_t k = 0; k < map->key_count; ++k) {
+         const char* var_name = map->key_order[k];
+         if (!var_name) continue;
+         Variable* arr = hash_table_lookup(map, var_name);
+         if (!arr || arr->type != TYPE_ARRAY) continue;
+
+         ArrayData* a = &arr->data.array;
+         size_t w = 0;
+         for (size_t r = 0; r < a->size; ++r) {
+             Variable* entry = a->elements[r];
+             int drop = 0;
+             if (entry && entry->type == TYPE_MAP && entry->data.map) {
+                 Variable* idv = hash_table_lookup(entry->data.map, "if_id");
+                 if (idv && (idv->type == TYPE_INTEGER || idv->type == TYPE_BOOL) &&
+                     idv->data.int_value == if_id) {
+                     /* restore snapshot and drop this entry */
+                     Variable* snap = hash_table_lookup(entry->data.map, "snapshot");
+                     if (snap) {
+                         Variable* copy = clone_scalar_var(snap);
+                         if (copy) set_symbol(st, (char*)var_name, copy);
+                     }
+                     free_variable(entry);
+                     drop = 1;
+                 }
+             }
+             if (!drop) a->elements[w++] = a->elements[r];
+         }
+         a->size = w;
+     }
+ }
+
+ /* Single place for assignment semantics used everywhere. */
+ ProError apply_assignment_with_ui_guard(AssignmentNode* asn, SymbolTable* st)
+ {
+     const char* lhs_name = NULL;
+     if (asn && asn->lhs && asn->lhs->type == EXPR_VARIABLE_REF)
+         lhs_name = asn->lhs->data.string_val;
+
+     /* Do not clobber user-driven inputs during reactive passes. */
+     if (lhs_name && is_ui_param(st, lhs_name) == PRO_B_TRUE)
+         return PRO_TK_NO_ERROR;  /* silently skip */
+
+     /* IF-scope: capture baseline once per (var, gate) before we overwrite */
+     int cur_if = 0;
+     if (st_get_int_local(st, "__CURRENT_IF_ID", &cur_if) && cur_if > 0 && lhs_name) {
+         push_override_snapshot(st, lhs_name, cur_if);
+     }
+
+     return execute_assignment(asn, st, NULL);
+ }
+
+ /* Internal walker: update only assignments (no SUB_PICTUREs, no declares). */
+ ProError update_assignments_only_impl(Block* blk, SymbolTable* st,
+     int target_if_id, int in_winner)
+ {
+     if (!blk || !st) return PRO_TK_NO_ERROR;
+
+     for (size_t i = 0; i < blk->command_count; ++i) {
+         CommandNode* cmd = blk->commands[i];
+         if (!cmd) continue;
+
+         if (cmd->type == COMMAND_IF) {
+             IfNode* node = (IfNode*)cmd->data;
+             int gate_id = if_gate_id_of(node, st);
+
+             /* Targeted mode: ignore unrelated IF trees. */
+             if (target_if_id != 0 && gate_id != target_if_id) {
+                 continue;
+             }
+
+             /* Pick the winning branch (same as in rebuild_sub_pictures_only_impl). */
+             size_t winner = (size_t)-1;
+             for (size_t b = 0; b < node->branch_count; ++b) {
+                 Variable* cv = NULL;
+                 IfBranch* br = node->branches[b];
+                 if (evaluate_expression(br->condition, st, &cv) == 0 && cv) {
+                     int truth = 0;
+                     if (cv->type == TYPE_BOOL || cv->type == TYPE_INTEGER) truth = (cv->data.int_value != 0);
+                     else if (cv->type == TYPE_DOUBLE) truth = (cv->data.double_value != 0.0);
+                     free_variable(cv);
+                     if (truth) { winner = b; break; }
+                 }
+             }
+
+             /* Push __CURRENT_IF_ID for the chosen branch, just like the picture walker. */
+             int old_cur = 0;
+             int had_old = st_get_int(st, "__CURRENT_IF_ID", &old_cur);
+             st_put_int(st, "__CURRENT_IF_ID", gate_id);
+
+             /* NEW: revert all variables previously overridden by this IF gate */
+             revert_if_contributions(st, gate_id);
+
+             if (winner != (size_t)-1) {
+                 IfBranch* br = node->branches[winner];
+                 Block nb; nb.command_count = br->command_count; nb.commands = br->commands;
+                 (void)update_assignments_only_impl(&nb, st, target_if_id, 1 /* in_winner */);
+             }
+             else if (node->else_command_count > 0) {
+                 Block eb; eb.command_count = node->else_command_count; eb.commands = node->else_commands;
+                 (void)update_assignments_only_impl(&eb, st, target_if_id, 1 /* in_winner */);
+             }
+
+             /* Pop __CURRENT_IF_ID */
+             if (had_old) st_put_int(st, "__CURRENT_IF_ID", old_cur);
+             else remove_symbol(st, "__CURRENT_IF_ID");
+
+             /* Continue scanning siblings (targeted mode will skip unrelated IFs above). */
+             continue;
+         }
+
+         /* In targeted mode, only run non-IF nodes when we are inside the winner. */
+         if (target_if_id != 0 && !in_winner) {
+             continue;
+         }
+
+         /* Only run assignments here. */
+         if (cmd->type == COMMAND_ASSIGNMENT) {
+             (void)apply_assignment_with_ui_guard((AssignmentNode*)cmd->data, st);
+         }
+     }
+
+     return PRO_TK_NO_ERROR;
+ }
+
+ /* Public entry: update only assignments across the GUI block. */
+ ProError update_assignments_only(Block* gui_block, SymbolTable* st)
  {
      if (!gui_block) return PRO_TK_NO_ERROR;
 
-     for (size_t i = 0; i < gui_block->command_count; ++i) {
-         CommandNode* cmd = gui_block->commands[i];
-         switch (cmd->type)
-         {
+     int target_if_id = 0;
+     {
+         Variable* v = get_symbol(st, "__TARGET_IF_ID");
+         if (v && v->type == TYPE_INTEGER) target_if_id = v->data.int_value;
+     }
+     return update_assignments_only_impl(gui_block, st, target_if_id, 0);
+ }
+
+ /* --- prune only subpictures emitted by a specific IF gate --- */
+ static void remove_sub_pictures_for_gate(SymbolTable* st, int gate_id)
+ {
+     Variable* arr = get_symbol(st, "SUB_PICTURES");
+     if (!arr || arr->type != TYPE_ARRAY) return;
+
+     ArrayData* a = &arr->data.array;
+     size_t w = 0;
+     for (size_t r = 0; r < a->size; ++r) {
+         Variable* item = a->elements[r];
+         int keep = 1;
+         if (item && item->type == TYPE_MAP) {
+             HashTable* m = item->data.map;
+             /* NOTE: writer uses "if_gate_id" (no leading underscores) */
+             Variable* tag = hash_table_lookup(m, "if_gate_id");
+             if (tag && tag->type == TYPE_INTEGER && tag->data.int_value == gate_id) {
+                 free_variable(item); /* drop this one */
+                 keep = 0;
+             }
+         }
+         if (keep) a->elements[w++] = a->elements[r];
+     }
+     a->size = w;
+ }
+
+ /* internal walker so we can thread "in_winner" state */
+ static ProError rebuild_sub_pictures_only_impl(Block* blk, SymbolTable* st,int target_if_id, int in_winner)
+ {
+     if (!blk || !st) return PRO_TK_NO_ERROR;
+
+     for (size_t i = 0; i < blk->command_count; ++i) {
+         CommandNode* cmd = blk->commands[i];
+         if (!cmd) continue;
+
+         if (cmd->type == COMMAND_IF) {
+             IfNode* node = (IfNode*)cmd->data;
+             int gate_id = if_gate_id_of(node, st);
+
+             /* in targeted mode, ignore unrelated IF trees */
+             if (target_if_id != 0 && gate_id != target_if_id) {
+                 continue;
+             }
+
+             /* pick the winning branch */
+             size_t winner = (size_t)-1;
+             for (size_t b = 0; b < node->branch_count; ++b) {
+                 Variable* cv = NULL;
+                 IfBranch* br = node->branches[b];
+                 if (evaluate_expression(br->condition, st, &cv) == 0 && cv) {
+                     int truth = 0;
+                     if (cv->type == TYPE_BOOL || cv->type == TYPE_INTEGER) truth = (cv->data.int_value != 0);
+                     else if (cv->type == TYPE_DOUBLE) truth = (cv->data.double_value != 0.0);
+                     free_variable(cv);
+                     if (truth) { winner = b; break; }
+                 }
+             }
+
+             /* targeted: prune only this IF's old pictures before re-emitting */
+             if (target_if_id != 0) {
+                 remove_sub_pictures_for_gate(st, gate_id);
+             }
+
+             /* push __CURRENT_IF_ID while walking the chosen branch */
+             int old_cur = 0;
+             int had_old = st_get_int(st, "__CURRENT_IF_ID", &old_cur);
+             st_put_int(st, "__CURRENT_IF_ID", gate_id);
+
+             if (winner != (size_t)-1) {
+                 IfBranch* br = node->branches[winner];
+                 Block nb; nb.command_count = br->command_count; nb.commands = br->commands;
+                 (void)rebuild_sub_pictures_only_impl(&nb, st, target_if_id, 1 /* in_winner */);
+             }
+             else if (node->else_command_count > 0) {
+                 Block eb; eb.command_count = node->else_command_count; eb.commands = node->else_commands;
+                 (void)rebuild_sub_pictures_only_impl(&eb, st, target_if_id, 1 /* in_winner */);
+             }
+
+             /* pop __CURRENT_IF_ID */
+             if (had_old) st_put_int(st, "__CURRENT_IF_ID", old_cur);
+             else remove_symbol(st, "__CURRENT_IF_ID");
+
+             /* full rebuild: keep walking siblings; targeted: siblings are skipped by gate check above */
+             continue;
+         }
+
+         /* In targeted mode, we only execute non-IF commands when we're inside the winning branch. */
+         if (target_if_id != 0 && !in_winner) {
+             continue;
+         }
+
+         /* Non-IF handling (order preserved so SUB_PICTURE snapshots see current symbols) */
+         switch (cmd->type) {
          case COMMAND_DECLARE_VARIABLE: {
-             /* Keep your existing reset of GUI-local defaults */
              DeclareVariableNode* dv = (DeclareVariableNode*)cmd->data;
              if (dv && dv->name) {
                  remove_symbol(st, dv->name);
                  (void)execute_declare_variable(dv, st);
              }
          } break;
-
-         case COMMAND_ASSIGNMENT: {
-             /* NEW: do not overwrite user-driven params during reactive rebuild */
-             AssignmentNode* asn = (AssignmentNode*)cmd->data;
-             const char* lhs_name = NULL;
-             if (asn && asn->lhs && asn->lhs->type == EXPR_VARIABLE_REF) {
-                 lhs_name = asn->lhs->data.string_val; /* identifier text */
-             }
-             if (lhs_name && is_ui_param(st, lhs_name) == PRO_B_TRUE) {
-                 /* skip mutating input parameters */
-                 break;
-             }
-             (void)execute_assignment(asn, st, NULL);
-         } break;
+         case COMMAND_ASSIGNMENT:
+             (void)apply_assignment_with_ui_guard((AssignmentNode*)cmd->data, st);
+             break;
 
          case COMMAND_SUB_PICTURE:
              (void)execute_sub_picture((SubPictureNode*)cmd->data, st);
              break;
-
-         case COMMAND_IF: {
-             IfNode* ifn = (IfNode*)cmd->data;
-             bool matched = false;
-
-             for (size_t b = 0; b < ifn->branch_count; ++b) {
-                 Variable* cond_val = NULL;
-                 IfBranch* br = ifn->branches[b];
-                 if (evaluate_expression(br->condition, st, &cond_val) == 0 && cond_val) {
-                     bool cond_true = false;
-                     if (cond_val->type == TYPE_BOOL || cond_val->type == TYPE_INTEGER)
-                         cond_true = (cond_val->data.int_value != 0);
-                     else if (cond_val->type == TYPE_DOUBLE)
-                         cond_true = (cond_val->data.double_value != 0.0);
-                     free_variable(cond_val);
-                     if (cond_true) {
-                         Block tmp = { 0 };
-                         tmp.command_count = br->command_count;
-                         tmp.commands = br->commands;
-                         (void)rebuild_sub_pictures_only(&tmp, st);
-                         matched = true;
-                         break;
-                     }
-                 }
-             }
-             if (!matched && ifn->else_command_count > 0) {
-                 Block tmp = { 0 };
-                 tmp.command_count = ifn->else_command_count;
-                 tmp.commands = ifn->else_commands;
-                 (void)rebuild_sub_pictures_only(&tmp, st);
-             }
-         } break;
 
          default: break;
          }
      }
 
      return PRO_TK_NO_ERROR;
+ }
+
+ /* public entry point */
+ ProError rebuild_sub_pictures_only(Block* gui_block, SymbolTable* st)
+ {
+     if (!gui_block) return PRO_TK_NO_ERROR;
+
+     int target_if_id = 0;
+     {
+         Variable* v = get_symbol(st, "__TARGET_IF_ID");
+         if (v && v->type == TYPE_INTEGER) target_if_id = v->data.int_value;
+     }
+
+     /* start outside any winner */
+     return rebuild_sub_pictures_only_impl(gui_block, st, target_if_id, 0);
  }
