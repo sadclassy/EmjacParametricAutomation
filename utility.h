@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <locale.h>
 #include <string.h>
+#include <stdint.h>
 
 
 
@@ -82,6 +83,12 @@ static wchar_t wMsgFile[] = L"EmjacParametricAutomation.txt";
 
 extern wchar_t selectedTabFilePath[MAX_PATH];
 
+
+typedef struct SelMapEntry {
+    char* key;
+    char* label;
+} SelMapEntry;
+
 ProError ProGenericMsg(wchar_t* wMsg);
 void ProPrintf(const wchar_t* format, ...);
 void ProPrintfChar(const char* format, ...);
@@ -93,6 +100,9 @@ char* wchar_to_char(const wchar_t* wstr);
 void to_lowercase(char* str);
 bool get_gif_dimensions(const char* filepath, int* width, int* height);
 int starts_with(const char* str, const char* prefix);
+void selmap_set_path(const char* path);
+int  selmap_reload(void);
+int  selmap_lookup_w(const char* param, wchar_t** out_wlabel);
 
 
 
