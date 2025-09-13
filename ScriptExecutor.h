@@ -10,6 +10,23 @@
 
 typedef void(*ExecuteFunction)(void* data, SymbolTable* st, BlockList* block_list);
 
+
+enum {
+    SLOT_SHOW_PARAM = 0,
+    SLOT_CHECKBOX_PARAM = 1,
+    SLOT_USER_INPUT_PARAM = 2,
+    SLOT_RADIOBUTTON_PARAM = 3,
+    SLOT_USER_SELECT = 4,
+    SLOT_COUNT = 5
+};
+
+typedef struct {
+    int computed;                 /* 0/1 */
+    unsigned present_mask;        /* bit i set => slot i present off-picture */
+    int slot_to_dense[SLOT_COUNT];/* -1 if absent; otherwise 0..dense_count-1 */
+    int dense_count;              /* number of occupied columns */
+} ColumnPlan;
+
 // Dialog structure
 typedef struct
 {
@@ -23,13 +40,11 @@ typedef struct
     SymbolTable* st;
     int  root_table_built;           /* 0/1 */
     char root_identifier[128];       /* optional: which table to build as root */
-    bool needs_show_param;
-    bool needs_checkbox;
-    bool needs_user_input;
-    bool needs_radiobutton;
-    bool needs_user_select;
-    bool needs_picture;
-    int num_param_sections;
+    ProBoolean dirty;
+    ColumnPlan column_plan;
+    char* root_drawarea_id;
+    char* root_table_id;
+
 
 
 
@@ -44,11 +59,15 @@ typedef struct
 
 
 /* -------------------- NEW: unified IF execution context -------------------- */
-typedef struct ExecContext {
+typedef struct {
     SymbolTable* st;
-    BlockList* block_list;  /* may be NULL */
-    DialogState* ui;          /* NULL for non-GUI */
+    BlockList* block_list;
+    DialogState* ui;
+    int reactive;  // 0 for initial execution (build UI + logic), 1 for reactive (logic only, skip UI creation)
 } ExecContext;
+
+
+
 
 /* Unified walkers */
 ProError exec_command_in_context(CommandNode* node, ExecContext* ctx);
@@ -59,7 +78,9 @@ ProError execute_command(CommandNode* node, SymbolTable* st, BlockList* block_li
 ProError execute_declare_variable(DeclareVariableNode* node, SymbolTable* st);
 ProError execute_assignment(AssignmentNode* node, SymbolTable* st, BlockList* block_list);
 ProError execute_sub_picture(SubPictureNode* node, SymbolTable* st);
-
-void EPA_ReactiveRefresh(void);
+int if_gate_id_of(IfNode* n, SymbolTable* st);
+int st_get_int(SymbolTable* st, const char* key, int* out);
+void st_put_int(SymbolTable* st, const char* key, int value);
+void EPA_ReactiveRefresh();
 
 #endif // !SCRIPT_EXECUTOR_H
