@@ -77,15 +77,22 @@ typedef struct {
 
 ProError draw_global_picture(char* dialog, char* component, ProAppData app_data);
 ProError draw_sub_pictures(char* dialog, char* component, ProAppData app_data);
+void onpic_label_size_for_text(const wchar_t* txt, int* out_w, int* out_h);
 ProError OnPictureShowParam(char* dialog, char* draw_area_name, ShowParamNode* node, SymbolTable* st);
 ProError addShowParam(char* dialog_name, char* parent_layout_name, ShowParamNode* node, int* current_row, int column, SymbolTable* st);
 ProError OnPictureCheckboxParam(char* dialog, char* draw_area_name, CheckboxParamNode* node, SymbolTable* st);
 ProError addCheckboxParam(char* dialog_name, char* parent_layout_name, CheckboxParamNode* cbNode, int* current_row, int column, SymbolTable* st);
+ProError OnPictureUserInputParam(char* dialog, char* draw_area_name, UserInputParamNode* node, SymbolTable* st);
 ProError addUserInputParam(char* dialog_name, char* parent_layout_name, UserInputParamNode* node, int* current_row, int column, SymbolTable* st);
+ProError OnPictureRadioButtonParam(char* dialog, char* draw_area_name, RadioButtonParamNode* node, SymbolTable* st);
 ProError addRadioButtonParam(char* dialog_name, char* parent_layout_name, RadioButtonParamNode* node, int* current_row, int column, SymbolTable* st);
+ProError OnPictureUserSelect(char* dialog, char* draw_area_name, UserSelectNode* node, SymbolTable* st);
 ProError addUserSelect(char* dialog_name, char* parent_layout_name, UserSelectNode* node, int* current_row, int column, SymbolTable* st);
+ProError OnPictureUserSelectOptional(char* dialog, char* draw_area_name, UserSelectOptionalNode* node, SymbolTable* st);
 ProError addUserSelectOptional(char* dialog_name, char* parent_layout_name, UserSelectOptionalNode* node, int* current_row, int column, SymbolTable* st);
+ProError OnPictureUserSelectMultipleOptional(char* dialog, char* draw_area_name, UserSelectMultipleOptionalNode* node, SymbolTable* st);
 ProError addUserSelectMultipleOptional(char* dialog_name, char* parent_layout_name, UserSelectMultipleOptionalNode* node, int* current_row, int column, SymbolTable* st);
+ProError OnPictureUserSelectMultiple(char* dialog, char* draw_area_name, UserSelectMultipleNode* node, SymbolTable* st);
 ProError addUserSelectMultiple(char* dialog_name, char* parent_layout_name, UserSelectMultipleNode* node, int* current_row, int column, SymbolTable* st);
 ProError addpicture(char* dialog, char* component, ProAppData app_data);
 ProError MyPostManageCallback(char* dialog, char* component, ProAppData app_data);
