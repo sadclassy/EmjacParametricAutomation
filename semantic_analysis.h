@@ -6,6 +6,13 @@
 #include "syntaxanalysis.h"
 
 
+// New struct for per-branch assignment collection
+typedef struct {
+    int* ids;       // Array of assignment IDs
+    size_t count;   // Number of IDs
+    size_t cap;     // Capacity of ids array
+} AssignmentList;
+
 int perform_semantic_analysis(BlockList* block_list, SymbolTable* st);
 int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result);
 int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result);
@@ -22,4 +29,3 @@ void set_default_value(Variable* var);
 
 
 #endif // !SEMANTIC_ANALYSIS_H
-
