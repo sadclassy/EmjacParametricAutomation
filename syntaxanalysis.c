@@ -5,6 +5,10 @@
 #include "LexicalAnalysis.h"
 #include "syntaxanalysis.h"
 
+static int s_if_id_counter = 0;
+static int s_assign_id_counter = 0; /* new: monotonically increasing assignment ids */
+static int s_table_id_counter = 0;
+
 
 void free_command_node(CommandNode* node);
 void free_expression(ExpressionNode* expr);
@@ -279,8 +283,7 @@ static ExpressionNode* parse_primary(Lexer* lexer, size_t* i, SymbolTable* st) {
         return NULL;
     }
 
-    if (tok->type == tok_number) {  // Existing: Handle integers/doubles
-        // Parse as int or double based on presence of decimal (existing logic assumed)
+    if (tok->type == tok_number) {  /* numbers */
         if (strchr(tok->val, '.')) {
             expr->type = EXPR_LITERAL_DOUBLE;
             expr->data.double_val = atof(tok->val);
@@ -291,7 +294,74 @@ static ExpressionNode* parse_primary(Lexer* lexer, size_t* i, SymbolTable* st) {
         }
         (*i)++;
     }
-    else if (tok->type == tok_identifier) {  // Existing: Variable references
+    else if (tok->type == tok_identifier) {
+        /* Split patterns like ELEVY-10 that were lexed as a single identifier.
+           Do NOT split filenames (they contain a '.') */
+        const char* s = tok->val;
+        if (strchr(s, '-') && !strchr(s, '.')) {
+            const char* dash = strchr(s, '-');
+            if (dash > s && dash[1] != '\0') {
+                /* left and right slices */
+                size_t left_len = (size_t)(dash - s);
+                char left[128], right[128];
+                if (left_len >= sizeof(left)) left_len = sizeof(left) - 1;
+
+                if (strncpy_s(left, sizeof(left), s, left_len) != 0) {
+                    free(expr);
+                    ProPrintfChar("Error: Failed copying left slice in parse_primary\n");
+                    return NULL;
+                }
+                if (strncpy_s(right, sizeof(right), dash + 1, _TRUNCATE) != 0) {
+                    free(expr);
+                    ProPrintfChar("Error: Failed copying right slice in parse_primary\n");
+                    return NULL;
+                }
+
+                /* build left expr (identifier or number) */
+                ExpressionNode* L = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+                if (!L) { free(expr); return NULL; }
+                if (strspn(left, "0123456789.") == strlen(left)) {
+                    L->type = (strchr(left, '.') ? EXPR_LITERAL_DOUBLE : EXPR_LITERAL_INT);
+                    if (L->type == EXPR_LITERAL_DOUBLE) L->data.double_val = atof(left);
+                    else L->data.int_val = atol(left);
+                }
+                else {
+                    L->type = EXPR_VARIABLE_REF;
+                    L->data.string_val = _strdup(left);
+                    if (!L->data.string_val) { free(L); free(expr); return NULL; }
+                }
+
+                /* build right expr (identifier or number) */
+                ExpressionNode* R = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+                if (!R) { free_expression(L); free(expr); return NULL; }
+                if (strspn(right, "0123456789.") == strlen(right)) {
+                    R->type = (strchr(right, '.') ? EXPR_LITERAL_DOUBLE : EXPR_LITERAL_INT);
+                    if (R->type == EXPR_LITERAL_DOUBLE) R->data.double_val = atof(right);
+                    else R->data.int_val = atol(right);
+                }
+                else {
+                    R->type = EXPR_VARIABLE_REF;
+                    R->data.string_val = _strdup(right);
+                    if (!R->data.string_val) { free_expression(L); free(R); free(expr); return NULL; }
+                }
+
+                /* build binary SUB node */
+                ExpressionNode* B = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+                if (!B) { free_expression(L); free_expression(R); free(expr); return NULL; }
+                B->type = EXPR_BINARY_OP;
+                B->data.binary.op = BINOP_SUB;
+                B->data.binary.left = L;
+                B->data.binary.right = R;
+
+                (*i)++; /* we consumed this identifier token */
+
+                /* optional: avoid leaking the prealloc'd expr */
+                free(expr);
+                return B;
+            }
+        }
+
+        /* existing behavior */
         expr->type = EXPR_VARIABLE_REF;
         expr->data.string_val = _strdup(tok->val);
         if (!expr->data.string_val) {
@@ -301,8 +371,8 @@ static ExpressionNode* parse_primary(Lexer* lexer, size_t* i, SymbolTable* st) {
         }
         (*i)++;
     }
-    else if (tok->type == tok_lparen) {  // Existing: Grouped expressions
-        (*i)++;  // Consume '('
+    else if (tok->type == tok_lparen) {  /* grouped */
+        (*i)++;
         expr = parse_expression(lexer, i, st);
         if (!expr || !consume(lexer, i, tok_rparen)) {
             free_expression(expr);
@@ -310,39 +380,26 @@ static ExpressionNode* parse_primary(Lexer* lexer, size_t* i, SymbolTable* st) {
             return NULL;
         }
     }
-    else if (tok->type == tok_minus) {  // Existing: Unary negation
-        (*i)++;  // Consume '-'
+    else if (tok->type == tok_minus) {  /* unary negation */
+        (*i)++;
         expr->type = EXPR_UNARY_OP;
         expr->data.unary.op = UNOP_NEG;
         expr->data.unary.operand = parse_primary(lexer, i, st);
-        if (!expr->data.unary.operand) {
-            free(expr);
-            return NULL;
-        }
+        if (!expr->data.unary.operand) { free(expr); return NULL; }
     }
     else if (tok->type == tok_type || tok->type == tok_option || tok->type == tok_string) {
-        // New: Handle types, options, and strings as literals
         expr->type = EXPR_LITERAL_STRING;
         expr->data.string_val = _strdup(tok->val);
-        if (!expr->data.string_val) {
-            free(expr);
-            ProPrintfChar("Error: Memory allocation failed for string literal at line %zu\n", tok->loc.line);
-            return NULL;
-        }
+        if (!expr->data.string_val) { free(expr); ProPrintfChar("Error: Memory allocation failed for string literal at line %zu\n", tok->loc.line); return NULL; }
         (*i)++;
     }
     else if (tok->type == tok_keyword && strcmp(tok->val, "NO_VALUE") == 0) {
-        expr->type = EXPR_LITERAL_STRING;  // Treat as empty string for null/empty cell
+        expr->type = EXPR_LITERAL_STRING;
         expr->data.string_val = _strdup("");
-        if (!expr->data.string_val) {
-            free(expr);
-            ProPrintfChar("Error: Memory allocation failed for NO_VALUE at line %zu\n", tok->loc.line);
-            return NULL;
-        }
+        if (!expr->data.string_val) { free(expr); ProPrintfChar("Error: Memory allocation failed for NO_VALUE at line %zu\n", tok->loc.line); return NULL; }
         (*i)++;
     }
     else {
-        // Existing default: Unsupported token
         free(expr);
         ProPrintfChar("Error: Unsupported primary expression token %d at line %zu\n", tok->type, tok->loc.line);
         return NULL;
@@ -1174,8 +1231,9 @@ int parse_show_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
         return -1;
     }
 
-    node->show_param.var_type = VAR_PARAMETER;  // Default to parameter type
-    node->show_param.subtype = PARAM_DOUBLE;    // Default subtype; will be set based on parsing
+    /* initialize defaults */
+    node->show_param.var_type = VAR_PARAMETER;
+    node->show_param.subtype = PARAM_DOUBLE;
     node->show_param.parameter = NULL;
     node->show_param.tooltip_message = NULL;
     node->show_param.image_name = NULL;
@@ -1187,10 +1245,10 @@ int parse_show_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
     TokenData* tok = NULL;
     int result = 0;
 
-    // Require parameter type first (map to subtype)
+    /* ---- parameter type (subtype) ---- */
     tok = current_token(lexer, i);
     if (!tok || tok->type != tok_type) {
-        ProPrintfChar("Error: Expected parameter type (e.g., DOUBLE) in SHOW_PARAM\n");
+        ProPrintfChar("Error: Expected parameter type (e.g. DOUBLE) in SHOW_PARAM\n");
         result = -1;
         goto cleanup;
     }
@@ -1221,7 +1279,7 @@ int parse_show_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
     free(type_str);
     type_str = NULL;
 
-    // Require parameter name second
+    /* ---- parameter name ---- */
     tok = current_token(lexer, i);
     if (!tok || tok->type != tok_identifier) {
         ProPrintfChar("Error: Expected parameter name in SHOW_PARAM\n");
@@ -1236,25 +1294,29 @@ int parse_show_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
     }
     (*i)++;
 
-    // Parse options until non-option token
+    /* ---- options loop ---- */
     while (1) {
         tok = current_token(lexer, i);
         if (!tok || tok->type != tok_option) break;
-        (*i)++;  // Consume option
+
+        (*i)++; /* consume option keyword */
+
         if (strcmp(tok->val, "TOOLTIP") == 0) {
-            // Parse tooltip as expression (expect string)
+            /* TOOLTIP <string-expr> [IMAGE <string-expr>] */
             node->show_param.tooltip_message = parse_expression(lexer, i, NULL);
-            if (!node->show_param.tooltip_message || node->show_param.tooltip_message->type != EXPR_LITERAL_STRING) {
+            if (!node->show_param.tooltip_message ||
+                node->show_param.tooltip_message->type != EXPR_LITERAL_STRING) {
                 ProPrintfChar("Error: Expected string expression after TOOLTIP\n");
                 result = -1;
                 goto cleanup;
             }
-            // Optional IMAGE
+            /* optional IMAGE */
             tok = current_token(lexer, i);
             if (tok && tok->type == tok_option && strcmp(tok->val, "IMAGE") == 0) {
                 (*i)++;
                 node->show_param.image_name = parse_expression(lexer, i, NULL);
-                if (!node->show_param.image_name || node->show_param.image_name->type != EXPR_LITERAL_STRING) {
+                if (!node->show_param.image_name ||
+                    node->show_param.image_name->type != EXPR_LITERAL_STRING) {
                     ProPrintfChar("Error: Expected string expression after IMAGE\n");
                     result = -1;
                     goto cleanup;
@@ -1262,20 +1324,22 @@ int parse_show_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
             }
         }
         else if (strcmp(tok->val, "ON_PICTURE") == 0) {
-            // Parse posX as expression (expect number)
+            /* ON_PICTURE <expr posX> <expr posY>
+               Accept general expressions; numeric validation happens in semantics. */
             node->show_param.posX = parse_expression(lexer, i, NULL);
-            if (!node->show_param.posX || (node->show_param.posX->type != EXPR_LITERAL_INT && node->show_param.posX->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for posX after ON_PICTURE\n");
+            if (!node->show_param.posX) {
+                ProPrintfChar("Error: Expected expression for posX after ON_PICTURE\n");
                 result = -1;
                 goto cleanup;
             }
-            // Parse posY as expression (expect number)
+
             node->show_param.posY = parse_expression(lexer, i, NULL);
-            if (!node->show_param.posY || (node->show_param.posY->type != EXPR_LITERAL_INT && node->show_param.posY->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for posY after posX\n");
+            if (!node->show_param.posY) {
+                ProPrintfChar("Error: Expected expression for posY after posX\n");
                 result = -1;
                 goto cleanup;
             }
+
             node->show_param.on_picture = true;
         }
         else {
@@ -1285,37 +1349,39 @@ int parse_show_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
         }
     }
 
-    // Log the parsed SHOW_PARAM (extract values for logging)
-    char* tooltip_val = (node->show_param.tooltip_message && node->show_param.tooltip_message->type == EXPR_LITERAL_STRING) ? node->show_param.tooltip_message->data.string_val : "NULL";
-    char* image_val = (node->show_param.image_name && node->show_param.image_name->type == EXPR_LITERAL_STRING) ? node->show_param.image_name->data.string_val : "NULL";
-    int log_posX = (node->show_param.posX && node->show_param.posX->type == EXPR_LITERAL_INT) ? (int)node->show_param.posX->data.int_val :
-        (node->show_param.posX && node->show_param.posX->type == EXPR_LITERAL_DOUBLE ? (int)node->show_param.posX->data.double_val : 0);
-    int log_posY = (node->show_param.posY && node->show_param.posY->type == EXPR_LITERAL_INT) ? (int)node->show_param.posY->data.int_val :
-        (node->show_param.posY && node->show_param.posY->type == EXPR_LITERAL_DOUBLE ? (int)node->show_param.posY->data.double_val : 0);
-    LogOnlyPrintfChar("ShowParamNode: var_type=%d, subtype=%d, parameter=%s, tooltip_message=%s, image_name=%s, on_picture=%d, posX=%d, posY=%d\n",
-        node->show_param.var_type, node->show_param.subtype, node->show_param.parameter,
-        tooltip_val, image_val,
-        node->show_param.on_picture, log_posX, log_posY);
+    /* ---- logging (stringify expressions for clarity) ---- */
+    {
+        char* tooltip_str = expression_to_string(node->show_param.tooltip_message);
+        char* image_str = expression_to_string(node->show_param.image_name);
+        char* posx_str = expression_to_string(node->show_param.posX);
+        char* posy_str = expression_to_string(node->show_param.posY);
+
+        LogOnlyPrintfChar(
+            "ShowParamNode: var_type=%d, subtype=%d, parameter=%s, tooltip=%s, image=%s, on_picture=%d, posX=%s, posY=%s\n",
+            node->show_param.var_type, node->show_param.subtype,
+            node->show_param.parameter ? node->show_param.parameter : "NULL",
+            tooltip_str ? tooltip_str : "NULL",
+            image_str ? image_str : "NULL",
+            node->show_param.on_picture,
+            posx_str ? posx_str : "NULL",
+            posy_str ? posy_str : "NULL"
+        );
+
+        free(tooltip_str);
+        free(image_str);
+        free(posx_str);
+        free(posy_str);
+    }
 
     return 0;
 
 cleanup:
-    if (type_str) {
-        free(type_str);
-        type_str = NULL;
-    }
-    if (node->show_param.parameter) {
-        free(node->show_param.parameter);
-        node->show_param.parameter = NULL;
-    }
-    free_expression(node->show_param.tooltip_message);
-    node->show_param.tooltip_message = NULL;
-    free_expression(node->show_param.image_name);
-    node->show_param.image_name = NULL;
-    free_expression(node->show_param.posX);
-    node->show_param.posX = NULL;
-    free_expression(node->show_param.posY);
-    node->show_param.posY = NULL;
+    if (type_str) { free(type_str); type_str = NULL; }
+    if (node->show_param.parameter) { free(node->show_param.parameter); node->show_param.parameter = NULL; }
+    free_expression(node->show_param.tooltip_message); node->show_param.tooltip_message = NULL;
+    free_expression(node->show_param.image_name);      node->show_param.image_name = NULL;
+    free_expression(node->show_param.posX);            node->show_param.posX = NULL;
+    free_expression(node->show_param.posY);            node->show_param.posY = NULL;
     return result;
 }
 
@@ -1398,74 +1464,80 @@ int parse_checkbox_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
     }
     (*i)++;
 
-    // Parse options until non-option token
-    while (1) {
-        tok = current_token(lexer, i);
-        if (!tok || tok->type != tok_option) break;
-        (*i)++;  // Consume option (corrected dereference)
-        const char* option = tok->val;
+    // Parse options and tag in any order until non-option/non-string token
+    while ((tok = current_token(lexer, i)) != NULL) {
+        if (tok->type == tok_option) {
+            (*i)++;  // Consume option
+            const char* option = tok->val;
 
-        if (strcmp(option, "REQUIRED") == 0) {
-            node->checkbox_param.required = true;
-        }
-        else if (strcmp(option, "DISPLAY_ORDER") == 0) {
-            node->checkbox_param.display_order = parse_expression(lexer, i, NULL);
-            if (!node->checkbox_param.display_order || (node->checkbox_param.display_order->type != EXPR_LITERAL_INT && node->checkbox_param.display_order->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression after DISPLAY_ORDER\n");
-                result = -1;
-                goto cleanup;
+            if (strcmp(option, "REQUIRED") == 0) {
+                node->checkbox_param.required = true;
             }
-        }
-        else if (strcmp(option, "TOOLTIP") == 0) {
-            node->checkbox_param.tooltip_message = parse_expression(lexer, i, NULL);
-            if (!node->checkbox_param.tooltip_message || node->checkbox_param.tooltip_message->type != EXPR_LITERAL_STRING) {
-                ProPrintfChar("Error: Expected string expression after TOOLTIP\n");
-                result = -1;
-                goto cleanup;
-            }
-
-            // Optional IMAGE
-            tok = current_token(lexer, i);
-            if (tok && tok->type == tok_option && strcmp(tok->val, "IMAGE") == 0) {
-                (*i)++;
-                node->checkbox_param.image_name = parse_expression(lexer, i, NULL);
-                if (!node->checkbox_param.image_name || node->checkbox_param.image_name->type != EXPR_LITERAL_STRING) {
-                    ProPrintfChar("Error: Expected string expression after IMAGE\n");
+            else if (strcmp(option, "DISPLAY_ORDER") == 0) {
+                node->checkbox_param.display_order = parse_expression(lexer, i, NULL);
+                if (!node->checkbox_param.display_order || (node->checkbox_param.display_order->type != EXPR_LITERAL_INT && node->checkbox_param.display_order->type != EXPR_LITERAL_DOUBLE)) {
+                    ProPrintfChar("Error: Expected numeric expression after DISPLAY_ORDER\n");
                     result = -1;
                     goto cleanup;
                 }
             }
+            else if (strcmp(option, "TOOLTIP") == 0) {
+                node->checkbox_param.tooltip_message = parse_expression(lexer, i, NULL);
+                if (!node->checkbox_param.tooltip_message || node->checkbox_param.tooltip_message->type != EXPR_LITERAL_STRING) {
+                    ProPrintfChar("Error: Expected string expression after TOOLTIP\n");
+                    result = -1;
+                    goto cleanup;
+                }
+
+                // Optional IMAGE
+                tok = current_token(lexer, i);
+                if (tok && tok->type == tok_option && strcmp(tok->val, "IMAGE") == 0) {
+                    (*i)++;
+                    node->checkbox_param.image_name = parse_expression(lexer, i, NULL);
+                    if (!node->checkbox_param.image_name || node->checkbox_param.image_name->type != EXPR_LITERAL_STRING) {
+                        ProPrintfChar("Error: Expected string expression after IMAGE\n");
+                        result = -1;
+                        goto cleanup;
+                    }
+                }
+            }
+            else if (strcmp(option, "ON_PICTURE") == 0) {
+                node->checkbox_param.posX = parse_expression(lexer, i, NULL);
+                if (!node->checkbox_param.posX) {
+                    ProPrintfChar("Error: Expected expression for posX after ON_PICTURE\n");
+                    result = -1;
+                    goto cleanup;
+                }
+                node->checkbox_param.posY = parse_expression(lexer, i, NULL);
+                if (!node->checkbox_param.posY) {
+                    ProPrintfChar("Error: Expected expression for posY after posX\n");
+                    result = -1;
+                    goto cleanup;
+                }
+                node->checkbox_param.on_picture = true;
+            }
+            else {
+                ProPrintfChar("Error: Unknown option '%s' in CHECKBOX_PARAM\n", option);
+                result = -1;
+                goto cleanup;
+            }
         }
-        else if (strcmp(option, "ON_PICTURE") == 0) {
-            node->checkbox_param.posX = parse_expression(lexer, i, NULL);
-            if (!node->checkbox_param.posX || (node->checkbox_param.posX->type != EXPR_LITERAL_INT && node->checkbox_param.posX->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for posX after ON_PICTURE\n");
+        else if (tok->type == tok_string) {
+            if (node->checkbox_param.tag != NULL) {
+                ProPrintfChar("Error: Duplicate tag in CHECKBOX_PARAM\n");
                 result = -1;
                 goto cleanup;
             }
-            node->checkbox_param.posY = parse_expression(lexer, i, NULL);
-            if (!node->checkbox_param.posY || (node->checkbox_param.posY->type != EXPR_LITERAL_INT && node->checkbox_param.posY->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for posY after posX\n");
+            node->checkbox_param.tag = parse_expression(lexer, i, NULL);
+            if (!node->checkbox_param.tag || node->checkbox_param.tag->type != EXPR_LITERAL_STRING) {
+                ProPrintfChar("Error: Expected string expression for tag\n");
                 result = -1;
                 goto cleanup;
             }
-            node->checkbox_param.on_picture = true;
         }
         else {
-            ProPrintfChar("Error: Unknown option '%s' in CHECKBOX_PARAM\n", option);
-            result = -1;
-            goto cleanup;
-        }
-    }
-
-    // Parse optional tag (if next is string)
-    tok = current_token(lexer, i);
-    if (tok && tok->type == tok_string) {
-        node->checkbox_param.tag = parse_expression(lexer, i, NULL);
-        if (!node->checkbox_param.tag || node->checkbox_param.tag->type != EXPR_LITERAL_STRING) {
-            ProPrintfChar("Error: Expected string expression for tag\n");
-            result = -1;
-            goto cleanup;
+            // Unexpected token; assume end of command parameters
+            break;
         }
     }
 
@@ -1474,14 +1546,41 @@ int parse_checkbox_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
     char* image_val = (node->checkbox_param.image_name && node->checkbox_param.image_name->type == EXPR_LITERAL_STRING) ? node->checkbox_param.image_name->data.string_val : "NULL";
     int log_display_order = (node->checkbox_param.display_order && node->checkbox_param.display_order->type == EXPR_LITERAL_INT) ? (int)node->checkbox_param.display_order->data.int_val :
         (node->checkbox_param.display_order && node->checkbox_param.display_order->type == EXPR_LITERAL_DOUBLE ? (int)node->checkbox_param.display_order->data.double_val : -1);
-    int log_posX = (node->checkbox_param.posX && node->checkbox_param.posX->type == EXPR_LITERAL_INT) ? (int)node->checkbox_param.posX->data.int_val :
-        (node->checkbox_param.posX && node->checkbox_param.posX->type == EXPR_LITERAL_DOUBLE ? (int)node->checkbox_param.posX->data.double_val : 0);
-    int log_posY = (node->checkbox_param.posY && node->checkbox_param.posY->type == EXPR_LITERAL_INT) ? (int)node->checkbox_param.posY->data.int_val :
-        (node->checkbox_param.posY && node->checkbox_param.posY->type == EXPR_LITERAL_DOUBLE ? (int)node->checkbox_param.posY->data.double_val : 0);
+    char* log_posX_str = "expression";
+    int log_posX = 0;
+    if (node->checkbox_param.posX) {
+        if (node->checkbox_param.posX->type == EXPR_LITERAL_INT) {
+            log_posX = (int)node->checkbox_param.posX->data.int_val;
+            log_posX_str = NULL;  // Will use numeric value
+        }
+        else if (node->checkbox_param.posX->type == EXPR_LITERAL_DOUBLE) {
+            log_posX = (int)node->checkbox_param.posX->data.double_val;
+            log_posX_str = NULL;  // Will use numeric value
+        }
+    }
+    char* log_posY_str = "expression";
+    int log_posY = 0;
+    if (node->checkbox_param.posY) {
+        if (node->checkbox_param.posY->type == EXPR_LITERAL_INT) {
+            log_posY = (int)node->checkbox_param.posY->data.int_val;
+            log_posY_str = NULL;  // Will use numeric value
+        }
+        else if (node->checkbox_param.posY->type == EXPR_LITERAL_DOUBLE) {
+            log_posY = (int)node->checkbox_param.posY->data.double_val;
+            log_posY_str = NULL;  // Will use numeric value
+        }
+    }
     char* tag_val = (node->checkbox_param.tag && node->checkbox_param.tag->type == EXPR_LITERAL_STRING) ? node->checkbox_param.tag->data.string_val : "NULL";
-    LogOnlyPrintfChar("CheckboxParamNode: subtype=%d, parameter=%s, required=%d, display_order=%d, tooltip_message=%s, image_name=%s, on_picture=%d, posX=%d, posY=%d, tag=%s",
-        node->checkbox_param.subtype, node->checkbox_param.parameter, node->checkbox_param.required, log_display_order,
-        tooltip_val, image_val, node->checkbox_param.on_picture, log_posX, log_posY, tag_val);
+    if (log_posX_str == NULL && log_posY_str == NULL) {
+        LogOnlyPrintfChar("CheckboxParamNode: subtype=%d, parameter=%s, required=%d, display_order=%d, tooltip_message=%s, image_name=%s, on_picture=%d, posX=%d, posY=%d, tag=%s",
+            node->checkbox_param.subtype, node->checkbox_param.parameter, node->checkbox_param.required, log_display_order,
+            tooltip_val, image_val, node->checkbox_param.on_picture, log_posX, log_posY, tag_val);
+    }
+    else {
+        LogOnlyPrintfChar("CheckboxParamNode: subtype=%d, parameter=%s, required=%d, display_order=%d, tooltip_message=%s, image_name=%s, on_picture=%d, posX=%s, posY=%s, tag=%s",
+            node->checkbox_param.subtype, node->checkbox_param.parameter, node->checkbox_param.required, log_display_order,
+            tooltip_val, image_val, node->checkbox_param.on_picture, log_posX_str ? log_posX_str : "", log_posY_str ? log_posY_str : "", tag_val);
+    }
     return 0;
 
 cleanup:
@@ -1507,7 +1606,6 @@ cleanup:
     node->checkbox_param.tag = NULL;
     return -1;
 }
-
 /*=================================================*\
 * 
 * // Parse USER_INPUT_PARAM command
@@ -1961,11 +2059,12 @@ int parse_radiobutton_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
         }
         else if (strcmp(option, "DISPLAY_ORDER") == 0) {
             node->display_order = parse_expression(lexer, i, NULL);
-            if (!node->display_order || (node->display_order->type != EXPR_LITERAL_INT && node->display_order->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression after DISPLAY_ORDER\n");
+            if (!node->display_order) {
+                ProPrintfChar("Error: Expected expression after DISPLAY_ORDER\n");
                 result = -1;
                 goto cleanup;
             }
+            // Note: Allow general expressions (e.g., variables or operations); assume numeric evaluation at runtime.
         }
         else if (strcmp(option, "TOOLTIP") == 0) {
             node->tooltip_message = parse_expression(lexer, i, NULL);
@@ -1988,17 +2087,19 @@ int parse_radiobutton_param(Lexer* lexer, size_t* i, CommandData* parsed_data) {
         }
         else if (strcmp(option, "ON_PICTURE") == 0) {
             node->posX = parse_expression(lexer, i, NULL);
-            if (!node->posX || (node->posX->type != EXPR_LITERAL_INT && node->posX->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for posX after ON_PICTURE\n");
+            if (!node->posX) {
+                ProPrintfChar("Error: Expected expression for posX after ON_PICTURE\n");
                 result = -1;
                 goto cleanup;
             }
+            // Note: Allow general expressions (e.g., variables or operations); assume numeric evaluation at runtime.
             node->posY = parse_expression(lexer, i, NULL);
-            if (!node->posY || (node->posY->type != EXPR_LITERAL_INT && node->posY->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for posY after posX\n");
+            if (!node->posY) {
+                ProPrintfChar("Error: Expected expression for posY after posX\n");
                 result = -1;
                 goto cleanup;
             }
+            // Note: Allow general expressions (e.g., variables or operations); assume numeric evaluation at runtime.
             node->on_picture = true;
         }
         else {
@@ -2356,15 +2457,7 @@ int parse_user_select(Lexer* lexer, size_t* i, CommandData* parsed_data) {
                 ProPrintfChar("Error: Expected string expression for tag\n");
                 goto cleanup;
             }
-        }
-        else if (tok->type == tok_number || tok->type == tok_identifier ||
-            tok->type == tok_lparen || tok->type == tok_minus) {
-            // Backward compatibility: keep supporting numeric tag if you already emit it
-            node->tag = parse_expression(lexer, i, NULL);
-            if (!node->tag || (node->tag->type != EXPR_LITERAL_INT && node->tag->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for tag\n");
-                goto cleanup;
-            }
+        
         }
     }
 
@@ -2689,14 +2782,6 @@ int parse_user_select_multiple(Lexer* lexer, size_t* i, CommandData* parsed_data
                 goto cleanup;
             }
         }
-        else if (tok->type == tok_number || tok->type == tok_identifier ||
-            tok->type == tok_lparen || tok->type == tok_minus) {
-            node->tag = parse_expression(lexer, i, NULL);
-            if (!node->tag || (node->tag->type != EXPR_LITERAL_INT && node->tag->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for tag\n");
-                goto cleanup;
-            }
-        }
     }
 
     /* -------- summary log -------- */
@@ -3010,14 +3095,6 @@ int parse_user_select_multiple_optional(Lexer* lexer, size_t* i, CommandData* pa
             node->tag = parse_expression(lexer, i, NULL);
             if (!node->tag || node->tag->type != EXPR_LITERAL_STRING) {
                 ProPrintfChar("Error: Expected string expression for tag\n");
-                goto cleanup;
-            }
-        }
-        else if (tok->type == tok_number || tok->type == tok_identifier ||
-            tok->type == tok_lparen || tok->type == tok_minus) {
-            node->tag = parse_expression(lexer, i, NULL);
-            if (!node->tag || (node->tag->type != EXPR_LITERAL_INT && node->tag->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for tag\n");
                 goto cleanup;
             }
         }
@@ -3394,15 +3471,6 @@ int parse_user_select_optional(Lexer* lexer, size_t* i, CommandData* parsed_data
                 goto cleanup;
             }
         }
-        else if (tok->type == tok_number || tok->type == tok_identifier ||
-            tok->type == tok_lparen || tok->type == tok_minus) {
-            // Backward compatibility: keep supporting numeric tag if you already emit it
-            node->tag = parse_expression(lexer, i, NULL);
-            if (!node->tag || (node->tag->type != EXPR_LITERAL_INT && node->tag->type != EXPR_LITERAL_DOUBLE)) {
-                ProPrintfChar("Error: Expected numeric expression for tag\n");
-                goto cleanup;
-            }
-        }
     }
 
     {
@@ -3530,6 +3598,19 @@ int parse_begin_table(Lexer* lexer, size_t* i, CommandData* parsed_data) {
     node->row_count = 0;
     node->column_count = 0;
 
+    // Additional flags and values for specific TABLE_OPTION handling
+    node->no_autosel = false;
+    node->no_filter = false;
+    node->depend_on_input = false;
+    node->invalidate_on_unselect = false;
+    node->show_autosel = false;
+    node->filter_rigid = false;
+    node->filter_only_column = -1;  // -1 indicates not used
+    node->filter_column = -1;       // -1 indicates not used
+    node->table_height = 12;        // Default is 12 (as per docs); track if explicitly set
+    node->table_height_set = false; // New: Track if TABLE_HEIGHT was explicitly provided
+    node->array = false;
+
     // Step 1: Assume 'BEGIN_TABLE' has already been consumed by the caller; parse TABLE_IDENTIFIER
     TokenData* tok = current_token(lexer, i);
     if (!tok || (tok->type != tok_field && tok->type != tok_identifier)) {
@@ -3569,6 +3650,7 @@ int parse_begin_table(Lexer* lexer, size_t* i, CommandData* parsed_data) {
 
     // Step 3: Parse optional TABLE_OPTION (array of ExpressionNode*)
     tok = current_token(lexer, i);
+    int actual_option_count = 0;  // New: Track logical options (names), excluding args
     if (tok && tok->type == tok_keyword && strcmp(tok->val, "TABLE_OPTION") == 0) {
         (*i)++;  // Consume TABLE_OPTION
         int option_capacity = 4;
@@ -3597,6 +3679,112 @@ int parse_begin_table(Lexer* lexer, size_t* i, CommandData* parsed_data) {
             node->options[node->option_count++] = option;
             tok = current_token(lexer, i);
         }
+    }
+
+    // New: Process the parsed options to set specific flags/values (track logical count)
+    // This iterates through the options array and matches known options, handling arguments where needed
+    for (size_t opt_idx = 0; opt_idx < node->option_count; ) {
+        ExpressionNode* opt = node->options[opt_idx];
+        if (opt->type != EXPR_VARIABLE_REF && opt->type != EXPR_LITERAL_STRING) {
+            ProPrintfChar("Error: TABLE_OPTION at index %zu is not a string or identifier\n", opt_idx);
+            goto cleanup;
+        }
+        char* opt_name = opt->data.string_val;  // Assumes string_val is set for both types
+
+        if (strcmp(opt_name, "NO_AUTOSEL") == 0) {
+            node->no_autosel = true;
+            opt_idx++;
+            actual_option_count++;  // Count the logical option
+        }
+        else if (strcmp(opt_name, "NO_FILTER") == 0) {
+            node->no_filter = true;
+            opt_idx++;
+            actual_option_count++;
+        }
+        else if (strcmp(opt_name, "DEPEND_ON_INPUT") == 0) {
+            node->depend_on_input = true;
+            opt_idx++;
+            actual_option_count++;
+        }
+        else if (strcmp(opt_name, "INVALIDATE_ON_UNSELECT") == 0) {
+            node->invalidate_on_unselect = true;
+            opt_idx++;
+            actual_option_count++;
+        }
+        else if (strcmp(opt_name, "SHOW_AUTOSEL") == 0) {
+            node->show_autosel = true;
+            opt_idx++;
+            actual_option_count++;
+        }
+        else if (strcmp(opt_name, "FILTER_RIGID") == 0) {
+            node->filter_rigid = true;
+            opt_idx++;
+            actual_option_count++;
+        }
+        else if (strcmp(opt_name, "ARRAY") == 0) {
+            node->array = true;
+            opt_idx++;
+            actual_option_count++;
+        }
+        else if (strcmp(opt_name, "FILTER_ONLY_COLUMN") == 0) {
+            actual_option_count++;  // Count the logical option
+            opt_idx++;
+            if (opt_idx >= node->option_count) {
+                ProPrintfChar("Error: FILTER_ONLY_COLUMN missing integer argument\n");
+                goto cleanup;
+            }
+            ExpressionNode* arg = node->options[opt_idx];
+            if (arg->type != EXPR_LITERAL_INT) {
+                ProPrintfChar("Error: FILTER_ONLY_COLUMN argument must be an integer literal\n");
+                goto cleanup;
+            }
+            node->filter_only_column = (int)arg->data.int_val;
+            opt_idx++;  // Consume arg (but don't count it as a separate option)
+        }
+        else if (strcmp(opt_name, "FILTER_COLUMN") == 0) {
+            actual_option_count++;  // Count the logical option
+            opt_idx++;
+            if (opt_idx >= node->option_count) {
+                ProPrintfChar("Error: FILTER_COLUMN missing integer argument\n");
+                goto cleanup;
+            }
+            ExpressionNode* arg = node->options[opt_idx];
+            if (arg->type != EXPR_LITERAL_INT) {
+                ProPrintfChar("Error: FILTER_COLUMN argument must be an integer literal\n");
+                goto cleanup;
+            }
+            node->filter_column = (int)arg->data.int_val;
+            opt_idx++;  // Consume arg
+        }
+        else if (strcmp(opt_name, "TABLE_HEIGHT") == 0) {
+            actual_option_count++;  // Count the logical option
+            opt_idx++;
+            if (opt_idx >= node->option_count) {
+                ProPrintfChar("Error: TABLE_HEIGHT missing integer argument\n");
+                goto cleanup;
+            }
+            ExpressionNode* arg = node->options[opt_idx];
+            if (arg->type != EXPR_LITERAL_INT) {
+                ProPrintfChar("Error: TABLE_HEIGHT argument must be an integer literal\n");
+                goto cleanup;
+            }
+            node->table_height = (int)arg->data.int_val;
+            node->table_height_set = true;  // Mark as explicitly set (useful if you need to distinguish default vs. user-provided)
+            opt_idx++;  // Consume arg
+        }
+        else {
+            ProPrintfChar("Warning: Unknown TABLE_OPTION '%s' at index %zu\n", opt_name, opt_idx);
+            opt_idx++;  // Skip unknown options (don't count them)
+        }
+    }
+
+    // Optional: Free the options array now that everything is processed into flags/values
+    // This saves memory and reinforces that raw expressions are no longer needed
+    if (node->options) {
+        for (int j = 0; j < node->option_count; j++) free_expression(node->options[j]);
+        free(node->options);
+        node->options = NULL;
+        node->option_count = 0;  // Reset count to reflect no unprocessed options
     }
 
     // Step 4: Parse SEL_STRING (array of ExpressionNode*)
@@ -3747,9 +3935,9 @@ int parse_begin_table(Lexer* lexer, size_t* i, CommandData* parsed_data) {
     }
     (*i)++;  // Consume END_TABLE
 
-    // Logging (optional summary)
+    // Logging (optional summary) - Use actual_option_count for accurate reporting
     LogOnlyPrintfChar("Parsed table '%s' with %d options, %d sel_strings, %d data_types, %d rows, %d columns\n",
-        node->identifier, node->option_count, node->sel_string_count, node->data_type_count, node->row_count, node->column_count);
+        node->identifier, actual_option_count, node->sel_string_count, node->data_type_count, node->row_count, node->column_count);
 
     // Detailed row and cell logging
     if (node->row_count > 0) {
@@ -3873,11 +4061,12 @@ static int add_command_to_list(CommandNode*** commands_ptr, size_t* count, size_
 CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
     TokenData* tok = current_token(lexer, i);
     if (!tok || tok->type != tok_keyword || strcmp(tok->val, "IF") != 0) {
-        return NULL;  // Not an IF
+        return NULL; /* not an IF */
     }
-    (*i)++;  // Consume IF
+    (*i)++; /* consume IF */
 
-    IfNode* if_node = malloc(sizeof(IfNode));
+    /* allocate IfNode */
+    IfNode* if_node = (IfNode*)malloc(sizeof(IfNode));
     if (!if_node) {
         ProPrintfChar("Error: Memory allocation failed for IfNode\n");
         return NULL;
@@ -3887,19 +4076,27 @@ CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
     if_node->else_commands = NULL;
     if_node->else_command_count = 0;
 
-    // Parse initial IF branch
+    /* assign a unique id for later tracking */
+    if_node->id = ++s_if_id_counter;
+    LogOnlyPrintfChar("IfNode: assigned id=%d at line %zu\n",
+        if_node->id, tok->loc.line);
+
+    /* parse initial IF condition */
     ExpressionNode* condition = parse_expression(lexer, i, st);
     if (!condition) {
         ProPrintfChar("Error: Expected condition after IF\n");
         free(if_node);
         return NULL;
     }
-    // Log the condition for the initial IF branch
-    char* cond_str = expression_to_string(condition);
-    LogOnlyPrintfChar("Parsed IF condition: %s", cond_str ? cond_str : "NULL");
-    free(cond_str);
+    {
+        char* cond_str = expression_to_string(condition);
+        LogOnlyPrintfChar("IfNode[%d] initial IF condition: %s\n",
+            if_node->id, cond_str ? cond_str : "NULL");
+        free(cond_str);
+    }
 
-    IfBranch* branch = malloc(sizeof(IfBranch));
+    /* first branch */
+    IfBranch* branch = (IfBranch*)malloc(sizeof(IfBranch));
     if (!branch) {
         free_expression(condition);
         free(if_node);
@@ -3909,7 +4106,7 @@ CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
     branch->commands = NULL;
     branch->command_count = 0;
     size_t branch_capacity = 4;
-    branch->commands = malloc(branch_capacity * sizeof(CommandNode*));
+    branch->commands = (CommandNode**)malloc(branch_capacity * sizeof(CommandNode*));
     if (!branch->commands) {
         free_expression(condition);
         free(branch);
@@ -3917,20 +4114,22 @@ CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
         return NULL;
     }
 
-    // Parse commands for current branch
+    /* parse commands for the first branch until ELSE_IF/ELSE/END_IF */
     while ((tok = current_token(lexer, i)) != NULL) {
-        if (tok->type == tok_keyword && (strcmp(tok->val, "ELSE_IF") == 0 || strcmp(tok->val, "ELSE") == 0 || strcmp(tok->val, "END_IF") == 0)) {
+        if (tok->type == tok_keyword &&
+            (strcmp(tok->val, "ELSE_IF") == 0 ||
+                strcmp(tok->val, "ELSE") == 0 ||
+                strcmp(tok->val, "END_IF") == 0)) {
             break;
         }
-        CommandNode* cmd = parse_command(lexer, i, st);
-        if (cmd) {
-            if (add_command_to_list(&branch->commands, &branch->command_count, &branch_capacity, cmd) != 0) {
-                free_command_node(cmd);
+        CommandNode* inner = parse_command(lexer, i, st);
+        if (inner) {
+            if (add_command_to_list(&branch->commands, &branch->command_count, &branch_capacity, inner) != 0) {
+                free_command_node(inner);
                 goto cleanup_if;
             }
         }
         else {
-            // Skip invalid tokens but log warning
             ProPrintfChar("Warning: Skipping invalid token in IF branch\n");
             (*i)++;
         }
@@ -3939,20 +4138,24 @@ CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
         goto cleanup_if;
     }
 
-    // Handle multiple ELSE_IF branches
-    while ((tok = current_token(lexer, i)) != NULL && tok->type == tok_keyword && strcmp(tok->val, "ELSE_IF") == 0) {
-        (*i)++;  // Consume ELSE_IF
+    /* parse zero or more ELSE_IF branches */
+    while ((tok = current_token(lexer, i)) != NULL &&
+        tok->type == tok_keyword &&
+        strcmp(tok->val, "ELSE_IF") == 0) {
+        (*i)++; /* consume ELSE_IF */
         condition = parse_expression(lexer, i, st);
         if (!condition) {
             ProPrintfChar("Error: Expected condition after ELSE_IF\n");
             goto cleanup_if;
         }
-        // Log the condition for ELSE_IF branch
-        cond_str = expression_to_string(condition);
-        LogOnlyPrintfChar("Parsed ELSE_IF condition: %s", cond_str ? cond_str : "NULL");
-        free(cond_str);
+        {
+            char* cond_str = expression_to_string(condition);
+            LogOnlyPrintfChar("IfNode[%d] ELSE_IF condition: %s\n",
+                if_node->id, cond_str ? cond_str : "NULL");
+            free(cond_str);
+        }
 
-        branch = malloc(sizeof(IfBranch));
+        branch = (IfBranch*)malloc(sizeof(IfBranch));
         if (!branch) {
             free_expression(condition);
             goto cleanup_if;
@@ -3961,22 +4164,25 @@ CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
         branch->commands = NULL;
         branch->command_count = 0;
         branch_capacity = 4;
-        branch->commands = malloc(branch_capacity * sizeof(CommandNode*));
+        branch->commands = (CommandNode**)malloc(branch_capacity * sizeof(CommandNode*));
         if (!branch->commands) {
             free_expression(condition);
             free(branch);
             goto cleanup_if;
         }
 
-        // Parse commands for ELSE_IF branch
+        /* parse commands for this ELSE_IF until next ELSE_IF/ELSE/END_IF */
         while ((tok = current_token(lexer, i)) != NULL) {
-            if (tok->type == tok_keyword && (strcmp(tok->val, "ELSE_IF") == 0 || strcmp(tok->val, "ELSE") == 0 || strcmp(tok->val, "END_IF") == 0)) {
+            if (tok->type == tok_keyword &&
+                (strcmp(tok->val, "ELSE_IF") == 0 ||
+                    strcmp(tok->val, "ELSE") == 0 ||
+                    strcmp(tok->val, "END_IF") == 0)) {
                 break;
             }
-            CommandNode* cmd = parse_command(lexer, i, st);
-            if (cmd) {
-                if (add_command_to_list(&branch->commands, &branch->command_count, &branch_capacity, cmd) != 0) {
-                    free_command_node(cmd);
+            CommandNode* inner = parse_command(lexer, i, st);
+            if (inner) {
+                if (add_command_to_list(&branch->commands, &branch->command_count, &branch_capacity, inner) != 0) {
+                    free_command_node(inner);
                     free_expression(condition);
                     free(branch->commands);
                     free(branch);
@@ -3989,30 +4195,29 @@ CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
             }
         }
         if (add_if_branch(if_node, branch) != 0) {
-            free_expression(condition);
-            free(branch->commands);
-            free(branch);
             goto cleanup_if;
         }
     }
 
-    // Handle optional ELSE
-    size_t else_capacity = 4;
-    if ((tok = current_token(lexer, i)) != NULL && tok->type == tok_keyword && strcmp(tok->val, "ELSE") == 0) {
-        (*i)++;  // Consume ELSE
-        if_node->else_commands = malloc(else_capacity * sizeof(CommandNode*));
+    /* optional ELSE block */
+    if ((tok = current_token(lexer, i)) != NULL &&
+        tok->type == tok_keyword && strcmp(tok->val, "ELSE") == 0) {
+        (*i)++; /* consume ELSE */
+        size_t else_capacity = 4;
+        if_node->else_commands = (CommandNode**)malloc(else_capacity * sizeof(CommandNode*));
         if (!if_node->else_commands) {
             goto cleanup_if;
         }
-        // Parse commands for ELSE
+        if_node->else_command_count = 0;
+
         while ((tok = current_token(lexer, i)) != NULL) {
             if (tok->type == tok_keyword && strcmp(tok->val, "END_IF") == 0) {
                 break;
             }
-            CommandNode* cmd = parse_command(lexer, i, st);
-            if (cmd) {
-                if (add_command_to_list(&if_node->else_commands, &if_node->else_command_count, &else_capacity, cmd) != 0) {
-                    free_command_node(cmd);
+            CommandNode* inner = parse_command(lexer, i, st);
+            if (inner) {
+                if (add_command_to_list(&if_node->else_commands, &if_node->else_command_count, &else_capacity, inner) != 0) {
+                    free_command_node(inner);
                     goto cleanup_if;
                 }
             }
@@ -4023,49 +4228,57 @@ CommandNode* parse_if_command(Lexer* lexer, size_t* i, SymbolTable* st) {
         }
     }
 
-    // Require END_IF
-    if ((tok = current_token(lexer, i)) == NULL || tok->type != tok_keyword || strcmp(tok->val, "END_IF") != 0) {
+    /* require END_IF */
+    if ((tok = current_token(lexer, i)) == NULL ||
+        tok->type != tok_keyword || strcmp(tok->val, "END_IF") != 0) {
         ProPrintfChar("Error: Expected END_IF to close IF block\n");
         goto cleanup_if;
     }
-    (*i)++;  // Consume END_IF
+    (*i)++; /* consume END_IF */
 
-    // Create CommandNode
-    CommandNode* cmd_node = malloc(sizeof(CommandNode));
+    /* wrap into CommandNode */
+    CommandNode* cmd_node = (CommandNode*)malloc(sizeof(CommandNode));
     if (!cmd_node) {
         goto cleanup_if;
     }
     cmd_node->type = COMMAND_IF;
-    cmd_node->data = malloc(sizeof(CommandData));
+    cmd_node->data = (CommandData*)malloc(sizeof(CommandData));
     if (!cmd_node->data) {
         free(cmd_node);
         goto cleanup_if;
     }
-    cmd_node->data->ifcommand = *if_node;  // Copy IfNode to union
-    free(if_node);  // IfNode was temp; data is now owned by CommandData
+    /* copy the fully built IfNode into the union */
+    cmd_node->data->ifcommand = *if_node;
+    free(if_node);
 
-    // Log the overall IfNode (after successful parse)
-    LogOnlyPrintfChar("IfNode: branch_count=%zu, else_command_count=%zu\n",
-        cmd_node->data->ifcommand.branch_count, cmd_node->data->ifcommand.else_command_count);
+    LogOnlyPrintfChar("IfNode[%d]: branch_count=%zu, else_command_count=%zu\n",
+        cmd_node->data->ifcommand.id,
+        cmd_node->data->ifcommand.branch_count,
+        cmd_node->data->ifcommand.else_command_count);
 
     return cmd_node;
 
 cleanup_if:
-    // Free partial IfNode
-    for (size_t b = 0; b < if_node->branch_count; b++) {
-        free_expression(if_node->branches[b]->condition);
-        for (size_t c = 0; c < if_node->branches[b]->command_count; c++) {
-            free_command_node(if_node->branches[b]->commands[c]);
+    /* free partial IfNode on error */
+    if (if_node) {
+        for (size_t b = 0; b < if_node->branch_count; ++b) {
+            IfBranch* br = if_node->branches[b];
+            if (br) {
+                free_expression(br->condition);
+                for (size_t c = 0; c < br->command_count; ++c) {
+                    free_command_node(br->commands[c]);
+                }
+                free(br->commands);
+                free(br);
+            }
         }
-        free(if_node->branches[b]->commands);
-        free(if_node->branches[b]);
+        free(if_node->branches);
+        for (size_t c = 0; c < if_node->else_command_count; ++c) {
+            free_command_node(if_node->else_commands[c]);
+        }
+        free(if_node->else_commands);
+        free(if_node);
     }
-    free(if_node->branches);
-    for (size_t c = 0; c < if_node->else_command_count; c++) {
-        free_command_node(if_node->else_commands[c]);
-    }
-    free(if_node->else_commands);
-    free(if_node);
     return NULL;
 }
 
@@ -4180,6 +4393,7 @@ CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
         return node;
     }
     /* Expression / assignment handling stays exactly the same */
+/* Expression / assignment handling stays exactly the same */
     else if (lexer->tokens[*i].type == tok_identifier ||
         lexer->tokens[*i].type == tok_number ||
         lexer->tokens[*i].type == tok_lparen ||
@@ -4212,27 +4426,30 @@ CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
                 return NULL;
             }
             node->type = COMMAND_ASSIGNMENT;
-            node->data = malloc(sizeof(CommandData));
+            node->data = (CommandData*)malloc(sizeof(CommandData));
             if (!node->data) {
                 free(node);
                 free_expression(expr);
                 free_expression(rhs);
                 return NULL;
             }
+            node->semantic_valid = true;
 
-            ((CommandData*)node->data)->assignment.lhs = expr;
-            ((CommandData*)node->data)->assignment.rhs = rhs;
+            /* fill assignment payload */
+            node->data->assignment.lhs = expr;
+            node->data->assignment.rhs = rhs;
+            node->data->assignment.assign_id = ++s_assign_id_counter; /* new id */
 
+            /* logging */
             char* lhs_str = expression_to_string(expr);
             char* rhs_str = expression_to_string(rhs);
-            if (lhs_str && rhs_str) {
-                LogOnlyPrintfChar("Parsed assignment: %s = %s", lhs_str, rhs_str);
-            }
-            else {
-                LogOnlyPrintfChar("Failed to generate string for assignment");
-            }
+            LogOnlyPrintfChar("Parsed assignment[%d]: %s = %s",
+                node->data->assignment.assign_id,
+                lhs_str ? lhs_str : "NULL",
+                rhs_str ? rhs_str : "NULL");
             free(lhs_str);
             free(rhs_str);
+
             return node;
         }
         else {
@@ -4242,25 +4459,23 @@ CommandNode* parse_command(Lexer* lexer, size_t* i, SymbolTable* st) {
                 return NULL;
             }
             node->type = COMMAND_EXPRESSION;
-            node->data = malloc(sizeof(CommandData));
+            node->data = (CommandData*)malloc(sizeof(CommandData));
             if (!node->data) {
                 free(node);
                 free_expression(expr);
                 return NULL;
             }
-            ((CommandData*)node->data)->expression = expr;
+            node->semantic_valid = true;
 
-            char* expr_str = expression_to_string(((CommandData*)node->data)->expression);
+            node->data->expression = expr;
+
+            char* expr_str = expression_to_string(node->data->expression);
             LogOnlyPrintfChar("Parsed standalone expression: %s", expr_str ? expr_str : "NULL");
             free(expr_str);
             return node;
         }
     }
-    else {
-        /* Skip unrecognized token kinds to avoid stalling */
-        (*i)++;
-        return NULL;
-    }
+    return 0;
 }
 
 Block* find_block(BlockList* block_list, BlockType type)
@@ -4672,11 +4887,12 @@ void free_command_node(CommandNode* node) {
             free(node->data);  // Free the entire CommandData allocation after cleaning internals
             break;
         }
-        case COMMAND_ASSIGNMENT: {  // New case added here
-            AssignmentNode* an = (AssignmentNode*)node->data;
+        case COMMAND_ASSIGNMENT: {
+            /* fix: node->data is CommandData*, not AssignmentNode* */
+            AssignmentNode* an = &((CommandData*)node->data)->assignment;
             free_expression(an->lhs);
             free_expression(an->rhs);
-            free(an);
+            free(node->data);
             break;
         }
         case COMMAND_EXPRESSION: {
@@ -4686,22 +4902,17 @@ void free_command_node(CommandNode* node) {
         }
         case COMMAND_IF: {
             IfNode* ifn = &((CommandData*)node->data)->ifcommand;
-            for (size_t b = 0; b < ifn->branch_count; b++)
-            {
+            for (size_t b = 0; b < ifn->branch_count; b++) {
                 IfBranch* branch = ifn->branches[b];
                 free_expression(branch->condition);
                 for (size_t c = 0; c < branch->command_count; c++)
-                {
                     free_command_node(branch->commands[c]);
-                }
                 free(branch->commands);
                 free(branch);
             }
             free(ifn->branches);
             for (size_t c = 0; c < ifn->else_command_count; c++)
-            {
                 free_command_node(ifn->else_commands[c]);
-            }
             free(ifn->else_commands);
             free(node->data);
             break;
