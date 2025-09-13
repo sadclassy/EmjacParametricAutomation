@@ -121,8 +121,6 @@ int is_valid_data_type(const char* type) {
 }
 
 
-
-
 // New helper to map string to VariableType
 static VariableType string_to_type(const char* type_str) {
 	if (strcmp(type_str, "STRING") == 0) return TYPE_STRING;
@@ -413,6 +411,14 @@ int evaluate_to_string(ExpressionNode* expr, SymbolTable* st, char** result) {
 	}
 }
 
+void coerce_empty_string_to_zero(Variable* v) {
+	if (v->type == TYPE_STRING && (v->data.string_value == NULL || strlen(v->data.string_value) == 0)) {
+		free(v->data.string_value);
+		v->type = TYPE_INTEGER;
+		v->data.int_value = 0;
+	}
+}
+
 // Infer the static type of an expression (returns VariableType or -1 on error)
 VariableType get_expression_type(ExpressionNode* expr, SymbolTable* st) {
 	if (!expr) return -1;
@@ -483,7 +489,7 @@ VariableType get_expression_type(ExpressionNode* expr, SymbolTable* st) {
 				}
 			}
 			else {  // <, >, <=, >==: numerics only
-				if (left_type == TYPE_INTEGER || left_type == TYPE_DOUBLE) {
+				if (left_type == TYPE_INTEGER || left_type == TYPE_DOUBLE || left_type == TYPE_STRING) {
 					return TYPE_BOOL;
 				}
 			}
@@ -689,34 +695,29 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 
 	case EXPR_VARIABLE_REF: {
 		Variable* src = get_symbol(st, expr->data.string_val);
-		if (!src) {
+		if (!src || src->type == TYPE_UNKNOWN) {
 			(*result)->type = TYPE_STRING;
 			(*result)->data.string_value = _strdup("");
 			return 0;
 		}
-		if (src->type == TYPE_UNKNOWN) {
-			(*result)->type = TYPE_STRING;
-			(*result)->data.string_value = _strdup("");
-			return 0;
-		}
+		/* shallow copy + fixup for strings */
 		memcpy(*result, src, sizeof(Variable));
-		if (src->type == TYPE_STRING) {
+		if (src->type == TYPE_STRING && src->data.string_value) {
 			(*result)->data.string_value = _strdup(src->data.string_value);
 		}
-		/* TODO: deep copy for ARRAY/MAP/STRUCT if needed */
 		return 0;
 	}
 
 	case EXPR_BINARY_OP: {
-		/* ---- NEW: short-circuit logical AND / OR ---- */
+		/* logical AND / OR short-circuit */
 		if (expr->data.binary.op == BINOP_AND || expr->data.binary.op == BINOP_OR) {
 			Variable* l = NULL;
 			if (evaluate_expression(expr->data.binary.left, st, &l) != 0 || !l) {
 				free(*result);
 				return -1;
 			}
-
-			/* coerce left to truthiness: bool/int != 0, double != 0.0 */
+			coerce_empty_string_to_zero(l);  // Coerce undefined/empty to 0
+			/* coerce left to truthiness */
 			int l_true = 0;
 			if (l->type == TYPE_BOOL || l->type == TYPE_INTEGER) {
 				l_true = (l->data.int_value != 0);
@@ -724,54 +725,57 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 			else if (l->type == TYPE_DOUBLE) {
 				l_true = (l->data.double_value != 0.0);
 			}
+			else if (l->type == TYPE_STRING) {
+				l_true = (l->data.string_value && strlen(l->data.string_value) > 0);
+			}
 			else {
 				free_variable(l);
 				free(*result);
-				return -1; /* invalid type for logical op */
+				return -1;
 			}
-
 			if (expr->data.binary.op == BINOP_AND && !l_true) {
-				/* left false => whole expr false (short-circuit) */
 				(*result)->type = TYPE_BOOL;
 				(*result)->data.int_value = 0;
 				free_variable(l);
 				return 0;
 			}
 			if (expr->data.binary.op == BINOP_OR && l_true) {
-				/* left true => whole expr true (short-circuit) */
 				(*result)->type = TYPE_BOOL;
 				(*result)->data.int_value = 1;
 				free_variable(l);
 				return 0;
 			}
-
-			/* must evaluate right side */
 			free_variable(l);
 			Variable* r = NULL;
 			if (evaluate_expression(expr->data.binary.right, st, &r) != 0 || !r) {
 				free(*result);
 				return -1;
 			}
-			int r_true = 0;
-			if (r->type == TYPE_BOOL || r->type == TYPE_INTEGER) {
-				r_true = (r->data.int_value != 0);
+			coerce_empty_string_to_zero(r);  // Coerce undefined/empty to 0
+			{
+				int r_true = 0;
+				if (r->type == TYPE_BOOL || r->type == TYPE_INTEGER) {
+					r_true = (r->data.int_value != 0);
+				}
+				else if (r->type == TYPE_DOUBLE) {
+					r_true = (r->data.double_value != 0.0);
+				}
+				else if (r->type == TYPE_STRING) {
+					r_true = (r->data.string_value && strlen(r->data.string_value) > 0);
+				}
+				else {
+					free_variable(r);
+					free(*result);
+					return -1;
+				}
+				(*result)->type = TYPE_BOOL;
+				(*result)->data.int_value = r_true;
 			}
-			else if (r->type == TYPE_DOUBLE) {
-				r_true = (r->data.double_value != 0.0);
-			}
-			else {
-				free_variable(r);
-				free(*result);
-				return -1;
-			}
-			(*result)->type = TYPE_BOOL;
-			(*result)->data.int_value = r_true;
 			free_variable(r);
 			return 0;
 		}
-		/* ---- END NEW LOGICALS ---- */
 
-		/* existing: evaluate both sides once for arithmetic/comparisons */
+		/* evaluate both sides once */
 		Variable* left_val = NULL;
 		Variable* right_val = NULL;
 		if (evaluate_expression(expr->data.binary.left, st, &left_val) != 0 || !left_val) {
@@ -784,8 +788,18 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 			return -1;
 		}
 
-		/* numeric coercion (int <-> double) for arithmetic/compare */
-		if (left_val->type != right_val->type) {
+		coerce_empty_string_to_zero(left_val);  // Coerce undefined/empty to 0
+		coerce_empty_string_to_zero(right_val); // Coerce undefined/empty to 0
+
+		/* operator categories */
+		const int is_arith =
+			(expr->data.binary.op >= BINOP_ADD && expr->data.binary.op <= BINOP_DIV);
+		const int is_ordered =
+			(expr->data.binary.op == BINOP_LT || expr->data.binary.op == BINOP_LE ||
+				expr->data.binary.op == BINOP_GT || expr->data.binary.op == BINOP_GE);
+
+		/* numeric coercion ONLY for arithmetic and ordered compares */
+		if ((is_arith || is_ordered) && left_val->type != right_val->type) {
 			if (left_val->type == TYPE_INTEGER && right_val->type == TYPE_DOUBLE) {
 				left_val->data.double_value = (double)left_val->data.int_value;
 				left_val->type = TYPE_DOUBLE;
@@ -803,8 +817,9 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 		}
 
 		/* arithmetic */
-		if (expr->data.binary.op >= BINOP_ADD && expr->data.binary.op <= BINOP_DIV) {
-			if (left_val->type != TYPE_INTEGER && left_val->type != TYPE_DOUBLE) {
+		if (is_arith) {
+			if ((left_val->type != TYPE_INTEGER && left_val->type != TYPE_DOUBLE) ||
+				(right_val->type != TYPE_INTEGER && right_val->type != TYPE_DOUBLE)) {
 				free_variable(left_val); free_variable(right_val); free(*result); return -1;
 			}
 			double l = (left_val->type == TYPE_DOUBLE ? left_val->data.double_value : (double)left_val->data.int_value);
@@ -819,7 +834,6 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 				dres = l / r; break;
 			default: free_variable(left_val); free_variable(right_val); free(*result); return -1;
 			}
-			/* keep double if any side was double or if division; else int */
 			if (left_val->type == TYPE_DOUBLE || right_val->type == TYPE_DOUBLE || expr->data.binary.op == BINOP_DIV) {
 				(*result)->type = TYPE_DOUBLE;
 				(*result)->data.double_value = dres;
@@ -836,80 +850,124 @@ int evaluate_expression(ExpressionNode* expr, SymbolTable* st, Variable** result
 		/* comparisons -> boolean */
 		(*result)->type = TYPE_BOOL;
 		{
-			const double eps = 1e-9; /* tolerance for doubles */
+			const double eps = 1e-9;
+
 			switch (expr->data.binary.op) {
 			case BINOP_EQ:
-				if (left_val->type == TYPE_DOUBLE) {
-					(*result)->data.int_value =
-						(fabs(left_val->data.double_value - right_val->data.double_value) <= eps);
-				}
-				else if (left_val->type == TYPE_INTEGER) {
-					(*result)->data.int_value = (left_val->data.int_value == right_val->data.int_value);
-				}
-				else if (left_val->type == TYPE_STRING) {
-					(*result)->data.int_value = (strcmp(left_val->data.string_value,
-						right_val->data.string_value) == 0);
-				}
-				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
-				break;
+			case BINOP_NE: {
+				int equal = 0;
 
-			case BINOP_NE:
-				if (left_val->type == TYPE_DOUBLE) {
-					(*result)->data.int_value =
-						(fabs(left_val->data.double_value - right_val->data.double_value) > eps);
+				/* if either side is a string, compare as text */
+				if (left_val->type == TYPE_STRING || right_val->type == TYPE_STRING) {
+					const char* ls = NULL;
+					const char* rs = NULL;
+					char lbuf[64]; lbuf[0] = '\0';
+					char rbuf[64]; rbuf[0] = '\0';
+
+					/* left -> text */
+					if (left_val->type == TYPE_STRING) {
+						ls = left_val->data.string_value ? left_val->data.string_value : "";
+					}
+					else if (left_val->type == TYPE_INTEGER || left_val->type == TYPE_BOOL) {
+						_snprintf_s(lbuf, sizeof(lbuf), _TRUNCATE, "%d", left_val->data.int_value);
+						lbuf[sizeof(lbuf) - 1] = '\0';
+						ls = lbuf;
+					}
+					else if (left_val->type == TYPE_DOUBLE) {
+						_snprintf_s(lbuf, sizeof(lbuf), _TRUNCATE, "%.15g", left_val->data.double_value);
+						lbuf[sizeof(lbuf) - 1] = '\0';
+						ls = lbuf;
+					}
+					else {
+						free_variable(left_val); free_variable(right_val); free(*result); return -1;
+					}
+
+					/* right -> text */
+					if (right_val->type == TYPE_STRING) {
+						rs = right_val->data.string_value ? right_val->data.string_value : "";
+					}
+					else if (right_val->type == TYPE_INTEGER || right_val->type == TYPE_BOOL) {
+						_snprintf_s(rbuf, sizeof(rbuf), _TRUNCATE, "%d", right_val->data.int_value);
+						rbuf[sizeof(rbuf) - 1] = '\0';
+						rs = rbuf;
+					}
+					else if (right_val->type == TYPE_DOUBLE) {
+						_snprintf_s(rbuf, sizeof(rbuf), _TRUNCATE, "%.15g", right_val->data.double_value);
+						rbuf[sizeof(rbuf) - 1] = '\0';
+						rs = rbuf;
+					}
+					else {
+						free_variable(left_val); free_variable(right_val); free(*result); return -1;
+					}
+
+					equal = (strcmp(ls, rs) == 0);
 				}
-				else if (left_val->type == TYPE_INTEGER) {
-					(*result)->data.int_value = (left_val->data.int_value != right_val->data.int_value);
+				else {
+					/* numeric equality (int/bool/double) */
+					if ((left_val->type == TYPE_DOUBLE) || (right_val->type == TYPE_DOUBLE)) {
+						double l = (left_val->type == TYPE_DOUBLE ? left_val->data.double_value : (double)left_val->data.int_value);
+						double r = (right_val->type == TYPE_DOUBLE ? right_val->data.double_value : (double)right_val->data.int_value);
+						equal = (fabs(l - r) <= eps);
+					}
+					else if ((left_val->type == TYPE_INTEGER || left_val->type == TYPE_BOOL) &&
+						(right_val->type == TYPE_INTEGER || right_val->type == TYPE_BOOL)) {
+						equal = (left_val->data.int_value == right_val->data.int_value);
+					}
+					else {
+						free_variable(left_val); free_variable(right_val); free(*result); return -1;
+					}
 				}
-				else if (left_val->type == TYPE_STRING) {
-					(*result)->data.int_value = (strcmp(left_val->data.string_value,
-						right_val->data.string_value) != 0);
-				}
-				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+
+				(*result)->data.int_value = (expr->data.binary.op == BINOP_EQ) ? equal : !equal;
 				break;
+			}
 
 			case BINOP_LT:
-				if (left_val->type == TYPE_DOUBLE) {
-					(*result)->data.int_value =
-						(left_val->data.double_value < right_val->data.double_value - eps);
+				if (left_val->type == TYPE_DOUBLE && right_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value = (left_val->data.double_value < right_val->data.double_value - eps);
 				}
-				else if (left_val->type == TYPE_INTEGER) {
+				else if (left_val->type == TYPE_INTEGER && right_val->type == TYPE_INTEGER) {
 					(*result)->data.int_value = (left_val->data.int_value < right_val->data.int_value);
 				}
-				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				else {
+					free_variable(left_val); free_variable(right_val); free(*result); return -1;
+				}
 				break;
 
 			case BINOP_GT:
-				if (left_val->type == TYPE_DOUBLE) {
-					(*result)->data.int_value =
-						(left_val->data.double_value > right_val->data.double_value + eps);
+				if (left_val->type == TYPE_DOUBLE && right_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value = (left_val->data.double_value > right_val->data.double_value + eps);
 				}
-				else if (left_val->type == TYPE_INTEGER) {
+				else if (left_val->type == TYPE_INTEGER && right_val->type == TYPE_INTEGER) {
 					(*result)->data.int_value = (left_val->data.int_value > right_val->data.int_value);
 				}
-				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				else {
+					free_variable(left_val); free_variable(right_val); free(*result); return -1;
+				}
 				break;
 
 			case BINOP_LE:
-				if (left_val->type == TYPE_DOUBLE) {
-					(*result)->data.int_value =
-						(left_val->data.double_value <= right_val->data.double_value + eps);
+				if (left_val->type == TYPE_DOUBLE && right_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value = (left_val->data.double_value <= right_val->data.double_value + eps);
 				}
-				else if (left_val->type == TYPE_INTEGER) {
+				else if (left_val->type == TYPE_INTEGER && right_val->type == TYPE_INTEGER) {
 					(*result)->data.int_value = (left_val->data.int_value <= right_val->data.int_value);
 				}
-				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				else {
+					free_variable(left_val); free_variable(right_val); free(*result); return -1;
+				}
 				break;
 
 			case BINOP_GE:
-				if (left_val->type == TYPE_DOUBLE) {
-					(*result)->data.int_value =
-						(left_val->data.double_value >= right_val->data.double_value - eps);
+				if (left_val->type == TYPE_DOUBLE && right_val->type == TYPE_DOUBLE) {
+					(*result)->data.int_value = (left_val->data.double_value >= right_val->data.double_value - eps);
 				}
-				else if (left_val->type == TYPE_INTEGER) {
+				else if (left_val->type == TYPE_INTEGER && right_val->type == TYPE_INTEGER) {
 					(*result)->data.int_value = (left_val->data.int_value >= right_val->data.int_value);
 				}
-				else { free_variable(left_val); free_variable(right_val); free(*result); return -1; }
+				else {
+					free_variable(left_val); free_variable(right_val); free(*result); return -1;
+				}
 				break;
 
 			default:
@@ -1058,7 +1116,7 @@ int check_sub_picture_semantic(SubPictureNode* node, SymbolTable* st) {
 
 	free(file_name);
 
-	ProPrintfChar("Note: SUB_PICTURE validated (positions allowed to be negative; handled at runtime)\n");
+	LogOnlyPrintfChar("Note: SUB_PICTURE validated (positions allowed to be negative; handled at runtime)\n");
 	return 0;
 }
 
@@ -1233,7 +1291,7 @@ int check_show_param_semantics(ShowParamNode* node, SymbolTable* st) {
 	snprintf(key, sizeof(key), "SHOW_PARAM_OPTIONS_%s", node->parameter);
 	set_symbol(st, key, options_var);
 
-	ProPrintfChar("Note: Stored SHOW_PARAM options map for '%s' under key '%s'\n", node->parameter, key);
+	LogOnlyPrintfChar("Note: Stored SHOW_PARAM options map for '%s' under key '%s'\n", node->parameter, key);
 
 	return 0;  // Success
 }
@@ -1512,6 +1570,8 @@ int check_declare_variable_semantics(DeclareVariableNode* node, SymbolTable* st)
 	}
 
 	set_symbol(st, node->name, var);
+	st_baseline_remember(st, node->name, var);   // <-keep original value
+	existing = var;
 	return 0;
 }
 
@@ -1697,7 +1757,7 @@ int check_checkbox_param_semantics(CheckboxParamNode* node, SymbolTable* st) {
 	char key[256];
 	snprintf(key, sizeof(key), "CHECKBOX_PARAM_OPTIONS_%s", node->parameter);
 	set_symbol(st, key, options_var);
-	ProPrintfChar("Note: Stored CHECKBOX_PARAM options map for '%s' under key '%s'\n", node->parameter, key);
+	LogOnlyPrintfChar("Note: Stored CHECKBOX_PARAM options map for '%s' under key '%s'\n", node->parameter, key);
 	return 0; // Success
 }
 
@@ -2413,7 +2473,7 @@ int check_radiobutton_param_semantics(RadioButtonParamNode * node, SymbolTable *
 	char key[256];
 	snprintf(key, sizeof(key), "RADIOBUTTON:%s", node->parameter);
 	set_symbol(st, key, options_var);
-	ProPrintfChar("Note: Stored RADIOBUTTON_PARAM options map for '%s' under key '%s'\n", node->parameter, key);
+	LogOnlyPrintfChar("Note: Stored RADIOBUTTON_PARAM options map for '%s' under key '%s'\n", node->parameter, key);
 	return 0;  // Success
 }
 
@@ -3112,7 +3172,7 @@ int check_user_select_multiple_semantics(UserSelectMultipleNode* node, SymbolTab
 	/* finally, publish the config under the array name */
 	set_symbol(st, node->array, cfg);
 
-	ProPrintfChar("Note: USER_SELECT_MULTIPLE '%s' registered with %zu types, max_sel=%ld\n",
+	LogOnlyPrintfChar("Note: USER_SELECT_MULTIPLE '%s' registered with %zu types, max_sel=%ld\n",
 		node->array, node->type_count, max_sel_val);
 	return 0;
 }
@@ -3342,7 +3402,7 @@ int check_user_select_multiple_optional_semantics(UserSelectMultipleOptionalNode
 	/* finally, publish the config under the array name */
 	set_symbol(st, node->array, cfg);
 
-	ProPrintfChar("Note: USER_SELECT_MULTIPLE '%s' registered with %zu types, max_sel=%ld\n",
+	LogOnlyPrintfChar("Note: USER_SELECT_MULTIPLE '%s' registered with %zu types, max_sel=%ld\n",
 		node->array, node->type_count, max_sel_val);
 	return 0;
 }
@@ -3474,7 +3534,18 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 		}
 		free(dtype_str);
 	}
-	/* New: Validate and prepare column keys from SEL_STRING (assuming node->sel_strings exists as ExpressionNode**) */
+	/* New: Validate and track options by evaluating to strings */
+	for (int i = 0; i < node->option_count; ++i) {
+		char* opt_str = NULL;
+		if (evaluate_to_string(node->options[i], st, &opt_str) != 0 || !opt_str) {
+			ProPrintfChar("Error: Failed to evaluate TABLE_OPTION %d\n", i);
+			free(column_types);
+			free(opt_str);
+			return -1;
+		}
+		free(opt_str);
+	}
+	/* New: Validate and prepare column keys from SEL_STRING */
 	if (node->sel_string_count != node->column_count) {
 		ProPrintfChar("Error: SEL_STRING count (%zu) does not match expected %zu\n",
 			node->sel_string_count, node->column_count);
@@ -3498,11 +3569,9 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 		ExpressionNode* key_expr = node->sel_strings[c];
 		char* k = NULL;
 		if (key_expr->type == EXPR_VARIABLE_REF) {
-			/* Use the variable name directly as the key, ignoring declaration status */
 			k = _strdup(key_expr->data.string_val);
 		}
 		else {
-			/* Evaluate other expressions to string */
 			if (evaluate_to_string(key_expr, st, &k) != 0 || !k) {
 				ProPrintfChar("Error: Failed to evaluate SEL_STRING key for column %zu\n", c);
 				for (size_t i = 0; i < c; ++i) free(column_keys[i]);
@@ -3519,14 +3588,13 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 			free(column_types);
 			return -1;
 		}
-		column_keys[c] = k;  /* Take ownership */
+		column_keys[c] = k;
 	}
-	/* 3) Validate rows: empty/NO_VALUE allowed; else enforce type */
+	/* 3) Materialize rows */
 	for (size_t r = 0; r < node->row_count; ++r) {
 		for (size_t c = 0; c < node->column_count; ++c) {
 			ExpressionNode* cell_expr = node->rows[r][c];
 			int is_empty = (cell_expr == NULL);
-			/* Probe for NO_VALUE / "" / NULL via string evaluator (safe for any expr) */
 			if (!is_empty) {
 				char* probe = NULL;
 				if (evaluate_to_string(cell_expr, st, &probe) == 0) {
@@ -3568,7 +3636,6 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 					free(column_keys);
 					return -1;
 				}
-				// Revised: Add debug log to confirm exact value during validation
 				LogOnlyPrintfChar("Note: DOUBLE cell in row %zu, column %zu evaluated to exact value %.15g\n", r, c, dv);
 			} break;
 			case TYPE_BOOL: {
@@ -3586,10 +3653,10 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 				int res = evaluate_to_string(cell_expr, st, &name);
 				if (res != 0) {
 					if (cell_expr->type == EXPR_VARIABLE_REF && get_symbol(st, cell_expr->data.string_val) == NULL) {
-						// Allow undeclared variable as forward reference
 						LogOnlyPrintfChar("Note: Treating undeclared '%s' as forward SUBTABLE ref (row %zu, col %zu)\n",
 							cell_expr->data.string_val, r, c);
-					} else {
+					}
+					else {
 						ProPrintfChar("Error: SUBTABLE cell failed to evaluate in row %zu, column %zu\n", r, c);
 						free(column_types);
 						for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
@@ -3597,7 +3664,6 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 						return -1;
 					}
 				}
-				/* Empty allowed (already handled), otherwise keep as typed reference */
 				if (name && name[0] != '\0' && strcmp(name, "NO_VALUE") != 0) {
 					LogOnlyPrintfChar("Note: SUBTABLE reference '%s' recorded (row %zu, col %zu)\n",
 						name, r, c);
@@ -3609,10 +3675,10 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 				int res = evaluate_to_string(cell_expr, st, &name);
 				if (res != 0) {
 					if (cell_expr->type == EXPR_VARIABLE_REF && get_symbol(st, cell_expr->data.string_val) == NULL) {
-						// Allow undeclared variable as forward reference
 						LogOnlyPrintfChar("Note: Treating undeclared '%s' as forward REFERENCE ref (row %zu, col %zu)\n",
 							cell_expr->data.string_val, r, c);
-					} else {
+					}
+					else {
 						ProPrintfChar("Error: REFERENCE cell failed to evaluate in row %zu, column %zu\n", r, c);
 						free(column_types);
 						for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
@@ -3631,21 +3697,21 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 			}
 		}
 	}
-	/* 4) Materialize table */
-	Variable* table_var = (Variable*)malloc(sizeof(Variable));
-	if (!table_var) { ProPrintfChar("Error: Memory allocation failed for table variable\n"); free(column_types); for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]); free(column_keys); return -1; }
-	table_var->type = TYPE_ARRAY;
-	table_var->data.array.size = node->row_count;
-	table_var->data.array.elements = (node->row_count > 0)
+	/* 4) Materialize table data as array (renamed to data_var for wrapping) */
+	Variable* data_var = (Variable*)malloc(sizeof(Variable));
+	if (!data_var) { ProPrintfChar("Error: Memory allocation failed for table variable\n"); free(column_types); for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]); free(column_keys); return -1; }
+	data_var->type = TYPE_ARRAY;
+	data_var->data.array.size = node->row_count;
+	data_var->data.array.elements = (node->row_count > 0)
 		? (Variable**)malloc(node->row_count * sizeof(Variable*))
 		: NULL;
-	if (node->row_count > 0 && !table_var->data.array.elements) { free(table_var); free(column_types); for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]); free(column_keys); return -1; }
+	if (node->row_count > 0 && !data_var->data.array.elements) { free(data_var); free(column_types); for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]); free(column_keys); return -1; }
 	for (size_t r = 0; r < node->row_count; ++r) {
 		Variable* row_var = (Variable*)malloc(sizeof(Variable));
 		if (!row_var) {
-			for (size_t k = 0; k < r; ++k) free_variable(table_var->data.array.elements[k]);
-			free(table_var->data.array.elements);
-			free(table_var);
+			for (size_t k = 0; k < r; ++k) free_variable(data_var->data.array.elements[k]);
+			free(data_var->data.array.elements);
+			free(data_var);
 			free(column_types);
 			for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
 			free(column_keys);
@@ -3655,9 +3721,9 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 		row_var->data.map = create_hash_table(node->column_count);
 		if (!row_var->data.map) {
 			free(row_var);
-			for (size_t k = 0; k < r; ++k) free_variable(table_var->data.array.elements[k]);
-			free(table_var->data.array.elements);
-			free(table_var);
+			for (size_t k = 0; k < r; ++k) free_variable(data_var->data.array.elements[k]);
+			free(data_var->data.array.elements);
+			free(data_var);
 			free(column_types);
 			for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
 			free(column_keys);
@@ -3669,15 +3735,15 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 			if (!v) {
 				free_hash_table(row_var->data.map);
 				free(row_var);
-				for (size_t k = 0; k < r; ++k) free_variable(table_var->data.array.elements[k]);
-				free(table_var->data.array.elements);
-				free(table_var);
+				for (size_t k = 0; k < r; ++k) free_variable(data_var->data.array.elements[k]);
+				free(data_var->data.array.elements);
+				free(data_var);
 				free(column_types);
 				for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
 				free(column_keys);
 				return -1;
 			}
-			v->type = TYPE_NULL; /* default: empty */
+			v->type = TYPE_NULL;
 			int is_empty = (cell_expr == NULL);
 			char* probe = NULL;
 			if (!is_empty && evaluate_to_string(cell_expr, st, &probe) == 0) {
@@ -3705,7 +3771,6 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 					if (evaluate_to_double(cell_expr, st, &dv) == 0) {
 						v->type = TYPE_DOUBLE;
 						v->data.double_value = dv;
-						// Revised: Add debug log to confirm exact storage
 						LogOnlyPrintfChar("Note: Stored exact DOUBLE value %.15g in row %zu, column %zu\n", dv, r, c);
 					}
 				} break;
@@ -3723,7 +3788,6 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 						}
 					}
 					if (name && name[0] != '\0' && strcmp(name, "NO_VALUE") != 0) {
-						/* Store typed subtable reference (deferred resolution) */
 						v->type = TYPE_SUBTABLE;
 						v->data.string_value = _strdup(name);
 						if (!v->data.string_value) v->type = TYPE_NULL;
@@ -3738,12 +3802,13 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 						if (cell_expr->type == EXPR_VARIABLE_REF && get_symbol(st, cell_expr->data.string_val) == NULL) {
 							ref = _strdup(cell_expr->data.string_val);
 							LogOnlyPrintfChar("Note: Stored undeclared '%s' as forward REFERENCE ref\n", ref);
-						} else {
+						}
+						else {
 							ref = NULL;
 						}
 					}
 					if (ref && ref[0] != '\0' && strcmp(ref, "NO_VALUE") != 0) {
-						v->type = TYPE_STRING; /* keep as string token; your USER_SELECT will materialize later */
+						v->type = TYPE_STRING;
 						v->data.string_value = _strdup(ref);
 						if (!v->data.string_value) v->type = TYPE_NULL;
 					}
@@ -3753,11 +3818,159 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 				}
 			}
 			free(probe);
-			/* Insert into row map using column key */
 			hash_table_insert(row_var->data.map, column_keys[c], v);
 		}
-		table_var->data.array.elements[r] = row_var;
+		data_var->data.array.elements[r] = row_var;
 	}
+
+	/* 4.5) Wrap data in a map with options */
+	Variable* table_var = (Variable*)malloc(sizeof(Variable));
+	if (!table_var) {
+		free_variable(data_var);
+		free(column_types);
+		for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+		free(column_keys);
+		ProPrintfChar("Error: Memory allocation failed for table wrapper\n");
+		return -1;
+	}
+	table_var->type = TYPE_MAP;
+	table_var->data.map = create_hash_table(6); /* rows, options, columns, filter_column, filter_only_column */
+	if (!table_var->data.map) {
+		free(table_var);
+		free_variable(data_var);
+		free(column_types);
+		for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+		free(column_keys);
+		return -1;
+	}
+	hash_table_insert(table_var->data.map, "rows", data_var);
+
+	/* --- NEW: persist columns + filter options --- */
+	/* 1) columns[] (string keys; 0 = SEL_STRING, 1+ = data columns) */
+	{
+		Variable* columns_var = (Variable*)malloc(sizeof(Variable));
+		if (columns_var) {
+			columns_var->type = TYPE_ARRAY;
+			columns_var->data.array.size = node->column_count;
+			columns_var->data.array.elements = (Variable**)calloc(node->column_count, sizeof(Variable*));
+			if (columns_var->data.array.elements) {
+				for (size_t i = 0; i < (size_t)node->column_count; ++i) {
+					Variable* s = (Variable*)malloc(sizeof(Variable));
+					if (!s) continue;
+					s->type = TYPE_STRING;
+					s->data.string_value = _strdup(column_keys[i]);
+					if (!s->data.string_value) { free(s); s = NULL; }
+					columns_var->data.array.elements[i] = s;
+				}
+				hash_table_insert(table_var->data.map, "columns", columns_var);
+			}
+			else {
+				free(columns_var);
+				ProPrintfChar("Warning: Failed to allocate columns array for table '%s'\n", node->identifier);
+			}
+		}
+		else {
+			ProPrintfChar("Warning: Failed to allocate columns_var for table '%s'\n", node->identifier);
+		}
+	}
+	/* 2) filter_column / filter_only_column (indices after visible col) */
+	if (node->filter_column >= 0) {
+		Variable* fc = (Variable*)malloc(sizeof(Variable));
+		if (fc) {
+			fc->type = TYPE_INTEGER;
+			fc->data.int_value = node->filter_column; /* 0 == first AFTER visible */
+			hash_table_insert(table_var->data.map, "filter_column", fc);
+		}
+		else {
+			ProPrintfChar("Warning: Failed to allocate filter_column for table '%s'\n", node->identifier);
+		}
+	}
+	if (node->filter_only_column >= 0) {
+		Variable* foc = (Variable*)malloc(sizeof(Variable));
+		if (foc) {
+			foc->type = TYPE_INTEGER;
+			foc->data.int_value = node->filter_only_column;
+			hash_table_insert(table_var->data.map, "filter_only_column", foc);
+		}
+		else {
+			ProPrintfChar("Warning: Failed to allocate filter_only_column for table '%s'\n", node->identifier);
+		}
+	}
+	/* --- END NEW --- */
+
+	/* New: Materialize and store options as array (kept as-is) */
+	if (node->option_count > 0) {
+		Variable* options_var = (Variable*)malloc(sizeof(Variable));
+		if (!options_var) {
+			free_hash_table(table_var->data.map);
+			free(table_var);
+			free(column_types);
+			for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+			free(column_keys);
+			ProPrintfChar("Error: Memory allocation failed for options array\n");
+			return -1;
+		}
+		options_var->type = TYPE_ARRAY;
+		options_var->data.array.size = node->option_count;
+		options_var->data.array.elements = (Variable**)malloc(node->option_count * sizeof(Variable*));
+		if (!options_var->data.array.elements) {
+			free(options_var);
+			free_hash_table(table_var->data.map);
+			free(table_var);
+			free(column_types);
+			for (size_t i = 0; i < node->column_count; ++i) free(column_keys[i]);
+			free(column_keys);
+			return -1;
+		}
+		for (int i = 0; i < node->option_count; ++i) {
+			char* opt_str = NULL;
+			if (evaluate_to_string(node->options[i], st, &opt_str) != 0 || !opt_str) {
+				ProPrintfChar("Error: Failed to re-evaluate TABLE_OPTION %d during materialization\n", i);
+				for (int j = 0; j < i; ++j) free_variable(options_var->data.array.elements[j]);
+				free(options_var->data.array.elements);
+				free(options_var);
+				free_hash_table(table_var->data.map);
+				free(table_var);
+				free(column_types);
+				for (size_t k = 0; k < node->column_count; ++k) free(column_keys[k]);
+				free(column_keys);
+				free(opt_str);
+				return -1;
+			}
+			Variable* opt_v = (Variable*)malloc(sizeof(Variable));
+			if (!opt_v) {
+				for (int j = 0; j < i; ++j) free_variable(options_var->data.array.elements[j]);
+				free(options_var->data.array.elements);
+				free(options_var);
+				free_hash_table(table_var->data.map);
+				free(table_var);
+				free(column_types);
+				for (size_t k = 0; k < node->column_count; ++k) free(column_keys[k]);
+				free(column_keys);
+				free(opt_str);
+				return -1;
+			}
+			opt_v->type = TYPE_STRING;
+			opt_v->data.string_value = _strdup(opt_str);
+			if (!opt_v->data.string_value) {
+				free(opt_v);
+				for (int j = 0; j < i; ++j) free_variable(options_var->data.array.elements[j]);
+				free(options_var->data.array.elements);
+				free(options_var);
+				free_hash_table(table_var->data.map);
+				free(table_var);
+				free(column_types);
+				for (size_t k = 0; k < node->column_count; ++k) free(column_keys[k]);
+				free(column_keys);
+				free(opt_str);
+				return -1;
+			}
+			options_var->data.array.elements[i] = opt_v;
+			free(opt_str);
+		}
+		hash_table_insert(table_var->data.map, "options", options_var);
+	}
+
 	/* 5) Publish to symbol table */
 	set_symbol(st, node->identifier, table_var);
 	free(column_types);
@@ -3772,154 +3985,509 @@ int check_begin_table_semantics(TableNode* node, SymbolTable* st) {
 * 
 * 
 \*=================================================*/
+// Helper to initialize an AssignmentList
+static void init_assignment_list(AssignmentList* list) {
+	list->ids = NULL;
+	list->count = 0;
+	list->cap = 0;
+}
+
+// Helper to add an ID to an AssignmentList
+static void add_to_assignment_list(AssignmentList* list, int id) {
+	if (list->count == list->cap) {
+		size_t new_cap = (list->cap == 0 ? 8 : list->cap * 2);
+		int* tmp = (int*)realloc(list->ids, new_cap * sizeof(int));
+		if (!tmp) return; // Out-of-memory: best-effort, skip add
+		list->ids = tmp;
+		list->cap = new_cap;
+	}
+	list->ids[list->count++] = id;
+}
+
+// Helper to free an AssignmentList
+static void free_assignment_list(AssignmentList* list) {
+	free(list->ids);
+	list->ids = NULL;
+	list->count = 0;
+	list->cap = 0;
+}
+
+static void collect_assignment_ids_from_command(CommandNode* cmd, AssignmentList* list)
+{
+	if (!cmd || !list) return;
+
+	if (cmd->type == COMMAND_ASSIGNMENT) {
+		AssignmentNode* an = &((CommandData*)cmd->data)->assignment;
+		if (an && an->assign_id > 0) {
+			add_to_assignment_list(list, an->assign_id);
+		}
+		return;
+	}
+
+	if (cmd->type == COMMAND_IF) {
+		IfNode* in = &((CommandData*)cmd->data)->ifcommand;
+		if (in) {
+			for (size_t b = 0; b < in->branch_count; ++b) {
+				IfBranch* br = in->branches[b];
+				if (!br) continue;
+				for (size_t c = 0; c < br->command_count; ++c) {
+					collect_assignment_ids_from_command(br->commands[c], list);
+				}
+			}
+			for (size_t c = 0; c < in->else_command_count; ++c) {
+				collect_assignment_ids_from_command(in->else_commands[c], list);
+			}
+		}
+		return;
+	}
+
+	if (cmd->type == COMMAND_FOR) {
+		ForNode* fn = &((CommandData*)cmd->data)->forcommand;
+		if (fn) {
+			for (size_t c = 0; c < fn->command_count; ++c) {
+				collect_assignment_ids_from_command(fn->commands[c], list);
+			}
+		}
+		return;
+	}
+
+	if (cmd->type == COMMAND_WHILE) {
+		WhileNode* wn = &((CommandData*)cmd->data)->whilecommand;
+		if (wn) {
+			for (size_t c = 0; c < wn->command_count; ++c) {
+				collect_assignment_ids_from_command(wn->commands[c], list);
+			}
+		}
+		return;
+	}
+
+	/* Other command types have no nested command blocks */
+}
+
 int check_if_semantics(IfNode* node, SymbolTable* st) {
 	if (!node) {
 		ProPrintfChar("Error: Invalid IF node\n");
 		return -1;
 	}
 
-	// Validate each branch condition (must be boolean or coercible)
+	/* 0) Ensure the IFS registry exists */
+	Variable* ifreg = get_symbol(st, "IFS");
+	if (!ifreg) {
+		ifreg = (Variable*)malloc(sizeof(Variable));
+		if (!ifreg) { ProPrintfChar("Error: OOM creating IFS registry\n"); return -1; }
+		ifreg->type = TYPE_MAP;
+		ifreg->data.map = create_hash_table(32);
+		ifreg->display_options = NULL;
+		ifreg->declaration_count = 1;
+		if (!ifreg->data.map) { free(ifreg); ProPrintfChar("Error: OOM creating IFS map\n"); return -1; }
+		set_symbol(st, "IFS", ifreg);
+	}
+	else if (ifreg->type != TYPE_MAP || !ifreg->data.map) {
+		ProPrintfChar("Error: Symbol 'IFS' exists but is not a map\n");
+		return -1;
+	}
+
+	/* Prepare per-branch lists (branch_count for IF/ELSE_IF, +1 if ELSE present) */
+	size_t total_branches = node->branch_count + (node->else_command_count > 0 ? 1 : 0);
+	AssignmentList* branch_lists = (AssignmentList*)calloc(total_branches, sizeof(AssignmentList));
+	if (!branch_lists) {
+		ProPrintfChar("Error: OOM for branch assignment lists\n");
+		return -1;
+	}
+	for (size_t i = 0; i < total_branches; ++i) {
+		init_assignment_list(&branch_lists[i]);
+	}
+
+	/* 1) Validate each branch condition; set __CURRENT_IF_ID while recursing */
+	/*    We reuse a single integer variable for __CURRENT_IF_ID to avoid churn. */
+	Variable* cur_if_sym = get_symbol(st, "__CURRENT_IF_ID");
+	if (!cur_if_sym) {
+		cur_if_sym = (Variable*)malloc(sizeof(Variable));
+		if (!cur_if_sym) {
+			for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+			free(branch_lists);
+			ProPrintfChar("Error: OOM for __CURRENT_IF_ID\n"); return -1;
+		}
+		cur_if_sym->type = TYPE_INTEGER;
+		cur_if_sym->data.int_value = 0;
+		cur_if_sym->display_options = NULL;
+		cur_if_sym->declaration_count = 1;
+		set_symbol(st, "__CURRENT_IF_ID", cur_if_sym);
+	}
+	const int saved_if_id = cur_if_sym->data.int_value;
+
 	for (size_t b = 0; b < node->branch_count; b++) {
 		IfBranch* branch = node->branches[b];
 		VariableType cond_type = get_expression_type(branch->condition, st);
 		if (cond_type == -1 ||
 			(cond_type != TYPE_BOOL && cond_type != TYPE_INTEGER && cond_type != TYPE_DOUBLE)) {
 			ProPrintfChar("Error: IF/ELSE_IF condition must be boolean or coercible (int/double)\n");
+			for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+			free(branch_lists);
 			return -1;
 		}
 
-		// Recurse into branch commands
+		/* Set current IF context for anything analyzed under this IF */
+		cur_if_sym->data.int_value = node->id;
+
+		/* Recurse */
 		for (size_t c = 0; c < branch->command_count; c++) {
 			if (analyze_command(branch->commands[c], st) != 0) {
+				cur_if_sym->data.int_value = saved_if_id;
+				for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+				free(branch_lists);
 				return -1;
+			}
+			/* Collect per branch */
+			collect_assignment_ids_from_command(branch->commands[c], &branch_lists[b]);
+		}
+	}
+
+	/* ELSE block */
+	if (node->else_command_count > 0) {
+		cur_if_sym->data.int_value = node->id;
+		for (size_t c = 0; c < node->else_command_count; c++) {
+			if (analyze_command(node->else_commands[c], st) != 0) {
+				cur_if_sym->data.int_value = saved_if_id;
+				for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+				free(branch_lists);
+				return -1;
+			}
+			collect_assignment_ids_from_command(node->else_commands[c], &branch_lists[node->branch_count]);
+		}
+		cur_if_sym->data.int_value = saved_if_id;
+	}
+
+	/* 2) Build the IF entry map and publish into IFS */
+	Variable* entry = (Variable*)malloc(sizeof(Variable));
+	if (!entry) {
+		for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+		free(branch_lists);
+		ProPrintfChar("Error: OOM for IF entry\n"); return -1;
+	}
+	entry->type = TYPE_MAP;
+	entry->data.map = create_hash_table(16);
+	entry->display_options = NULL;
+	entry->declaration_count = 1;
+	if (!entry->data.map) {
+		free(entry);
+		for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+		free(branch_lists);
+		ProPrintfChar("Error: OOM for IF entry map\n"); return -1;
+	}
+
+	/* Basic facts */
+	(void)add_int_to_map(entry->data.map, "if_id", node->id);
+	(void)add_int_to_map(entry->data.map, "branch_count", (int)node->branch_count);
+	(void)add_int_to_map(entry->data.map, "else_command_count", (int)node->else_command_count);
+
+	/* Optional pretty print of the first IF condition to aid debugging */
+	if (node->branch_count > 0 && node->branches[0] && node->branches[0]->condition) {
+		char* cond = expression_to_string(node->branches[0]->condition);
+		if (cond) (void)add_string_to_map(entry->data.map, "if_condition", cond);
+	}
+
+	/* NEW: branch_assignments as array of arrays (one per branch + else if present) */
+	Variable* branch_arr = (Variable*)malloc(sizeof(Variable));
+	if (!branch_arr) {
+		free_hash_table(entry->data.map); free(entry);
+		for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+		free(branch_lists);
+		ProPrintfChar("Error: OOM for branch_assignments array\n"); return -1;
+	}
+	branch_arr->type = TYPE_ARRAY;
+	branch_arr->display_options = NULL;
+	branch_arr->declaration_count = 1;
+	branch_arr->data.array.size = (int)total_branches;
+	branch_arr->data.array.elements = (Variable**)calloc(total_branches > 0 ? total_branches : 1, sizeof(Variable*));
+	if (!branch_arr->data.array.elements && total_branches > 0) {
+		free(branch_arr); free_hash_table(entry->data.map); free(entry);
+		for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+		free(branch_lists);
+		ProPrintfChar("Error: OOM for branch_assignments elements\n");
+		return -1;
+	}
+	size_t total_assigns = 0;
+	for (size_t b = 0; b < total_branches; ++b) {
+		AssignmentList* lst = &branch_lists[b];
+		Variable* sub_arr = (Variable*)malloc(sizeof(Variable));
+		if (!sub_arr) continue;
+		sub_arr->type = TYPE_ARRAY;
+		sub_arr->display_options = NULL;
+		sub_arr->declaration_count = 1;
+		sub_arr->data.array.size = (int)lst->count;
+		sub_arr->data.array.elements = (Variable**)calloc(lst->count > 0 ? lst->count : 1, sizeof(Variable*));
+		if (!sub_arr->data.array.elements && lst->count > 0) {
+			free(sub_arr); continue;
+		}
+		for (size_t i = 0; i < lst->count; ++i) {
+			Variable* iv = (Variable*)malloc(sizeof(Variable));
+			if (!iv) continue;
+			iv->type = TYPE_INTEGER;
+			iv->data.int_value = lst->ids[i];
+			iv->display_options = NULL;
+			iv->declaration_count = 1;
+			sub_arr->data.array.elements[i] = iv;
+		}
+		branch_arr->data.array.elements[b] = sub_arr;
+		total_assigns += lst->count;
+	}
+	(void)add_var_to_map(entry->data.map, "branch_assignments", branch_arr);
+	(void)add_int_to_map(entry->data.map, "has_assignments", (int)(total_assigns > 0));
+
+	/* Insert under stable key IF_#### */
+	{
+		char key[32];
+		snprintf(key, sizeof(key), "IF_%04d", node->id);
+		(void)add_var_to_map(ifreg->data.map, key, entry);
+	}
+
+	/* 3) Back-fill each ASSIGN_#### with its parent IF id and branch_index (if created already) */
+	/*    branch_index: 0 for IF, 1.. for ELSE_IF, total_branches-1 for ELSE if present */
+	if (total_assigns > 0) {
+		Variable* areg = get_symbol(st, "ASSIGNMENTS");
+		if (areg && areg->type == TYPE_MAP && areg->data.map) {
+			for (size_t b = 0; b < total_branches; ++b) {
+				AssignmentList* lst = &branch_lists[b];
+				int branch_idx = (int)b;
+				if (b == node->branch_count) branch_idx = -1; // ELSE
+				for (size_t i = 0; i < lst->count; ++i) {
+					char akey[32];
+					snprintf(akey, sizeof(akey), "ASSIGN_%04d", lst->ids[i]);
+					Variable* aentry = hash_table_lookup(areg->data.map, akey);
+					if (aentry && aentry->type == TYPE_MAP && aentry->data.map) {
+						(void)add_int_to_map(aentry->data.map, "if_id", node->id);
+						(void)add_int_to_map(aentry->data.map, "branch_index", branch_idx);
+					}
+				}
 			}
 		}
 	}
 
-	// Recurse into ELSE commands
-	for (size_t c = 0; c < node->else_command_count; c++) {
-		if (analyze_command(node->else_commands[c], st) != 0) {
-			return -1;
-		}
-	}
+	/* Cleanup */
+	for (size_t i = 0; i < total_branches; ++i) free_assignment_list(&branch_lists[i]);
+	free(branch_lists);
 
-	// Optional: Log success for debugging
-	ProPrintfChar("Note: IF validated; % zu branches analyzed\n", node->branch_count);
+	LogOnlyPrintfChar("Note: IF validated; %zu branches analyzed (linked %zu assignment(s))\n",
+		node->branch_count, total_assigns);
 	return 0;
 }
 
-/*=================================================*\
-* 
-* // New function in semantic_analysis.c (revised with debug messages)
-* 
-* 
+/*=================================================*
+ *
+ * ASSIGNMENT semantic analysis: validate and register in symbol table
+ *
+ * The registry lives at top-level key "ASSIGNMENTS" (TYPE_MAP).
+ * Each assignment is stored under "ASSIGN_####" with:
+ *   - assign_id   : int
+ *   - lhs_text    : string (pretty string of LHS)
+ *   - rhs_text    : string (pretty string of RHS)
+ *   - lhs_type    : int (VariableType)
+ *   - rhs_type    : int (VariableType)
+ *   - lhs_expr    : TYPE_EXPR (raw AST pointer)
+ *   - rhs_expr    : TYPE_EXPR (raw AST pointer)
+ *   - lhs_name    : string (only when LHS is EXPR_VARIABLE_REF)
+ *   - if_id       : int (added if inside IF)
+ *   - branch_index: int (new: 0.. for branches, -1 for else)
+ *
 \*=================================================*/
-int check_assignment_semantics(AssignmentNode* node, SymbolTable* st) {
+int check_assignment_semantics(AssignmentNode* node, SymbolTable* st)
+{
 	if (!node || !node->lhs || !node->rhs) {
 		ProPrintfChar("Error: Invalid assignment node\n");
 		return -1;
 	}
 
-	// Debug: Log the assignment being checked (basic info; extend for full stringification if needed)
-	ProPrintfChar("Debug: Checking assignment - LHS type: %d, RHS type: %d\n",
-		node->lhs->type, node->rhs->type);
-
-	// Validate LHS is an lvalue
-	ExpressionType lhs_expr_type = node->lhs->type;
-	if (lhs_expr_type != EXPR_VARIABLE_REF && lhs_expr_type != EXPR_ARRAY_INDEX &&
-		lhs_expr_type != EXPR_MAP_LOOKUP && lhs_expr_type != EXPR_STRUCT_ACCESS) {
+	/* LHS form check ... (unchanged) */
+	if (node->lhs->type != EXPR_VARIABLE_REF &&
+		node->lhs->type != EXPR_ARRAY_INDEX &&
+		node->lhs->type != EXPR_MAP_LOOKUP &&
+		node->lhs->type != EXPR_STRUCT_ACCESS)
+	{
 		ProPrintfChar("Error: LHS of assignment must be a variable, array index, map lookup, or struct member\n");
 		return -1;
 	}
 
-	// Get LHS type (infers and checks declaration/validity)
+	/* Type inference ... (unchanged) */
 	VariableType lhs_type = get_expression_type(node->lhs, st);
-	if (lhs_type == -1) {
+	if (lhs_type == (VariableType)-1) {
 		ProPrintfChar("Error: Invalid or undeclared LHS in assignment\n");
 		return -1;
 	}
-
-	// Debug: If LHS is a variable ref, check and print symbol table details
-	if (node->lhs->type == EXPR_VARIABLE_REF) {
-		const char* lhs_var_name = node->lhs->data.string_val;
-		Variable* lhs_var = get_symbol(st, lhs_var_name);
-		if (lhs_var) {
-			ProPrintfChar("Debug: LHS variable '%s' found in symbol table. Type: %d\n", lhs_var_name, lhs_var->type);
-			// Print value based on type (extend for more types as needed)
-			switch (lhs_var->type) {
-			case TYPE_INTEGER:
-			case TYPE_BOOL:
-				ProPrintfChar("Debug: LHS value: %d\n", lhs_var->data.int_value);
-				break;
-			case TYPE_DOUBLE:
-				ProPrintfChar("Debug: LHS value: %.2f\n", lhs_var->data.double_value);
-				break;
-			case TYPE_STRING:
-				ProPrintfChar("Debug: LHS value: %s\n", lhs_var->data.string_value ? lhs_var->data.string_value : "(null)");
-				break;
-			default:
-				ProPrintfChar("Debug: LHS value: (complex type, not printed)\n");
-				break;
-			}
-		}
-		else {
-			ProPrintfChar("Debug: LHS variable '%s' NOT found in symbol table\n", lhs_var_name);
-		}
-	}
-
-	// Get RHS type
 	VariableType rhs_type = get_expression_type(node->rhs, st);
-	if (rhs_type == -1) {
+	if (rhs_type == (VariableType)-1) {
 		ProPrintfChar("Error: Invalid RHS expression in assignment\n");
 		return -1;
 	}
 
-	// Debug: If RHS is a variable ref, check and print symbol table details
-	if (node->rhs->type == EXPR_VARIABLE_REF) {
-		const char* rhs_var_name = node->rhs->data.string_val;
-		Variable* rhs_var = get_symbol(st, rhs_var_name);
-		if (rhs_var) {
-			ProPrintfChar("Debug: RHS variable '%s' found in symbol table. Type: %d\n", rhs_var_name, rhs_var->type);
-			// Print value based on type
-			switch (rhs_var->type) {
-			case TYPE_INTEGER:
-			case TYPE_BOOL:
-				ProPrintfChar("Debug: RHS value: %d\n", rhs_var->data.int_value);
-				break;
-			case TYPE_DOUBLE:
-				ProPrintfChar("Debug: RHS value: %.2f\n", rhs_var->data.double_value);
-				break;
-			case TYPE_STRING:
-				ProPrintfChar("Debug: RHS value: %s\n", rhs_var->data.string_value ? rhs_var->data.string_value : "(null)");
-				break;
-			default:
-				ProPrintfChar("Debug: RHS value: (complex type, not printed)\n");
-				break;
+	/* Ensure ASSIGNMENTS registry ... (unchanged) */
+	Variable* reg = get_symbol(st, "ASSIGNMENTS");
+	if (!reg) {
+		reg = (Variable*)malloc(sizeof(Variable));
+		if (!reg) { ProPrintfChar("Error: OOM for ASSIGNMENTS registry\n"); return -1; }
+		reg->type = TYPE_MAP;
+		reg->data.map = create_hash_table(32);
+		reg->display_options = NULL;
+		reg->declaration_count = 1;
+		if (!reg->data.map) { free(reg); ProPrintfChar("Error: OOM for ASSIGNMENTS map\n"); return -1; }
+		set_symbol(st, "ASSIGNMENTS", reg);
+	}
+	else if (reg->type != TYPE_MAP || !reg->data.map) {
+		ProPrintfChar("Error: Symbol 'ASSIGNMENTS' exists but is not a map\n");
+		return -1;
+	}
+
+	/* Build entry map ... (unchanged up to 4b) */
+	Variable* entry = (Variable*)malloc(sizeof(Variable));
+	if (!entry) { ProPrintfChar("Error: OOM for assignment entry\n"); return -1; }
+	entry->type = TYPE_MAP;
+	entry->data.map = create_hash_table(16);
+	entry->display_options = NULL;
+	entry->declaration_count = 1;
+	if (!entry->data.map) { free(entry); ProPrintfChar("Error: OOM for assignment entry map\n"); return -1; }
+	(void)add_int_to_map(entry->data.map, "assign_id", (int)node->assign_id);
+
+	/* 4b) stringified, 4c) raw exprs, 4d) types, 4e) lhs_name ... (unchanged) */
+	{
+		char* lhs_text = expression_to_string(node->lhs);
+		char* rhs_text = expression_to_string(node->rhs);
+		if (lhs_text) (void)add_string_to_map(entry->data.map, "lhs_text", lhs_text);
+		if (rhs_text) (void)add_string_to_map(entry->data.map, "rhs_text", rhs_text);
+	}
+	{
+		Variable* v_lhs = (Variable*)malloc(sizeof(Variable));
+		Variable* v_rhs = (Variable*)malloc(sizeof(Variable));
+		if (!v_lhs || !v_rhs) { if (v_lhs) free(v_lhs); if (v_rhs) free(v_rhs); ProPrintfChar("Error: OOM for expr handles\n"); return -1; }
+		v_lhs->type = TYPE_EXPR; v_lhs->data.expr = node->lhs; v_lhs->display_options = NULL; v_lhs->declaration_count = 1;
+		v_rhs->type = TYPE_EXPR; v_rhs->data.expr = node->rhs; v_rhs->display_options = NULL; v_rhs->declaration_count = 1;
+		(void)add_var_to_map(entry->data.map, "lhs_expr", v_lhs);
+		(void)add_var_to_map(entry->data.map, "rhs_expr", v_rhs);
+	}
+	(void)add_int_to_map(entry->data.map, "lhs_type", (int)lhs_type);
+	(void)add_int_to_map(entry->data.map, "rhs_type", (int)rhs_type);
+	if (node->lhs->type == EXPR_VARIABLE_REF && node->lhs->data.string_val) {
+		(void)add_string_to_map(entry->data.map, "lhs_name", _strdup(node->lhs->data.string_val));
+	}
+
+	/* NEW: backlink to the IF we are currently inside, if any */
+	{
+		Variable* cur_if = get_symbol(st, "__CURRENT_IF_ID");
+		if (cur_if && cur_if->type == TYPE_INTEGER && cur_if->data.int_value > 0) {
+			(void)add_int_to_map(entry->data.map, "if_id", cur_if->data.int_value);
+			// branch_index will be back-filled during IF analysis (since it knows the branch)
+		}
+	}
+
+	/* Insert entry under ASSIGN_#### */
+	{
+		char key[32];
+		snprintf(key, sizeof(key), "ASSIGN_%04d", node->assign_id);
+		(void)add_var_to_map(reg->data.map, key, entry);
+	}
+
+	LogOnlyPrintfChar("Note: ASSIGNMENT registered with assign_id=%d\n", node->assign_id);
+	return 0;
+}
+
+/*=================================================*
+ *
+ * New: Watcher Index Builder
+ * Builds a top-level map "WATCHER_INDEX" in the symbol table.
+ * Key: variable name (string, from lhs_name if simple var)
+ * Value: array of maps, each: {if_id: int, branch_index: int, assign_id: int}
+ * Only includes assignments with lhs_name (simple variables) and inside IFs.
+ * This allows tracking conditional assignments to variables for re-evaluation.
+ *
+ * Call this after all semantic analysis, e.g., at the end of perform_semantic_analysis.
+ *
+\*=================================================*/
+int build_watcher_index(SymbolTable* st) {
+	Variable* areg = get_symbol(st, "ASSIGNMENTS");
+	if (!areg || areg->type != TYPE_MAP || !areg->data.map) {
+		ProPrintfChar("Warning: No ASSIGNMENTS registry; skipping watcher index\n");
+		return 0; // No error, just no index
+	}
+
+	Variable* watcher = (Variable*)malloc(sizeof(Variable));
+	if (!watcher) {
+		ProPrintfChar("Error: OOM for WATCHER_INDEX\n");
+		return -1;
+	}
+	watcher->type = TYPE_MAP;
+	watcher->data.map = create_hash_table(64); // Arbitrary initial size
+	watcher->display_options = NULL;
+	watcher->declaration_count = 1;
+	if (!watcher->data.map) {
+		free(watcher);
+		ProPrintfChar("Error: OOM for WATCHER_INDEX map\n");
+		return -1;
+	}
+
+	// Iterate over all ASSIGN_#### entries
+	HashTable* assign_map = areg->data.map;
+	for (size_t bucket = 0; bucket < assign_map->size; ++bucket) {
+		HashEntry* entry = assign_map->buckets[bucket];
+		while (entry) {
+			if (entry->value && entry->value->type == TYPE_MAP && entry->value->data.map) {
+				HashTable* a_map = entry->value->data.map;
+
+				// Check for lhs_name, if_id, branch_index
+				Variable* lhs_name_var = hash_table_lookup(a_map, "lhs_name");
+				Variable* if_id_var = hash_table_lookup(a_map, "if_id");
+				Variable* branch_idx_var = hash_table_lookup(a_map, "branch_index");
+				Variable* assign_id_var = hash_table_lookup(a_map, "assign_id");
+
+				if (lhs_name_var && lhs_name_var->type == TYPE_STRING && lhs_name_var->data.string_value &&
+					if_id_var && if_id_var->type == TYPE_INTEGER &&
+					branch_idx_var && branch_idx_var->type == TYPE_INTEGER &&
+					assign_id_var && assign_id_var->type == TYPE_INTEGER) {
+
+					const char* var_name = lhs_name_var->data.string_value;
+
+					// Get or create array for this var_name
+					Variable* var_list = hash_table_lookup(watcher->data.map, var_name);
+					if (!var_list) {
+						var_list = (Variable*)malloc(sizeof(Variable));
+						if (!var_list) goto next_entry; // OOM: skip
+						var_list->type = TYPE_ARRAY;
+						var_list->data.array.size = 0;
+						var_list->data.array.elements = NULL;
+						var_list->display_options = NULL;
+						var_list->declaration_count = 1;
+						(void)add_var_to_map(watcher->data.map, var_name, var_list);
+					}
+					if (var_list->type != TYPE_ARRAY) goto next_entry; // Corrupt: skip
+
+					// Append a map {if_id, branch_index, assign_id}
+					Variable* info = (Variable*)malloc(sizeof(Variable));
+					if (!info) goto next_entry;
+					info->type = TYPE_MAP;
+					info->data.map = create_hash_table(4);
+					info->display_options = NULL;
+					info->declaration_count = 1;
+					if (!info->data.map) { free(info); goto next_entry; }
+
+					(void)add_int_to_map(info->data.map, "if_id", if_id_var->data.int_value);
+					(void)add_int_to_map(info->data.map, "branch_index", branch_idx_var->data.int_value);
+					(void)add_int_to_map(info->data.map, "assign_id", assign_id_var->data.int_value);
+
+					// Append to array
+					size_t new_size = var_list->data.array.size + 1;
+					Variable** new_elems = (Variable**)realloc(var_list->data.array.elements, new_size * sizeof(Variable*));
+					if (!new_elems) { free_hash_table(info->data.map); free(info); goto next_entry; }
+					var_list->data.array.elements = new_elems;
+					var_list->data.array.elements[var_list->data.array.size] = info;
+					var_list->data.array.size = new_size;
+				}
 			}
-		}
-		else {
-			ProPrintfChar("Debug: RHS variable '%s' NOT found in symbol table\n", rhs_var_name);
-		}
-	}
-
-	// Check type compatibility (with coercion)
-	if (lhs_type != rhs_type) {
-		if (lhs_type == TYPE_DOUBLE && rhs_type == TYPE_INTEGER) {
-			// Allow int -> double
-		}
-		else if (lhs_type == TYPE_INTEGER && rhs_type == TYPE_DOUBLE) {
-			ProPrintfChar("Warning: Potential precision loss assigning double to int\n");
-		}
-		else {
-			ProPrintfChar("Error: Type mismatch in assignment: LHS type %d, RHS type %d\n", lhs_type, rhs_type);
-			return -1;
+		next_entry:
+			entry = entry->next;
 		}
 	}
 
-	// Optional: If LHS is variable ref, confirm it's not const (if you add const support later)
-
-	LogOnlyPrintfChar("Note: Assignment validated (LHS type %d, RHS type %d)\n", lhs_type, rhs_type);
-	return 0;  // Success
+	set_symbol(st, "WATCHER_INDEX", watcher);
+	ProPrintfChar("Note: WATCHER_INDEX built successfully\n");
+	return 0;
 }
 
 // Recursive helper to analyze a single CommandNode (handles nesting)
@@ -4024,6 +4592,10 @@ int perform_semantic_analysis(BlockList* block_list, SymbolTable* st) {
 				ProPrintfChar("Semantic error in block type %d, command %zu\n", order[ord], j);
 			}
 		}
+	}
+	if (build_watcher_index(st) != 0) {
+		ProPrintfChar("Error: Failed to build watcher index\n");
+		return -1;
 	}
 	print_symbol_table(st);
 	return 0;  // Always return success to proceed; invalid commands are flagged
