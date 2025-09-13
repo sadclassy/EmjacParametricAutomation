@@ -174,7 +174,7 @@ typedef enum {
     EXPR_FUNCTION_CALL,    // Function calls (e.g., sin(expr))
     EXPR_ARRAY_INDEX,      // base[index]
     EXPR_MAP_LOOKUP,       // map.key
-    EXPR_STRUCT_ACCESS     // struct.member
+    EXPR_STRUCT_ACCESS,     // struct.member
 } ExpressionType;
 
 // Expression node for values, accesses, and computations (expanded)
@@ -407,7 +407,7 @@ typedef struct
 }InvalidateParamNode;
 
 typedef struct {
-    char* identifier;                // TABLE_IDENTIFIER (remains char* as a fixed lexical token)
+    char* identifier; // TABLE_IDENTIFIER (remains char* as a fixed lexical token)
     ExpressionNode* name;            // Optional table name (now an expression, e.g., string literal or variable)
     ExpressionNode** options;        // TABLE_OPTION options (array of expressions for dynamic options)
     int option_count;             // Number of options
@@ -418,9 +418,19 @@ typedef struct {
     ExpressionNode*** rows;          // 2D array of row data (outer array for rows, inner arrays for column expressions)
     int row_count;                // Number of rows
     int column_count;             // Number of columns (should match sel_string_count for consistency)
+    bool no_autosel;              /* NO_AUTOSEL */
+    bool no_filter;               /* NO_FILTER */
+    bool depend_on_input;         /* DEPEND_ON_INPUT */
+    bool invalidate_on_unselect;  /* INVALIDATE_ON_UNSELECT */
+    bool show_autosel;            /* SHOW_AUTOSEL */
+    bool filter_rigid;            /* FILTER_RIGID */
+    bool array;
+    int  filter_only_column;      /* FILTER_ONLY_COLUMN <int>, -1 if not specified */
+    int  filter_column;           /* FILTER_COLUMN <int>,      -1 if not specified */
+    int  table_height;            /* TABLE_HEIGHT <int>, default 12 */
+    bool table_height_set;        /* tracks explicit presence vs. default */
+
 } TableNode;
-
-
 
 typedef enum {
     FOR_INTERF_MDL,       // INTERF_MDL model [SOLID_ONLY]
@@ -462,7 +472,9 @@ typedef struct {
     size_t branch_count;
     CommandNode** else_commands; // Optional ELSE block
     size_t else_command_count;
+    int id;
 } IfNode;
+
 
 typedef struct {
     ExpressionNode* condition;  // Loop condition (e.g., "number <> 0")
@@ -474,6 +486,7 @@ typedef struct {
 typedef struct {
     ExpressionNode* lhs;              // Left-hand side (variable name)
     ExpressionNode* rhs;    // Right-hand side expression
+    int assign_id;
 } AssignmentNode;
 
 
