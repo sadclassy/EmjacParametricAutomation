@@ -19,7 +19,8 @@ static int is_option(const char* str)
         "DECIMAL_PLACES", "MODEL", "REQUIRED", "NO_UPDATE", "DISPLAY_ORDER",
         "MIN_VALUE", "MAX_VALUE", "NO_AUTOSEL", "NO_FILTER", "DEPEND_ON_INPUT",
         "INVALIDATE_ON_UNSELECT", "SHOW_AUTOSEL", "FILTER_RIGID", "FILTER_ONLY_COLUMN",
-        "FILTER_COLUMN", "TABLE_HEIGHT", "ARRAY"
+        "FILTER_COLUMN", "TABLE_HEIGHT", "ARRAY", "RECURSIVE", "ALLOW_SUPPRESSED", "ALLOW_SIMPREP_SUPPRESSED",
+        "EXCLUDE_INHERITED", "EXCLUDE_FOOTER", "NO_UPDATE", "INCLUDE_MULTI_CAD"
     };
     size_t num_options = sizeof(all_options) / sizeof(all_options[0]);
     for (size_t i = 0; i < num_options; i++) {
@@ -64,6 +65,7 @@ static int prev_allows_unary_minus(Token t) {
         return 0;
     }
 }
+
 
 int lex(Lexer* lexer) {
     lexer->in_table = 0;
@@ -123,11 +125,12 @@ int lex(Lexer* lexer) {
         }
         if (*lexer->cur_tok == '\0') break;
 
-        /* Comments starting with '!' to end-of-line */
+        /* COMMENTS: '!' starts a comment to end-of-line (outside strings). */
         if (*lexer->cur_tok == '!') {
             while (*lexer->cur_tok != '\n' && *lexer->cur_tok != '\0') {
                 lexer->cur_tok++;
             }
+            /* loop continues; the newline (if any) will be handled by whitespace above */
             continue;
         }
 
@@ -287,81 +290,96 @@ int lex(Lexer* lexer) {
                 continue;
             }
 
-            /* Grab the entire cell up to '\t' or '\n' (spaces/punct are data). */
-            char* cell_start = lexer->cur_tok;
-            while (*lexer->cur_tok != '\0' && *lexer->cur_tok != '\t' && *lexer->cur_tok != '\n') {
-                lexer->cur_tok++;
-            }
-            size_t cell_len = (size_t)(lexer->cur_tok - cell_start);
-
-            /* Empty cell mid-line: treat as NO_VALUE. */
-            if (cell_len == 0) {
-                char* nov = _strdup("NO_VALUE");
-                add_token(lexer, tok_keyword, nov);
-            }
-            else {
-                char* cell = (char*)malloc(cell_len + 1);
-                if (!cell) {
-                    ProPrintfChar("%zu:%zu: Memory allocation failed for table cell\n",
-                        lexer->line_number, (size_t)(cell_start - lexer->line_start));
-                    return 1;
+            /* Grab the entire cell up to '\t', '\n', or '!' (spaces/punct are data). */
+            {
+                char* cell_start = lexer->cur_tok;
+                while (*lexer->cur_tok != '\0'
+                    && *lexer->cur_tok != '\t'
+                    && *lexer->cur_tok != '\n'
+                    /* treat '!' as start-of-comment for table rows, too */
+                    && *lexer->cur_tok != '!') {
+                    lexer->cur_tok++;
                 }
-                memcpy(cell, cell_start, cell_len);
-                cell[cell_len] = '\0';
+                size_t cell_len = (size_t)(lexer->cur_tok - cell_start);
 
-                /* NEW: Context flags for classification refinements */
-                int at_line_start_cell = (cell_start == lexer->line_start);
-                int sel_line = 0;
-                if (lexer->line_start) {
-                    /* line begins with "SEL_STRING" followed by tab/space/EOL */
-                    if (strncmp(lexer->line_start, "SEL_STRING", 10) == 0) {
-                        char ch = lexer->line_start[10];
-                        if (ch == '\t' || ch == ' ' || ch == '\r' || ch == '\n' || ch == '\0') {
-                            sel_line = 1;
-                        }
-                    }
+                /* trim trailing spaces/CRs before building the cell string */
+                while (cell_len > 0 && (cell_start[cell_len - 1] == ' ' || cell_start[cell_len - 1] == '\r')) {
+                    cell_len--;
                 }
 
-                /* Classify the cell. */
-                if (is_keyword(cell)) {
-                    add_token(lexer, tok_keyword, cell);
-                    if (strcmp(cell, "BEGIN_TABLE") == 0 || strcmp(cell, "BEGIN_SUBTABLE") == 0) {
-                        lexer->pending_table_start = 1;
-                    }
-                    else if (strcmp(cell, "END_TABLE") == 0 || strcmp(cell, "END_SUBTABLE") == 0) {
-                        lexer->in_table = 0;
-                        lexer->pending_table_start = 0;
-                    }
-                }
-                else if (is_type_specifier(cell)) {
-                    add_token(lexer, tok_type, cell);
-                }
-                else if (is_option(cell)) {
-                    add_token(lexer, tok_option, cell);
-                }
-                else if (is_number(cell)) {
-                    add_token(lexer, tok_number, cell);
-                }
-                /* NEW: treat headers after SEL_STRING as identifiers */
-                else if (sel_line && !at_line_start_cell) {
-                    add_token(lexer, tok_identifier, cell);
-                }
-                /* NEW: treat first cell of data rows as identifier (row label), even with spaces */
-                else if (at_line_start_cell) {
-                    add_token(lexer, tok_identifier, cell);
-                }
-                else {
-                    add_token(lexer, tok_string, cell);  /* Default to string for table data. */
-                }
-            }
-
-            /* After cell, interpret tabs: first = separator, additional = empty cells. */
-            if (*lexer->cur_tok == '\t') {
-                lexer->cur_tok++; /* separator tab */
-                while (*lexer->cur_tok == '\t') {
+                /* Empty cell mid-line: treat as NO_VALUE. */
+                if (cell_len == 0) {
                     char* nov = _strdup("NO_VALUE");
                     add_token(lexer, tok_keyword, nov);
-                    lexer->cur_tok++;
+                }
+                else {
+                    char* cell = (char*)malloc(cell_len + 1);
+                    if (!cell) {
+                        ProPrintfChar("%zu:%zu: Memory allocation failed for table cell\n",
+                            lexer->line_number, (size_t)(cell_start - lexer->line_start));
+                        return 1;
+                    }
+                    memcpy(cell, cell_start, cell_len);
+                    cell[cell_len] = '\0';
+
+                    /* Context flags for classification refinements */
+                    int at_line_start_cell = (cell_start == lexer->line_start);
+                    int sel_line = 0;
+                    if (lexer->line_start) {
+                        if (strncmp(lexer->line_start, "SEL_STRING", 10) == 0) {
+                            char ch = lexer->line_start[10];
+                            if (ch == '\t' || ch == ' ' || ch == '\r' || ch == '\n' || ch == '\0') {
+                                sel_line = 1;
+                            }
+                        }
+                    }
+
+                    /* Classify the cell. */
+                    if (is_keyword(cell)) {
+                        add_token(lexer, tok_keyword, cell);
+                        if (strcmp(cell, "BEGIN_TABLE") == 0 || strcmp(cell, "BEGIN_SUBTABLE") == 0) {
+                            lexer->pending_table_start = 1;
+                        }
+                        else if (strcmp(cell, "END_TABLE") == 0 || strcmp(cell, "END_SUBTABLE") == 0) {
+                            lexer->in_table = 0;
+                            lexer->pending_table_start = 0;
+                        }
+                    }
+                    else if (is_type_specifier(cell)) {
+                        add_token(lexer, tok_type, cell);
+                    }
+                    else if (is_option(cell)) {
+                        add_token(lexer, tok_option, cell);
+                    }
+                    else if (is_number(cell)) {
+                        add_token(lexer, tok_number, cell);
+                    }
+                    else if (sel_line && !at_line_start_cell) {
+                        add_token(lexer, tok_identifier, cell); /* headers after SEL_STRING */
+                    }
+                    else if (at_line_start_cell) {
+                        add_token(lexer, tok_identifier, cell); /* row label */
+                    }
+                    else {
+                        add_token(lexer, tok_string, cell);     /* default for data */
+                    }
+                }
+
+                /* if we stopped on '!' (inline comment), swallow the rest of the line */
+                if (*lexer->cur_tok == '!') {
+                    while (*lexer->cur_tok != '\n' && *lexer->cur_tok != '\0') {
+                        lexer->cur_tok++;
+                    }
+                }
+
+                /* After cell, interpret tabs: first = separator, additional = empty cells. */
+                if (*lexer->cur_tok == '\t') {
+                    lexer->cur_tok++; /* separator tab */
+                    while (*lexer->cur_tok == '\t') {
+                        char* nov = _strdup("NO_VALUE");
+                        add_token(lexer, tok_keyword, nov);
+                        lexer->cur_tok++;
+                    }
                 }
             }
 
@@ -397,7 +415,9 @@ int lex(Lexer* lexer) {
                     lexer->cur_tok++;
                     continue;
                 }
-                if (c == '-' && (isalpha(*(lexer->cur_tok + 1)) || *(lexer->cur_tok + 1) == '_')) {
+                /* allow hyphen if followed by alnum, '_', or '.' (for filenames) */
+                if (c == '-' && (*(lexer->cur_tok + 1) == '_' || *(lexer->cur_tok + 1) == '.' ||
+                    isalnum(*(lexer->cur_tok + 1)))) {
                     lexer->cur_tok++; /* keep hyphen inside name-like segments */
                     continue;
                 }
@@ -551,8 +571,12 @@ int lex(Lexer* lexer) {
         /* Fallback tokenization (non-table bare words) */
         {
             char* str_start = lexer->cur_tok;
-            while (*lexer->cur_tok != '\0' && !isspace(*lexer->cur_tok) &&
-                *lexer->cur_tok != '\t' && !is_operator_char(*lexer->cur_tok)) {
+            while (*lexer->cur_tok != '\0'
+                && !isspace(*lexer->cur_tok)
+                && *lexer->cur_tok != '\t'
+                && !is_operator_char(*lexer->cur_tok)
+                /* Stop the word when an inline comment starts. */
+                && *lexer->cur_tok != '!') {
                 lexer->cur_tok++;
             }
             size_t str_len = (size_t)(lexer->cur_tok - str_start);
@@ -589,6 +613,9 @@ int lex(Lexer* lexer) {
                     add_token(lexer, tok_identifier, token_str);
                 }
             }
+            /* Note: we intentionally do NOT advance past '!' here.
+               The next loop iteration hits the early '!' handler and
+               swallows the rest of the line. */
         }
     }
 
@@ -625,7 +652,8 @@ static int is_keyword(const char* str) {
         "RADIOBUTTON_PARAM", "CHECKBOX_PARAM", "IF", "ELSE_IF", "ELSE", "END_IF",
         "TABLE_OPTION", "SEL_STRING", "BEGIN_ASM_DESCR", "END_ASM_DESCR", "CONFIG_ELEM",
         "NO_VALUE", "BEGIN_SUBTABLE", "END_SUBTABLE", "INVALIDATE_PARAM", "USER_SELECT_MULTIPLE", "USER_SELECT_OPTIONAL",
-        "USER_SELECT_MULTIPLE_OPTIONAL"
+        "USER_SELECT_MULTIPLE_OPTIONAL", "MEASURE_DISTANCE", "SEARCH_MDL_REFS", "SEARCH_MDL_REF", "BEGIN_CATCH_ERROR",
+        "END_CATCH_ERROR", "MEASURE_LENGTH",
     };
     size_t num_keywords = sizeof(keywords) / sizeof(keywords[0]);
     for (size_t i = 0; i < num_keywords; i++) {
