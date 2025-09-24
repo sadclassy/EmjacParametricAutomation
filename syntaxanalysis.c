@@ -625,6 +625,40 @@ ExpressionNode* parse_expression(Lexer* lexer, size_t* i, SymbolTable* st)
     return left;
 }
 
+//helper for integer being true/false
+int parse_bool_literal(Lexer* lexer, size_t* i, int* out) {
+    TokenData* t = current_token(lexer, i);
+    if (!t) return -1;
+
+    if (t->type == tok_identifier) {
+        if (strcmp(t->val, "TRUE") == 0) { *out = 1; (*i)++; return 0; }
+        if (strcmp(t->val, "FALSE") == 0) { *out = 0; (*i)++; return 0; }
+    }
+    if (t->type == tok_number) {
+        // Treat any nonzero number as true
+        long v = strtol(t->val, NULL, 10);
+        *out = (v != 0);
+        (*i)++;
+        return 0;
+    }
+    return -1;
+}
+
+int add_expr(ExpressionNode*** arr, size_t* count, size_t* cap, ExpressionNode* e)
+{
+    if (!e) return -1;
+    if (*count >= *cap) {
+        size_t ncap = (*cap ? *cap * 2 : 4);
+        ExpressionNode** tmp = (ExpressionNode**)realloc(*arr, ncap * sizeof(*tmp));
+        if (!tmp) return -1;
+        *arr = tmp;
+        *cap = ncap;
+    }
+    (*arr)[(*count)++] = e;
+    return 0;
+}
+
+
 /*=================================================*\
 * 
 * //parse_declare_variable with type-specific handling
@@ -4026,6 +4060,674 @@ int parse_invlaidate_param(Lexer* lexer, size_t* i, CommandData* parsed_data)
     return 0;
 }
 
+
+/*=================================================*\
+* 
+* MEASURE_DISTANCE syntax_analysis  
+* 
+* 
+\*=================================================*/
+/* --- free helper (mirrors your other node free-ers) --- */
+static void free_measure_distance_node(MeasureDistanceNode* n) {
+    if (!n) return;
+    free_expression(n->reference1);     n->reference1 = NULL;
+    free_expression(n->reference2);     n->reference2 = NULL;
+    free_expression(n->parameterResult); n->parameterResult = NULL;
+    memset(n, 0, sizeof(*n));
+}
+
+/* --- optional <:tag> consumer used below --- */
+static void consume_optional_inout_suffix(Lexer* lexer, size_t* i, const char* tag /* "in" or "out" */) {
+    TokenData* t = current_token(lexer, i);
+    if (t && t->type == tok_colon) {
+        (*i)++;
+        t = current_token(lexer, i);
+        if (t && t->type == tok_identifier && _stricmp(t->val, tag) == 0) {
+            (*i)++; /* swallow expected tag */
+        }
+        else {
+            ProPrintfChar("Warning: Expected <:%s> after argument; proceeding without it\n", tag);
+        }
+    }
+}
+
+/*=================================================*\
+*  MEASURE_DISTANCE syntax analysis
+*  Syntax:
+*    MEASURE_DISTANCE [ENABLE_CHECKBOX1 bool] [ENABLE_CHECKBOX2 bool]
+*                     reference1<:in> reference2<:in> parameterResult<:out>
+\*=================================================*/
+int parse_measure_distance(Lexer* lexer, size_t* i, CommandData* parsed_data)
+{
+    MeasureDistanceNode* node = &parsed_data->measure_distance;
+
+    /* defaults */
+    memset(node, 0, sizeof(*node));
+    node->enable_cb1 = true;
+    node->enable_cb2 = true;
+
+    /* ---- options: ENABLE_CHECKBOX1 / ENABLE_CHECKBOX2 ---- */
+    for (;;) {
+        TokenData* t = current_token(lexer, i);
+        if (!t) break;
+
+        if ((t->type == tok_option || t->type == tok_identifier) &&
+            (!strcmp(t->val, "ENABLE_CHECKBOX1") || !strcmp(t->val, "ENABLE_CHECKBOX2")))
+        {
+            int val = 1;
+            (*i)++; /* consume option token */
+            if (parse_bool_literal(lexer, i, &val) != 0) {
+                ProPrintfChar("Error: Expected TRUE/FALSE or 0/1 after %s at line %zu\n", t->val, t->loc.line);
+                free_measure_distance_node(node);
+                return -1;
+            }
+            if (!strcmp(t->val, "ENABLE_CHECKBOX1")) node->enable_cb1 = (val != 0);
+            else                                     node->enable_cb2 = (val != 0);
+            continue;
+        }
+        break; /* no more options */
+    }
+
+    /* ---- reference1 (expr) + optional <:in> ---- */
+    node->reference1 = parse_expression(lexer, i, NULL);
+    if (!node->reference1) {
+        ProPrintfChar("Error: Expected reference1 expression\n");
+        free_measure_distance_node(node);
+        return -1;
+    }
+    consume_optional_inout_suffix(lexer, i, "in");  /* accepts <:in> */
+
+    /* ---- reference2 (expr) + optional <:in> ---- */
+    node->reference2 = parse_expression(lexer, i, NULL);
+    if (!node->reference2) {
+        ProPrintfChar("Error: Expected reference2 expression\n");
+        free_measure_distance_node(node);
+        return -1;
+    }
+    consume_optional_inout_suffix(lexer, i, "in");  /* accepts <:in> */
+
+    /* ---- parameterResult: require an identifier token; wrap as expr; optional <:out> ---- */
+    {
+        TokenData* t = current_token(lexer, i);
+        if (!t || t->type != tok_identifier) {
+            ProPrintfChar("Error: Expected result identifier for parameterResult\n");
+            free_measure_distance_node(node);
+            return -1;
+        }
+        node->parameterResult = parse_expression(lexer, i, NULL); /* becomes EXPR_VARIABLE_REF */
+        if (!node->parameterResult) {
+            ProPrintfChar("Error: Failed to parse parameterResult identifier\n");
+            free_measure_distance_node(node);
+            return -1;
+        }
+        consume_optional_inout_suffix(lexer, i, "out"); /* accepts <:out> */
+    }
+
+    /* log (same style as others) */
+    char* r1 = expression_to_string(node->reference1);
+    char* r2 = expression_to_string(node->reference2);
+    char* pr = expression_to_string(node->parameterResult);
+    LogOnlyPrintfChar("MEASURE_DISTANCE: cb1=%d, cb2=%d, ref1=%s, ref2=%s, out=%s\n",
+        node->enable_cb1, node->enable_cb2,
+        r1 ? r1 : "<null>", r2 ? r2 : "<null>", pr ? pr : "<null>");
+    free(r1); free(r2); free(pr);
+
+    return 0;
+}
+
+/*=================================================*\
+*
+* MEASURE_LENGTH syntax_analysis
+* Syntax:
+*   MEASURE_LENGTH reference1<:in> parameterResult<:out>
+*
+\*=================================================*/
+
+/* --- free helper --- */
+static void free_measure_length_node(MeasureLengthNode* n) {
+    if (!n) return;
+    free_expression(n->reference1);       n->reference1 = NULL;
+    free_expression(n->parameterResult);  n->parameterResult = NULL;
+    memset(n, 0, sizeof(*n));
+}
+
+/* Parser */
+int parse_measure_length(Lexer* lexer, size_t* i, CommandData* parsed_data)
+{
+    MeasureLengthNode* node = &parsed_data->measure_length;
+    memset(node, 0, sizeof(*node));
+
+    /* ---- reference1 (expr) + optional <:in> ---- */
+    node->reference1 = parse_expression(lexer, i, NULL);
+    if (!node->reference1) {
+        ProPrintfChar("Error: Expected reference1 expression in MEASURE_LENGTH\n");
+        free_measure_length_node(node);
+        return -1;
+    }
+    /* accept optional <:in>, same behavior as other commands */
+    consume_optional_inout_suffix(lexer, i, "in");
+
+    /* ---- parameterResult: require identifier token, parse as expr; optional <:out> ---- */
+    {
+        TokenData* t = current_token(lexer, i);
+        if (!t || t->type != tok_identifier) {
+            ProPrintfChar("Error: Expected result identifier for parameterResult in MEASURE_LENGTH\n");
+            free_measure_length_node(node);
+            return -1;
+        }
+        node->parameterResult = parse_expression(lexer, i, NULL); /* becomes EXPR_VARIABLE_REF */
+        if (!node->parameterResult) {
+            ProPrintfChar("Error: Failed to parse parameterResult identifier in MEASURE_LENGTH\n");
+            free_measure_length_node(node);
+            return -1;
+        }
+        consume_optional_inout_suffix(lexer, i, "out"); /* accepts <:out> */
+    }
+
+    /* log (same style as others) */
+    {
+        char* r1 = expression_to_string(node->reference1);
+        char* pr = expression_to_string(node->parameterResult);
+        LogOnlyPrintfChar("MeasureLengthNode: reference1=%s, parameterResult=%s\n",
+            r1 ? r1 : "NULL", pr ? pr : "NULL");
+        free(r1);
+        free(pr);
+    }
+
+    return 0;
+}
+
+
+/*=================================================*
+ *  SEARCH_MDL_REF syntax analysis
+ *
+ *  Syntax:
+ *    SEARCH_MDL_REF [options] model "type" "search_string"
+ *                   [WITH_CONTENT expr]*
+ *                   [WITH_CONTENT_NOT expr]*
+ *                   [WITH_IDENTIFIER expr]*
+ *                   [WITH_IDENTIFIER_NOT expr]*
+ *                   reference<:out>
+ *
+ *  Notes:
+ *  - INCLUDE_MULTI_CAD takes one expression (bool-ish), default FALSE.
+ *  - Each WITH_* clause adds exactly one expression; repeat clauses to add more.
+ *=================================================*/
+ /* ---------- SEARCH_MDL_REF: helpers ---------- */
+static void free_search_mdl_ref_node(SearchMdlRefNode* n)
+{
+    if (!n) return;
+
+    free_expression(n->include_multi_cad);
+    free_expression(n->model);
+    free_expression(n->type_expr);
+    free_expression(n->search_string);
+
+    if (n->with_content) {
+        for (size_t k = 0; k < n->with_content_count; ++k) free_expression(n->with_content[k]);
+        free(n->with_content);
+    }
+    if (n->with_content_not) {
+        for (size_t k = 0; k < n->with_content_not_count; ++k) free_expression(n->with_content_not[k]);
+        free(n->with_content_not);
+    }
+    if (n->with_identifier) {
+        for (size_t k = 0; k < n->with_identifier_count; ++k) free_expression(n->with_identifier[k]);
+        free(n->with_identifier);
+    }
+    if (n->with_identifier_not) {
+        for (size_t k = 0; k < n->with_identifier_not_count; ++k) free_expression(n->with_identifier_not[k]);
+        free(n->with_identifier_not);
+    }
+
+    free(n->out_reference);
+    memset(n, 0, sizeof(*n));
+}
+
+int parse_search_mdl_ref(Lexer* lexer, size_t* i, CommandData* parsed_data)
+{
+    TokenData* t = NULL;
+    SearchMdlRefNode* n = &parsed_data->search_mdl_ref;
+    memset(n, 0, sizeof(*n));
+
+    /* default INCLUDE_MULTI_CAD := FALSE (as an expr node) */
+    {
+        ExpressionNode* lit_false = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+        if (!lit_false) { ProPrintfChar("Error: OOM in SEARCH_MDL_REF\n"); return -1; }
+        lit_false->type = EXPR_LITERAL_BOOL;
+        lit_false->data.bool_val = 0;
+        n->include_multi_cad = lit_false;
+    }
+
+    /* ---- pre-argument options ---- (reuse flags + INCLUDE_MULTI_CAD like REFS) */
+    for (;;) {
+        t = current_token(lexer, i);
+        if (!t) break;
+        if (t->type != tok_option && t->type != tok_identifier) break;
+
+        if (_stricmp(t->val, "RECURSIVE") == 0) { n->recursive = true; (*i)++; continue; }
+        else if (_stricmp(t->val, "ALLOW_SUPPRESSED") == 0) { n->allow_suppressed = true; (*i)++; continue; }
+        else if (_stricmp(t->val, "ALLOW_SIMPREP_SUPPRESSED") == 0) { n->allow_simprep_suppressed = true; (*i)++; continue; }
+        else if (_stricmp(t->val, "EXCLUDE_INHERITED") == 0) { n->exclude_inherited = true; (*i)++; continue; }
+        else if (_stricmp(t->val, "EXCLUDE_FOOTER") == 0) { n->exclude_footer = true; (*i)++; continue; }
+        else if (_stricmp(t->val, "NO_UPDATE") == 0) { n->no_update = true; (*i)++; continue; }
+        else if (_stricmp(t->val, "INCLUDE_MULTI_CAD") == 0) {
+            (*i)++; /* consume option */
+            ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) {
+                ProPrintfChar("Error: Expected expression after INCLUDE_MULTI_CAD at line %zu\n", t->loc.line);
+                free_search_mdl_ref_node(n); return -1;
+            }
+            free_expression(n->include_multi_cad);
+            n->include_multi_cad = e;
+            continue;
+        }
+
+        /* If we hit WITH_* it's the next phase */
+        if (_stricmp(t->val, "WITH_CONTENT") == 0 ||
+            _stricmp(t->val, "WITH_CONTENT_NOT") == 0 ||
+            _stricmp(t->val, "WITH_IDENTIFIER") == 0 ||
+            _stricmp(t->val, "WITH_IDENTIFIER_NOT") == 0) {
+            break;
+        }
+        break;
+    }
+
+    /* ---- positional: model, type, search_string ---- */
+    n->model = parse_expression(lexer, i, NULL);
+    if (!n->model) {
+        ProPrintfChar("Error: Expected model expression in SEARCH_MDL_REF\n");
+        free_search_mdl_ref_node(n); return -1;
+    }
+
+    n->type_expr = parse_expression(lexer, i, NULL);
+    if (!n->type_expr) {
+        ProPrintfChar("Error: Expected \"type\" expression in SEARCH_MDL_REF\n");
+        free_search_mdl_ref_node(n); return -1;
+    }
+
+    n->search_string = parse_expression(lexer, i, NULL);
+    if (!n->search_string) {
+        ProPrintfChar("Error: Expected \"search_string\" expression in SEARCH_MDL_REF\n");
+        free_search_mdl_ref_node(n); return -1;
+    }
+
+    /* ---- optional WITH_* clauses (repeatable) ---- */
+    size_t cap_c = 0, cap_cn = 0, cap_i = 0, cap_in = 0;
+    for (;;) {
+        t = current_token(lexer, i);
+        if (!t || (t->type != tok_option && t->type != tok_identifier)) break;
+
+        if (_stricmp(t->val, "WITH_CONTENT") == 0) {
+            (*i)++; ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) {
+                ProPrintfChar("Error: WITH_CONTENT requires an expression\n");
+                free_search_mdl_ref_node(n); return -1;
+            }
+            if (add_expr(&n->with_content, &n->with_content_count, &cap_c, e) != 0) {
+                free_expression(e); free_search_mdl_ref_node(n); return -1;
+            }
+            continue;
+        }
+        if (_stricmp(t->val, "WITH_CONTENT_NOT") == 0) {
+            (*i)++; ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) {
+                ProPrintfChar("Error: WITH_CONTENT_NOT requires an expression\n");
+                free_search_mdl_ref_node(n); return -1;
+            }
+            if (add_expr(&n->with_content_not, &n->with_content_not_count, &cap_cn, e) != 0) {
+                free_expression(e); free_search_mdl_ref_node(n); return -1;
+            }
+            continue;
+        }
+        if (_stricmp(t->val, "WITH_IDENTIFIER") == 0) {
+            (*i)++; ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) {
+                ProPrintfChar("Error: WITH_IDENTIFIER requires an expression\n");
+                free_search_mdl_ref_node(n); return -1;
+            }
+            if (add_expr(&n->with_identifier, &n->with_identifier_count, &cap_i, e) != 0) {
+                free_expression(e); free_search_mdl_ref_node(n); return -1;
+            }
+            continue;
+        }
+        if (_stricmp(t->val, "WITH_IDENTIFIER_NOT") == 0) {
+            (*i)++; ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) {
+                ProPrintfChar("Error: WITH_IDENTIFIER_NOT requires an expression\n");
+                free_search_mdl_ref_node(n); return -1;
+            }
+            if (add_expr(&n->with_identifier_not, &n->with_identifier_not_count, &cap_in, e) != 0) {
+                free_expression(e); free_search_mdl_ref_node(n); return -1;
+            }
+            continue;
+        }
+
+        /* not a WITH_* -> done */
+        break;
+    }
+
+    /* ---- result: single reference identifier + optional <:out> ---- */
+    t = current_token(lexer, i);
+    if (!t || t->type != tok_identifier) {
+        ProPrintfChar("Error: Expected result reference identifier in SEARCH_MDL_REF\n");
+        free_search_mdl_ref_node(n); return -1;
+    }
+    n->out_reference = _strdup(t->val);
+    if (!n->out_reference) {
+        ProPrintfChar("Error: OOM for out reference\n");
+        free_search_mdl_ref_node(n); return -1;
+    }
+    (*i)++;
+    consume_optional_inout_suffix(lexer, i, "out"); /* accepts <:out> */
+
+    /* debug log (consistent with others) */
+    {
+        char* m = expression_to_string(n->model);
+        char* ty = expression_to_string(n->type_expr);
+        char* ss = expression_to_string(n->search_string);
+        LogOnlyPrintfChar("SEARCH_MDL_REF: model=%s, type=%s, search=%s, out=%s\n",
+            m ? m : "<null>", ty ? ty : "<null>", ss ? ss : "<null>", n->out_reference ? n->out_reference : "<null>");
+        free(m); free(ty); free(ss);
+    }
+
+    return 0;
+}
+
+
+/*=================================================*\
+ *  SEARCH_MDL_REFS syntax analysis
+ *
+ *  Syntax:
+ *    SEARCH_MDL_REFS [options] model "type" "search_string"
+ *                    [WITH_CONTENT expr]*
+ *                    [WITH_CONTENT_NOT expr]*
+ *                    [WITH_IDENTIFIER expr]*
+ *                    [WITH_IDENTIFIER_NOT expr]*
+ *                    array<:out>
+ *
+ *  Notes:
+ *  - INCLUDE_MULTI_CAD takes one expression (bool-ish), default FALSE.
+ *  - Each WITH_* clause adds exactly one expression; repeat clauses to add more.
+\*=================================================*/
+void free_search_mdl_refs_node(SearchMdlRefsNode* n)
+{
+    if (!n) return;
+
+    free_expression(n->include_multi_cad);
+    free_expression(n->model);
+    free_expression(n->type_expr);
+    free_expression(n->search_string);
+
+    if (n->with_content) {
+        for (size_t k = 0; k < n->with_content_count; ++k) free_expression(n->with_content[k]);
+        free(n->with_content);
+    }
+    if (n->with_content_not) {
+        for (size_t k = 0; k < n->with_content_not_count; ++k) free_expression(n->with_content_not[k]);
+        free(n->with_content_not);
+    }
+    if (n->with_identifier) {
+        for (size_t k = 0; k < n->with_identifier_count; ++k) free_expression(n->with_identifier[k]);
+        free(n->with_identifier);
+    }
+    if (n->with_identifier_not) {
+        for (size_t k = 0; k < n->with_identifier_not_count; ++k) free_expression(n->with_identifier_not[k]);
+        free(n->with_identifier_not);
+    }
+
+    free(n->out_array);
+    memset(n, 0, sizeof(*n));
+}
+
+int parse_search_mdl_refs(Lexer* lexer, size_t* i, CommandData* parsed_data)
+{
+    TokenData* t = NULL;
+    SearchMdlRefsNode* n = &parsed_data->search_mdl_refs;
+    memset(n, 0, sizeof(*n));
+
+    /* default for INCLUDE_MULTI_CAD: FALSE (as an expression node) */
+    {
+        ExpressionNode* lit_false = (ExpressionNode*)malloc(sizeof(ExpressionNode));
+        if (!lit_false) { ProPrintfChar("Error: OOM in SEARCH_MDL_REFS\n"); return -1; }
+        lit_false->type = EXPR_LITERAL_BOOL;
+        lit_false->data.bool_val = 0;
+        n->include_multi_cad = lit_false;
+    }
+
+    /* ---- pre-argument options (flags or INCLUDE_MULTI_CAD <expr>) ---- */
+    for (;;) {
+        t = current_token(lexer, i);
+        if (!t) break;
+        if (t->type != tok_option && t->type != tok_identifier) break;
+
+        if (_stricmp(t->val, "RECURSIVE") == 0) {
+            n->recursive = true; (*i)++; continue;
+        }
+        else if (_stricmp(t->val, "ALLOW_SUPPRESSED") == 0) {
+            n->allow_suppressed = true; (*i)++; continue;
+        }
+        else if (_stricmp(t->val, "ALLOW_SIMPREP_SUPPRESSED") == 0) {
+            n->allow_simprep_suppressed = true; (*i)++; continue;
+        }
+        else if (_stricmp(t->val, "EXCLUDE_INHERITED") == 0) {
+            n->exclude_inherited = true; (*i)++; continue;
+        }
+        else if (_stricmp(t->val, "EXCLUDE_FOOTER") == 0) {
+            n->exclude_footer = true; (*i)++; continue;
+        }
+        else if (_stricmp(t->val, "NO_UPDATE") == 0) {
+            n->no_update = true; (*i)++; continue;
+        }
+        else if (_stricmp(t->val, "INCLUDE_MULTI_CAD") == 0) {
+            (*i)++; /* consume the option */
+            /* one expression (bool-ish), e.g. TRUE or &flag */
+            ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) {
+                ProPrintfChar("Error: Expected expression after INCLUDE_MULTI_CAD at line %zu\n", t->loc.line);
+                free_search_mdl_refs_node(n);
+                return -1;
+            }
+            free_expression(n->include_multi_cad);
+            n->include_multi_cad = e;
+            continue;
+        }
+
+        /* stop if we hit a different option (likely a WITH_* clause) */
+        if (_stricmp(t->val, "WITH_CONTENT") == 0 ||
+            _stricmp(t->val, "WITH_CONTENT_NOT") == 0 ||
+            _stricmp(t->val, "WITH_IDENTIFIER") == 0 ||
+            _stricmp(t->val, "WITH_IDENTIFIER_NOT") == 0) {
+            break;
+        }
+        /* not one of ours -> end options */
+        break;
+    }
+
+    /* ---- positional: model, type, search_string ---- */
+    n->model = parse_expression(lexer, i, NULL);
+    if (!n->model) {
+        ProPrintfChar("Error: Expected model expression in SEARCH_MDL_REFS\n");
+        free_search_mdl_refs_node(n);
+        return -1;
+    }
+
+    n->type_expr = parse_expression(lexer, i, NULL);
+    if (!n->type_expr) {
+        ProPrintfChar("Error: Expected \"type\" expression in SEARCH_MDL_REFS\n");
+        free_search_mdl_refs_node(n);
+        return -1;
+    }
+
+    n->search_string = parse_expression(lexer, i, NULL);
+    if (!n->search_string) {
+        ProPrintfChar("Error: Expected \"search_string\" expression in SEARCH_MDL_REFS\n");
+        free_search_mdl_refs_node(n);
+        return -1;
+    }
+
+    /* ---- optional WITH_* clauses (repeatable) ---- */
+    size_t cap_c = 0, cap_cn = 0, cap_i = 0, cap_in = 0;
+    for (;;) {
+        t = current_token(lexer, i);
+        if (!t || (t->type != tok_option && t->type != tok_identifier)) break;
+
+        if (_stricmp(t->val, "WITH_CONTENT") == 0) {
+            (*i)++; /* consume */
+            ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) { ProPrintfChar("Error: WITH_CONTENT requires an expression\n"); free_search_mdl_refs_node(n); return -1; }
+            if (add_expr(&n->with_content, &n->with_content_count, &cap_c, e) != 0) { free_expression(e); free_search_mdl_refs_node(n); return -1; }
+            continue;
+        }
+        if (_stricmp(t->val, "WITH_CONTENT_NOT") == 0) {
+            (*i)++;
+            ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) { ProPrintfChar("Error: WITH_CONTENT_NOT requires an expression\n"); free_search_mdl_refs_node(n); return -1; }
+            if (add_expr(&n->with_content_not, &n->with_content_not_count, &cap_cn, e) != 0) { free_expression(e); free_search_mdl_refs_node(n); return -1; }
+            continue;
+        }
+        if (_stricmp(t->val, "WITH_IDENTIFIER") == 0) {
+            (*i)++;
+            ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) { ProPrintfChar("Error: WITH_IDENTIFIER requires an expression\n"); free_search_mdl_refs_node(n); return -1; }
+            if (add_expr(&n->with_identifier, &n->with_identifier_count, &cap_i, e) != 0) { free_expression(e); free_search_mdl_refs_node(n); return -1; }
+            continue;
+        }
+        if (_stricmp(t->val, "WITH_IDENTIFIER_NOT") == 0) {
+            (*i)++;
+            ExpressionNode* e = parse_expression(lexer, i, NULL);
+            if (!e) { ProPrintfChar("Error: WITH_IDENTIFIER_NOT requires an expression\n"); free_search_mdl_refs_node(n); return -1; }
+            if (add_expr(&n->with_identifier_not, &n->with_identifier_not_count, &cap_in, e) != 0) { free_expression(e); free_search_mdl_refs_node(n); return -1; }
+            continue;
+        }
+
+        /* not a WITH_* clause -> leave loop to parse result array */
+        break;
+    }
+
+    /* ---- result array identifier + optional <:out> ---- */
+    t = current_token(lexer, i);
+    if (!t || t->type != tok_identifier) {
+        ProPrintfChar("Error: Expected result array identifier in SEARCH_MDL_REFS\n");
+        free_search_mdl_refs_node(n);
+        return -1;
+    }
+    n->out_array = _strdup(t->val);
+    if (!n->out_array) {
+        ProPrintfChar("Error: OOM for array name in SEARCH_MDL_REFS\n");
+        free_search_mdl_refs_node(n);
+        return -1;
+    }
+    (*i)++;
+    consume_optional_inout_suffix(lexer, i, "out"); /* accept <:out> silently */
+
+    /* ---- debug log (consistent with others) ---- */
+    {
+        char* m = expression_to_string(n->model);
+        char* ty = expression_to_string(n->type_expr);
+        char* ss = expression_to_string(n->search_string);
+        LogOnlyPrintfChar("SEARCH_MDL_REFS: rec=%d, sup=%d, simprep=%d, ex_inh=%d, ex_foot=%d, nupd=%d, arr=%s\n",
+            (int)n->recursive, (int)n->allow_suppressed, (int)n->allow_simprep_suppressed,
+            (int)n->exclude_inherited, (int)n->exclude_footer, (int)n->no_update,
+            n->out_array ? n->out_array : "<null>");
+        LogOnlyPrintfChar("    model=%s, type=%s, search=%s\n",
+            m ? m : "<null>", ty ? ty : "<null>", ss ? ss : "<null>");
+        free(m); free(ty); free(ss);
+    }
+
+    return 0;
+}
+
+/* ---------- BEGIN_CATCH_ERROR / END_CATCH_ERROR ---------------------- */
+/* free helper mirrors others (e.g., IF) */
+static void free_catch_error_node(CatchErrorNode* n) {
+    if (!n) return;
+    if (n->commands) {
+        for (size_t k = 0; k < n->command_count; ++k) {
+            free_command_node(n->commands[k]);
+        }
+        free(n->commands);
+    }
+    memset(n, 0, sizeof(*n));
+}
+
+/* Parser:
+   BEGIN_CATCH_ERROR [FIX_FAIL_UDF] [FIX_FAIL_COMPONENT]
+       <nested commands...>
+   END_CATCH_ERROR
+*/
+static int parse_begin_catch_error(Lexer* lexer, size_t* i, CommandData* parsed_data) {
+    CatchErrorNode* node = &parsed_data->begin_catch_error;
+    memset(node, 0, sizeof(*node));
+
+    /* ---- options (flags) ---- */
+    for (;;) {
+        TokenData* t = current_token(lexer, i);
+        if (!t) break;
+        if (t->type != tok_option && t->type != tok_identifier) break;
+
+        if (_stricmp(t->val, "FIX_FAIL_UDF") == 0) {
+            node->fix_fail_udf = true; (*i)++; continue;
+        }
+        else if (_stricmp(t->val, "FIX_FAIL_COMPONENT") == 0) {
+            node->fix_fail_component = true; (*i)++; continue;
+        }
+
+        /* unknown token means options phase ended */
+        break;
+    }
+
+    /* ---- nested commands until END_CATCH_ERROR ---- */
+    size_t cap = 4;
+    node->commands = (CommandNode**)malloc(cap * sizeof(CommandNode*));
+    if (!node->commands) {
+        ProPrintfChar("Error: Memory allocation failed in BEGIN_CATCH_ERROR\n");
+        return -1;
+    }
+    node->command_count = 0;
+
+    TokenData* tok = NULL;
+    while ((tok = current_token(lexer, i)) != NULL) {
+        if (tok->type == tok_keyword && strcmp(tok->val, "END_CATCH_ERROR") == 0) {
+            break;
+        }
+        CommandNode* inner = parse_command(lexer, i, NULL);
+        if (inner) {
+            if (node->command_count >= cap) {
+                cap = cap ? cap * 2 : 4;
+                CommandNode** tmp = (CommandNode**)realloc(node->commands, cap * sizeof(CommandNode*));
+                if (!tmp) {
+                    ProPrintfChar("Error: Realloc failed in BEGIN_CATCH_ERROR body\n");
+                    free_catch_error_node(node);
+                    return -1;
+                }
+                node->commands = tmp;
+            }
+            node->commands[node->command_count++] = inner;
+        }
+        else {
+            /* make forward progress if a bad token slips in */
+            ProPrintfChar("Warning: Skipping invalid token in BEGIN_CATCH_ERROR body\n");
+            (*i)++;
+        }
+    }
+
+    /* require END_CATCH_ERROR (same spirit as END_IF requirement) */
+    tok = current_token(lexer, i);
+    if (!tok || tok->type != tok_keyword || strcmp(tok->val, "END_CATCH_ERROR") != 0) {
+        ProPrintfChar("Error: Expected END_CATCH_ERROR to close BEGIN_CATCH_ERROR block\n");
+        free_catch_error_node(node);
+        return -1;
+    }
+    (*i)++; /* consume END_CATCH_ERROR */
+
+    LogOnlyPrintfChar("BEGIN_CATCH_ERROR: udf=%d, comp=%d, nested=%zu\n",
+        node->fix_fail_udf ? 1 : 0, node->fix_fail_component ? 1 : 0, node->command_count);
+
+    return 0;
+}
+
+
 /*=================================================*\
 * 
 * // Helper to add a branch to IfNode's branches array (dynamic growth)
@@ -4297,7 +4999,14 @@ CommandEntry command_table[] = {
     {"USER_SELECT_MULTIPLE_OPTIONAL", COMMAND_USER_SELECT_MULTIPLE_OPTIONAL, parse_user_select_multiple_optional},
     {"USER_SELECT_OPTIONAL", COMMAND_USER_SELECT_OPTIONAL, parse_user_select_optional},
     {"INVALIDATE_PARAM", COMMAND_INVALIDATE_PARAM, parse_invlaidate_param},
-    {"BEGIN_TABLE", COMMAND_BEGIN_TABLE, parse_begin_table}
+    {"BEGIN_TABLE", COMMAND_BEGIN_TABLE, parse_begin_table},
+    {"MEASURE_DISTANCE", COMMAND_MEASURE_DISTANCE, parse_measure_distance},
+    {"MEASURE_LENGTH", COMMAND_MEASURE_LENGTH, parse_measure_length},
+    {"SEARCH_MDL_REFS", COMMAND_SEARCH_MDL_REFS, parse_search_mdl_refs},
+    {"SEARCH_MDL_REF", COMMAND_SEARCH_MDL_REF, parse_search_mdl_ref},
+    {"BEGIN_CATCH_ERROR", COMMAND_BEGIN_CATCH_ERROR, parse_begin_catch_error},
+
+
 };
 
 // Allocate data based on CommandType
@@ -4330,6 +5039,16 @@ CommandData* allocate_data(CommandType type) {
     case COMMAND_INVALIDATE_PARAM:
         return malloc(sizeof(CommandData));
     case COMMAND_BEGIN_TABLE:
+        return malloc(sizeof(CommandData));
+    case COMMAND_MEASURE_DISTANCE:
+        return malloc(sizeof(CommandData));
+    case COMMAND_MEASURE_LENGTH:
+        return malloc(sizeof(CommandData));
+    case COMMAND_SEARCH_MDL_REFS:
+        return malloc(sizeof(CommandData));
+    case COMMAND_SEARCH_MDL_REF:
+        return malloc(sizeof(CommandData));
+    case COMMAND_BEGIN_CATCH_ERROR:
         return malloc(sizeof(CommandData));
     default:
         ProPrintf(L"Error: Unknown CommandType in allocate_data\n");
@@ -4885,6 +5604,44 @@ void free_command_node(CommandNode* node) {
             free(tn->rows);
 
             free(node->data);  // Free the entire CommandData allocation after cleaning internals
+            break;
+        }
+        case COMMAND_MEASURE_DISTANCE: {
+            MeasureDistanceNode* md = (MeasureDistanceNode*)node->data;
+            if (md) {
+                free_expression(md->parameterResult);
+                free(md);
+            }
+            break;
+        }
+        case COMMAND_MEASURE_LENGTH: {
+            MeasureLengthNode* ml = &((CommandData*)node->data)->measure_length;
+            free_expression(ml->reference1);
+            free_expression(ml->parameterResult);
+            free(node->data);
+        } break;
+
+        case COMMAND_SEARCH_MDL_REFS: {
+            SearchMdlRefsNode* n = &((CommandData*)node->data)->search_mdl_refs;
+            /* use the same helper we wrote for the parser */
+            free_search_mdl_refs_node(n);
+            free(node->data);
+        } break;
+        case COMMAND_SEARCH_MDL_REF: {
+            SearchMdlRefNode* n = &((CommandData*)node->data)->search_mdl_ref;
+            /* use the same helper we wrote for the parser */
+            free_search_mdl_ref_node(n);
+            free(node->data);
+        } break;
+        case COMMAND_BEGIN_CATCH_ERROR: {
+            CatchErrorNode* cen = &((CommandData*)node->data)->begin_catch_error;
+            if (cen->commands) {
+                for (size_t k = 0; k < cen->command_count; ++k) {
+                    free_command_node(cen->commands[k]);
+                }
+                free(cen->commands);
+            }
+            free(node->data);
             break;
         }
         case COMMAND_ASSIGNMENT: {
