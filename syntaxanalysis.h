@@ -407,6 +407,84 @@ typedef struct
 }InvalidateParamNode;
 
 typedef struct {
+    bool enable_cb1; // default TRUE   |  has_cb1,
+    bool enable_cb2; // default TRUE
+    ExpressionNode* reference1; // e.g. "plane1" (as string literal or var_ref)
+    ExpressionNode* reference2; // e.g. "plane2"
+    ExpressionNode* parameterResult; // e.g., "dist_plane1_plane2" (output param_name)
+}MeasureDistanceNode;
+
+typedef struct
+{
+    ExpressionNode* reference1;
+    ExpressionNode* parameterResult;
+}MeasureLengthNode;
+
+typedef struct
+{
+    //Optional (flags)
+    bool recursive;                   /* RECURSIVE */
+    bool allow_suppressed;            /* ALLOW_SUPPRESSED */
+    bool allow_simprep_suppressed;    /* ALLOW_SIMPREP_SUPPRESSED */
+    bool exclude_inherited;           /* EXCLUDE_INHERITED */
+    bool exclude_footer;              /* EXCLUDE_FOOTER */
+    bool no_update;
+
+    ExpressionNode* include_multi_cad;
+
+    // Positional args
+    ExpressionNode* model;
+    ExpressionNode* type_expr;
+    ExpressionNode* search_string;
+
+    ExpressionNode** with_content;
+    size_t with_content_count;
+    ExpressionNode** with_content_not;
+    size_t with_content_not_count;
+    ExpressionNode** with_identifier;
+    size_t with_identifier_count;
+    ExpressionNode** with_identifier_not;
+    size_t with_identifier_not_count;
+    char* out_array;
+}SearchMdlRefsNode;
+
+/* Single-reference search: SEARCH_MDL_REF */
+typedef struct
+{
+    /* options (flags) */
+    bool recursive;                   /* RECURSIVE */
+    bool allow_suppressed;            /* ALLOW_SUPPRESSED */
+    bool allow_simprep_suppressed;    /* ALLOW_SIMPREP_SUPPRESSED */
+    bool exclude_inherited;           /* EXCLUDE_INHERITED */
+    bool exclude_footer;              /* EXCLUDE_FOOTER */
+    bool no_update;                   /* NO_UPDATE */
+
+    ExpressionNode* include_multi_cad;  /* INCLUDE_MULTI_CAD <bool-expr>, default FALSE */
+
+    /* positional */
+    ExpressionNode* model;           /* model */
+    ExpressionNode* type_expr;       /* "type" (string expr) */
+    ExpressionNode* search_string;   /* "search_string" (string expr; supports wildcards/FID:/GID:) */
+
+    /* optional filters (repeatable) */
+    ExpressionNode** with_content;         size_t with_content_count;
+    ExpressionNode** with_content_not;     size_t with_content_not_count;
+    ExpressionNode** with_identifier;      size_t with_identifier_count;
+    ExpressionNode** with_identifier_not;  size_t with_identifier_not_count;
+
+    /* result: single reference variable name */
+    char* out_reference;              /* reference<:out> */
+} SearchMdlRefNode;
+
+typedef struct
+{
+    bool fix_fail_udf;
+    bool fix_fail_component;
+    CommandNode** commands;
+    size_t command_count;
+}CatchErrorNode;
+
+typedef struct {
     char* identifier; // TABLE_IDENTIFIER (remains char* as a fixed lexical token)
     ExpressionNode* name;            // Optional table name (now an expression, e.g., string literal or variable)
     ExpressionNode** options;        // TABLE_OPTION options (array of expressions for dynamic options)
@@ -493,6 +571,10 @@ typedef struct {
 typedef union
 {
     DeclareVariableNode declare_variable;
+    MeasureDistanceNode measure_distance;
+    MeasureLengthNode measure_length;
+    SearchMdlRefsNode search_mdl_refs;
+    SearchMdlRefNode search_mdl_ref;
     ConfigElemNode config_elem;
     ShowParamNode show_param;
     GlobalPictureNode global_picture;
@@ -510,6 +592,7 @@ typedef union
     ForNode forcommand;
     AssignmentNode assignment;
     IfNode ifcommand;
+    CatchErrorNode begin_catch_error;
     ExpressionNode* expression;
 }CommandData;
 
@@ -517,6 +600,8 @@ typedef union
 typedef enum {
 
     COMMAND_DECLARE_VARIABLE,
+    COMMAND_SEARCH_MDL_REFS,
+    COMMAND_SEARCH_MDL_REF,
     COMMAND_CONFIG_ELEM,
     COMMAND_SHOW_PARAM,
     COMMAND_GLOBAL_PICTURE,
@@ -534,7 +619,11 @@ typedef enum {
     COMMAND_WHILE,
     COMMAND_ASSIGNMENT,
     COMMAND_EXPRESSION,
-    COMMAND_INVALIDATE_PARAM
+    COMMAND_INVALIDATE_PARAM,
+    COMMAND_MEASURE_DISTANCE,
+    COMMAND_MEASURE_LENGTH,
+    COMMAND_BEGIN_CATCH_ERROR,
+
     // Add other command types as needed
 } CommandType;
 
