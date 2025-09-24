@@ -5,6 +5,7 @@
 #include "guicomponent.h"
 #include "semantic_analysis.h"
 #include "GuiLogic.h"
+#include "assemblycomponent.h"
 
 
 // --- Reactive context (file-scope) ---
@@ -21,7 +22,29 @@ ProError TableSelectCallback(char* dialog, char* table, ProAppData appdata);
 static void colplan_scan_command(CommandNode* c, ColumnPlan* p);
 void EPA_MarkDirty(SymbolTable* st, const char* param_name);
 
+const char* pro_error_to_string(ProError e)
+{
+	switch (e)
+	{
+	case PRO_TK_NO_ERROR:      return "no error";
+	case PRO_TK_GENERAL_ERROR: return "general error";
+	case PRO_TK_BAD_INPUTS:    return "bad inputs";
+	case PRO_TK_E_NOT_FOUND:   return "not found";
+	case PRO_TK_ABORT:		   return "Could Not Execute. Abort .Tab file executable";
+	default:                   return "unknown error";
+	}
+}
 
+static inline ProError abort_script(SymbolTable* st, ProError code) {
+	st_put_int(st, "__GLOBAL_ABORT", 1);
+	return code == PRO_TK_NO_ERROR ? PRO_TK_ABORT : code;
+}
+
+static ProError escalate_if_uncaught(ExecContext* ctx, ProError s) {
+	if (s == PRO_TK_NO_ERROR || !ctx || !ctx->st) return s;
+	int catching = 0; (void)st_get_int(ctx->st, "__CATCH_ACTIVE", &catching);
+	return catching ? s : abort_script(ctx->st, PRO_TK_ABORT);
+}
 
 /* unchanged helpers, but kept here for completeness */
 int st_get_int(SymbolTable* st, const char* key, int* out)
@@ -943,6 +966,162 @@ ProError execute_user_select_multiple_optional_param(UserSelectMultipleOptionalN
 	return PRO_TK_NO_ERROR;
 }
 
+/* ---------- Headless USER_SELECT (ASM-only) ---------- */
+
+static char* build_sel_type_from_node(UserSelectNode* node, SymbolTable* st)
+{
+	if (!node || !st || node->type_count == 0) return NULL;
+
+	size_t n = (size_t)node->type_count;
+	char** parts = (char**)calloc(n, sizeof(char*));
+	size_t* lens = (size_t*)calloc(n, sizeof(size_t));
+	if (!parts || !lens) { free(parts); free(lens); return NULL; }
+
+	size_t total_len = 0;
+
+	/* Evaluate once, lowercase in-place, record lengths */
+	for (size_t i = 0; i < n; ++i) {
+		char* t = NULL;
+		if (evaluate_to_string(node->types[i], st, &t) != 0 || !t) goto fail;
+
+		/* ASCII lowercase */
+		for (char* p = t; *p; ++p) {
+			unsigned char c = (unsigned char)*p;
+			*p = (char)tolower(c);
+		}
+
+		size_t len = strlen(t);
+		parts[i] = t;
+		lens[i] = len;
+
+		/* overflow guard: total_len += len */
+		if (SIZE_MAX - total_len < len) goto fail;
+		total_len += len;
+	}
+
+	/* capacity = sum(lengths) + (n ? n-1 : 0) commas + 1 NUL */
+	size_t commas = (n > 0) ? (n - 1) : 0;
+	if (SIZE_MAX - total_len < (commas + 1)) goto fail;
+	size_t cap = total_len + commas + 1;
+
+	char* out = (char*)malloc(cap);
+	if (!out) goto fail;
+
+	size_t off = 0;
+	for (size_t i = 0; i < n; ++i) {
+		if (i > 0) out[off++] = ',';             /* 1 byte; cap was sized for this */
+		memcpy(out + off, parts[i], lens[i]);     /* lens[i] bytes fit by construction */
+		off += lens[i];
+	}
+	out[off] = '\0';                              /* final NUL fits by construction */
+
+	/* cleanup */
+	for (size_t i = 0; i < n; ++i) free(parts[i]);
+	free(parts);
+	free(lens);
+	return out;
+
+fail:
+	if (parts) {
+		for (size_t i = 0; i < n; ++i) if (parts[i]) free(parts[i]);
+	}
+	free(parts);
+	free(lens);
+	return NULL;
+}
+
+ProError execute_user_select_headless(UserSelectNode* node, SymbolTable* st)
+{
+	if (!node || !st || !node->reference || !node->reference[0]) return PRO_TK_BAD_INPUTS;
+
+	/* Build the ProSelect type string (e.g., "plane,edge,surface") */
+	char* sel_type = build_sel_type_from_node(node, st);
+	if (!sel_type) {
+		ProPrintfChar("USER_SELECT: failed to build selection type string\n");
+		return PRO_TK_GENERAL_ERROR;
+	}
+
+	/* Clear buffer, then prompt the user (single required selection) */
+	ProSelbufferClear();
+	ProSelection* p_sel = NULL;
+	int n_sel = 0;
+	ProError s = ProSelect(sel_type, 1, NULL, NULL, NULL, NULL, &p_sel, &n_sel);
+	free(sel_type);
+
+	if (s != PRO_TK_NO_ERROR) {
+		ProPrintfChar("USER_SELECT: ProSelect failed (%d)\n", (int)s);
+		return s;
+	}
+	if (n_sel < 1) {
+		ProPrintfChar("USER_SELECT: no selection made (user abort)\n");
+		ProSelectionarrayFree(p_sel);
+		n_sel = 0;
+		return PRO_TK_USER_ABORT;
+	}
+
+	ProSelection picked = NULL;
+	if (ProSelectionCopy(p_sel[0], &picked) != PRO_TK_NO_ERROR) {
+		ProSelectionarrayFree(p_sel);
+		n_sel = 0;
+		ProPrintfChar("USER_SELECT: failed to copy selection\n");
+		return PRO_TK_GENERAL_ERROR;
+	}
+
+
+	Variable* existing_v = get_symbol(st, node->reference);
+	ProSelection old_sel = NULL;  // Revised: Use local ProSelection for safe freeing
+	if (existing_v && existing_v->type == TYPE_REFERENCE) {
+		old_sel = (ProSelection)existing_v->data.reference.reference_value;  // Cast from void*
+		if (old_sel) {
+			ProError uh = ProSelectionUnhighlight(old_sel);
+			if (uh != PRO_TK_NO_ERROR) {
+				ProPrintfChar("USER_SELECT: warn: unhighlight(old) failed (%d)\n", (int)uh);
+			}
+			// Revised: Free the old selection to match UserSelectCallback's freeing style
+			ProSelectionFree(&old_sel);
+		}
+	}
+
+	/* 2) Creo usually leaves the just-picked thing highlighted; clear it now */
+	ProError uh_new = ProSelectionUnhighlight(picked);
+	if (uh_new != PRO_TK_NO_ERROR) {
+		ProPrintfChar("USER_SELECT: warn: unhighlight(new) failed (%d)\n", (int)uh_new);
+	}
+
+	/* Store as TYPE_REFERENCE so MEASURE_* can resolve it directly. */
+	Variable* v = existing_v;  // Revised: Reuse existing_v if present
+	if (!v) {
+		v = (Variable*)calloc(1, sizeof(*v));
+		if (!v) {
+			ProPrintfChar("USER_SELECT: OOM storing selection for '%s'\n", node->reference);
+			// Revised: Free the new picked selection on allocation failure, matching error handling in UserSelectCallback
+			ProSelection temp_picked = picked;
+			ProSelectionFree(&temp_picked);
+			picked = temp_picked;  // Update in case free sets to NULL (safety)
+			return PRO_TK_GENERAL_ERROR;
+		}
+		v->type = TYPE_REFERENCE;
+		set_symbol(st, node->reference, v);  // Set early for consistency
+	}
+	else {
+		if (v->type != TYPE_REFERENCE) {
+			/* Only free what actually exists for that type. */
+			if (v->type == TYPE_MAP && v->data.map) {
+				/* Prefer your deep free if you have one. */
+				/* free_hash_table(v->data.map); */  /* if available */
+				free(v->data.map);                   /* fallback */
+				v->data.map = NULL;
+			}
+			/* Optional: clear the union to avoid stale pointers from other types. */
+			memset(&v->data, 0, sizeof(v->data));
+			v->type = TYPE_REFERENCE;
+		}
+	}
+	v->data.reference.reference_value = (void*)picked;  // Cast to void* for storage
+
+	ProPrintfChar("USER_SELECT ok -> %s\n", node->reference);
+	return PRO_TK_NO_ERROR;
+}
 
 // In prepare_if_user_selects: pretag, then create 
 ProError prepare_if_user_selects(IfNode* node, DialogState* state, SymbolTable* st)
@@ -2335,6 +2514,10 @@ ProError execute_gui_command(CommandNode* node, DialogState* state, SymbolTable*
 	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
 		execute_user_select_multiple_optional_param((UserSelectMultipleOptionalNode*)node->data, state, st);
 		break;
+	case COMMAND_MEASURE_LENGTH:
+	{
+		return execute_measure_length((MeasureLengthNode*)node->data, st);
+	}
 	case COMMAND_BEGIN_TABLE:
 		execute_begin_table((TableNode*)node->data, state, st);
 		break;
@@ -2560,7 +2743,7 @@ ProError execute_gui_block(Block* gui_block, SymbolTable* st, BlockList* block_l
 
 }
 
-void execute_config_elem(CommandData* config, SymbolTable* st, BlockList* block_list)
+ProError execute_config_elem(CommandData* config, SymbolTable* st, BlockList* block_list)
 {
 
 	// Process Config_elem options (e.g., NO_TABLES, SCREEN_LOCATION)
@@ -2593,11 +2776,12 @@ void execute_config_elem(CommandData* config, SymbolTable* st, BlockList* block_
 	}
 	
 
-
+	return PRO_TK_NO_ERROR;
 }
 
 // Executor for DECLARE_VARIABLE (handles declarations and redeclarations with duplication warning)
 ProError execute_declare_variable(DeclareVariableNode* node, SymbolTable* st) {
+	ProGenericMsg(L"-------------------EXECUTING_DECLARE_VARIABLE----------------------");
 	if (!node || !node->name) return PRO_TK_BAD_INPUTS;
 	VariableType mapped_type = map_variable_type(node->var_type, (node->var_type == VAR_PARAMETER ? node->data.parameter.subtype : PARAM_INT));
 	if (mapped_type == -1) {
@@ -2774,6 +2958,441 @@ ProError execute_declare_variable(DeclareVariableNode* node, SymbolTable* st) {
 	return PRO_TK_NO_ERROR;
 }
 
+/* --- helpers ------------------------------------------------------------ */
+
+/* unified resolver for distance/length/etc. */
+static ProError sel_from_expr(ExpressionNode* expr, SymbolTable* st,
+	ProSelection* out_sel, const char* argname)
+{
+	*out_sel = NULL;
+
+	char* name = NULL;
+	if (evaluate_to_string(expr, st, &name) != 0 || !name || !*name) {
+		ProPrintfChar("SEL_RESOLVE: %s did not evaluate to a name\n", argname);
+		free(name);
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	Variable* v = get_symbol(st, name);
+	if (!v) {
+		ProPrintfChar("SEL_RESOLVE: name '%s' not found\n", name);
+		free(name);
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	/* 1) plain TYPE_REFERENCE */
+	if (v->type == TYPE_REFERENCE && v->data.reference.reference_value) {
+		*out_sel = v->data.reference.reference_value;
+		free(name);
+		return PRO_TK_NO_ERROR;
+	}
+
+	/* 2) MAP{ reference_value := TYPE_REFERENCE } */
+	if (v->type == TYPE_MAP && v->data.map) {
+		Variable* sub = hash_table_lookup(v->data.map, "reference_value");
+		if (sub && sub->type == TYPE_REFERENCE && sub->data.reference.reference_value) {
+			*out_sel = sub->data.reference.reference_value;
+			free(name);
+			return PRO_TK_NO_ERROR;
+		}
+	}
+
+	/* 3) ARRAY[0] is TYPE_REFERENCE */
+	if (v->type == TYPE_ARRAY && v->data.array.size > 0) {
+		Variable* first = v->data.array.elements[0];
+		if (first && first->type == TYPE_REFERENCE && first->data.reference.reference_value) {
+			*out_sel = first->data.reference.reference_value;
+			free(name);
+			return PRO_TK_NO_ERROR;
+		}
+	}
+
+	ProPrintfChar("SEL_RESOLVE: '%s' is not a valid reference (name=%s, type=%d)\n",
+		argname, name, v->type);
+	free(name);
+	return PRO_TK_BAD_INPUTS;
+}
+
+/* Helper: duplicate identifier from an expression that MUST be a variable ref */
+static int expr_to_identifier(ExpressionNode* e, char** out_name) {
+	if (!e || !out_name) return -1;
+	if (e->type != EXPR_VARIABLE_REF || !e->data.string_val || !*e->data.string_val) return -1;
+	*out_name = _strdup(e->data.string_val);
+	return (*out_name ? 0 : -1);
+}
+
+static size_t map_type_string_to_candidates(const char* t, ProType out[], size_t out_cap)
+{
+	if (!t || !out || out_cap == 0) return 0;
+	size_t n = 0;
+
+	/* Add synonyms as needed; order = preference for ByNameInit */
+	if (_stricmp(t, "PLANE") == 0 || _stricmp(t, "DATUM_PLANE") == 0 || _stricmp(t, "DTMPLN") == 0) {
+		if (n < out_cap) out[n++] = PRO_DATUM_PLANE;      /* datum plane feature */
+		if (n < out_cap) out[n++] = PRO_SURFACE;     /* some models name the surface */
+	}
+	else if (_stricmp(t, "CURVE") == 0) {
+		if (n < out_cap) out[n++] = PRO_CURVE;
+	}
+	else if (_stricmp(t, "AXIS") == 0) {
+		if (n < out_cap) out[n++] = PRO_AXIS;
+	}
+	else if (_stricmp(t, "CSYS") == 0 || _stricmp(t, "COORD_SYS") == 0) {
+		if (n < out_cap) out[n++] = PRO_CSYS;
+	}
+	else if (_stricmp(t, "SURFACE") == 0) {
+		if (n < out_cap) out[n++] = PRO_SURFACE;
+	}
+	else if (_stricmp(t, "EDGE") == 0) {
+		if (n < out_cap) out[n++] = PRO_EDGE;
+	}
+	else if (_stricmp(t, "POINT") == 0 || _stricmp(t, "VERTEX") == 0) {
+		if (n < out_cap) out[n++] = PRO_POINT;       /* datum point (vertices rarely have names) */
+	}
+	else if (_stricmp(t, "FEATURE") == 0 || _stricmp(t, "FEAT") == 0) {
+		if (n < out_cap) out[n++] = PRO_FEATURE;
+	}
+
+	return n;
+}
+
+static ProError selection_from_item(ProMdl mdl, const ProModelitem* item, ProSelection* sel_out)
+{
+	if (!mdl || !item || !sel_out) return PRO_TK_GENERAL_ERROR;
+
+	ProMdlType mtype;
+	ProError e = ProMdlTypeGet(mdl, &mtype);
+	if (e != PRO_TK_NO_ERROR) return e;
+
+	if (mtype == PRO_ASSEMBLY) {
+		ProAsmcomppath acp;
+		e = ProAsmcomppathInit((ProSolid)mdl, NULL, 0, &acp);  /* root path: no ids */
+		if (e != PRO_TK_NO_ERROR) return e;
+		return ProSelectionAlloc(&acp, (ProModelitem*)item, sel_out);
+	}
+	else {
+		return ProSelectionAlloc(NULL, (ProModelitem*)item, sel_out);
+	}
+}
+
+ProError execute_search_mdl_ref(SearchMdlRefNode* node, SymbolTable* st)
+{
+	ProGenericMsg(L"-------------------EXECUTING SEARCH_MDL_REF------------------------");
+	if (!node || !st) return PRO_TK_GENERAL_ERROR;
+
+	/* 1) Resolve model (supports THIS) */
+	ProMdl mdl = NULL; ProMdlName mdl_name = L"";
+	ProError status = EPA_ResolveModelArg(node->model, st, &mdl, mdl_name);
+	if (status != PRO_TK_NO_ERROR || !mdl) {
+		int catching = 0; (void)st_get_int(st, "__CATCH_ACTIVE", &catching);
+		st_put_int(st, "__LAST_ERROR", (int)(status ? status : PRO_TK_E_NOT_FOUND));
+		ProPrintfChar("SEARCH_MDL_REF: model could not be resolved; %s\n",
+			catching ? "continuing in CATCH" : "aborting");
+		return catching ? (status ? status : PRO_TK_E_NOT_FOUND) : PRO_TK_ABORT;
+	}
+
+	/* 2) Evaluate "type" and "search_string" */
+	char* type_str = NULL;
+	char* search_str = NULL;
+	if (evaluate_to_string(node->type_expr, st, &type_str) != 0 || !type_str) {
+		ProPrintfChar("SEARCH_MDL_REF: type must be a string\n");
+		return PRO_TK_GENERAL_ERROR;
+	}
+	if (evaluate_to_string(node->search_string, st, &search_str) != 0 || !search_str) {
+		free(type_str);
+		ProPrintfChar("SEARCH_MDL_REF: search_string must be a string\n");
+		return PRO_TK_GENERAL_ERROR;
+	}
+
+	/* 3) Map the 'type' token from the script into candidate ProType(s) */
+	ProType candidates[4];
+	size_t cand_count = map_type_string_to_candidates(type_str, candidates, sizeof(candidates) / sizeof(candidates[0]));
+	if (cand_count == 0) {
+		ProPrintfChar("SEARCH_MDL_REF: unsupported type '%s'\n", type_str);
+		free(type_str); free(search_str);
+		return PRO_TK_E_NOT_FOUND;
+	}
+
+	/* 4) Fast path: exact-name lookup using ProModelitemByNameInit */
+	ProModelitem found = { 0 };
+	ProError found_status = PRO_TK_E_NOT_FOUND;
+
+	/* (Optional future) Handle FID:/GID: forms up front here.
+	   e.g., if (_strnicmp(search_str,"FID:",4)==0) { ... ProFeatureInit ... }
+	   e.g., if (_strnicmp(search_str,"GID:",4)==0) { ... ProGeomitemInit ... }
+	   For now, we implement robust name-based search.
+	*/
+
+	ProName wname;
+	ProStringToWstring(wname, search_str);
+
+	for (size_t i = 0; i < cand_count; ++i) {
+		ProModelitem mi = { 0 };
+		ProError e = ProModelitemByNameInit(mdl, candidates[i], wname, &mi);
+		if (e == PRO_TK_NO_ERROR) {
+			found = mi;
+			found_status = PRO_TK_NO_ERROR;
+			break;
+		}
+	}
+
+	/* (Optional future) If not found and search_str has '*' or '?',
+	   iterate items of the requested types (ProSolidFeatVisit/ProFeatureGeomitemVisit)
+	   and do a wildcard match before giving up.
+	*/
+
+	if (found_status != PRO_TK_NO_ERROR) {
+		int catching = 0; (void)st_get_int(st, "__CATCH_ACTIVE", &catching);
+		st_put_int(st, "__LAST_ERROR", (int)PRO_TK_E_NOT_FOUND);
+		ProPrintfChar("SEARCH_MDL_REF: no match; %s\n",
+			catching ? "continuing in CATCH" : "aborting");
+		return catching ? PRO_TK_E_NOT_FOUND : PRO_TK_ABORT;
+	}
+
+	/* 5) Build a selection with correct assembly context, store it into the symbol table */
+	ProSelection sel = NULL;
+	status = selection_from_item(mdl, &found, &sel);
+	if (status != PRO_TK_NO_ERROR || !sel) {
+		ProPrintfChar("SEARCH_MDL_REF: failed to create selection for '%s'\n", search_str);
+		free(type_str); free(search_str);
+		return status ? status : PRO_TK_GENERAL_ERROR;
+	}
+
+	Variable* v = (Variable*)calloc(1, sizeof(Variable));
+	if (!v) {
+		ProSelectionFree(&sel);
+		free(type_str); free(search_str);
+		return PRO_TK_GENERAL_ERROR;
+	}
+	v->type = TYPE_REFERENCE;
+	v->data.reference.reference_value = sel;
+	v->data.reference.model = mdl;               /* optional: keep model with the ref */
+	v->data.reference.allowed_types = NULL;      /* not constraining here */
+	v->data.reference.allowed_count = 0;
+
+	set_symbol(st, node->out_reference, v);      /* overwrites & frees prior value if any */
+	ProPrintfChar("SEARCH_MDL_REF: stored '%s' (type '%s') from model '%S'\n",
+		node->out_reference, type_str, mdl_name);
+
+	free(type_str);
+	free(search_str);
+	return PRO_TK_NO_ERROR;
+}
+
+static int sel_is_ok_for_distance(ProSelection s) {
+	ProModelitem mi;
+	if (ProSelectionModelitemGet(s, &mi) != PRO_TK_NO_ERROR) return 0;
+	/* planes (datum), planar faces, axes, points */
+	return (mi.type == PRO_DATUM_PLANE ||
+		mi.type == PRO_SURFACE ||
+		mi.type == PRO_AXIS ||
+		mi.type == PRO_POINT);
+}
+
+ProError execute_measure_distance(MeasureDistanceNode* node, SymbolTable* st)
+{
+	if (!node || !st) return PRO_TK_BAD_INPUTS;
+
+	/* 1) Resolve the two selections by name from the symbol table */
+	ProSelection s1 = NULL, s2 = NULL;
+	ProError e = sel_from_expr(node->reference1, st, &s1, "reference1");
+	if (e != PRO_TK_NO_ERROR) return e;
+	e = sel_from_expr(node->reference2, st, &s2, "reference2");
+	if (e != PRO_TK_NO_ERROR) return e;
+
+	/* 2) Validate supported kinds to prevent edges/curves from slipping in */
+	if (!sel_is_ok_for_distance(s1) || !sel_is_ok_for_distance(s2)) {
+		ProPrintfChar("MEASURE_DISTANCE: inputs must be point/axis/planar surface (datum plane).\n");
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	/* 3) Evaluate distance */
+	double dist = 0.0;
+	ProError status = ProGeomitemDistanceEval(s1, s2, &dist);
+	if (status != PRO_TK_NO_ERROR) return status;
+
+	/* 4) Store into output parameter (robust if not predeclared) */
+	char* out_name = NULL;
+	if (expr_to_identifier(node->parameterResult, &out_name) != 0) {
+		ProPrintfChar("MEASURE_DISTANCE: parameterResult must be an identifier\n");
+		return PRO_TK_BAD_INPUTS;
+	}
+
+
+	Variable* out = get_symbol(st, out_name);
+	if (!out) {
+		out = (Variable*)calloc(1, sizeof(Variable));
+		if (!out) { free(out_name); return PRO_TK_GENERAL_ERROR; }
+		out->type = TYPE_DOUBLE;
+		out->data.double_value = dist;
+		set_symbol(st, out_name, out);
+	}
+	else if (out->type == TYPE_DOUBLE) {
+		out->data.double_value = dist;
+	}
+	else if (out->type == TYPE_INTEGER || out->type == TYPE_BOOL) {
+		out->data.int_value = (int)dist;  /* permissive numeric coercion */
+	}
+	else {
+		ProPrintfChar("MEASURE_DISTANCE: result '%s' exists but is not numeric (type=%d)\n", out_name, out->type);
+		free(out_name);
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	ProPrintfChar("MEASURE_DISTANCE: %s = %.6f\n", out_name, dist);
+	free(out_name);
+	return PRO_TK_NO_ERROR;
+}
+
+
+
+static int sel_is_ok_for_length(ProSelection s)
+{
+	ProModelitem mi;
+	if (ProSelectionModelitemGet(s, &mi) != PRO_TK_NO_ERROR) return 0;
+	return (mi.type == PRO_EDGE || mi.type == PRO_CURVE);
+}
+
+/* Return length from a selection that resolves to EDGE or CURVE */
+static ProError length_from_selection(ProSelection s, double* out_len)
+{
+	if (!s || !out_len) return PRO_TK_BAD_INPUTS;
+
+	ProModelitem mi;
+	ProError e = ProSelectionModelitemGet(s, &mi);
+	if (e != PRO_TK_NO_ERROR) return e;
+
+	if (mi.type == PRO_EDGE) {
+		ProEdge edge;
+		e = ProEdgeInit((ProSolid)mi.owner, mi.id, &edge);       /* <ProEdge.h> */
+		if (e != PRO_TK_NO_ERROR) return e;
+		return ProEdgeLengthEval(edge, out_len);                 /* <ProEdge.h> */
+	}
+	else if (mi.type == PRO_CURVE) {
+		ProCurve curve;
+		e = ProCurveInit((ProSolid)mi.owner, mi.id, &curve);     /* <ProCurve.h> */
+		if (e != PRO_TK_NO_ERROR) return e;
+		return ProCurveLengthEval(curve, out_len);               /* <ProCurve.h> */
+	}
+
+	return PRO_TK_BAD_INPUTS;
+}
+
+/* MEASURE_LENGTH executor */
+ProError execute_measure_length(MeasureLengthNode* node, SymbolTable* st)
+{
+	if (!node || !st) return PRO_TK_BAD_INPUTS;
+
+	/* 1) Resolve the selection by name from the symbol table */
+	ProSelection s = NULL;
+	ProError e = sel_from_expr(node->reference1, st, &s, "reference1");
+	if (e != PRO_TK_NO_ERROR) return e;
+
+	/* 2) Validate supported kinds (edge or curve only) */
+	if (!sel_is_ok_for_length(s)) {
+		ProPrintfChar("MEASURE_LENGTH: input must be an EDGE or CURVE.\n");
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	/* 3) Evaluate length via typed handle (edge/curve) */
+	double len = 0.0;
+	ProError status = length_from_selection(s, &len);
+	if (status != PRO_TK_NO_ERROR) return status;
+
+	/* 4) Store into output parameter (same policy as distance) */
+	char* out_name = NULL;
+	if (expr_to_identifier(node->parameterResult, &out_name) != 0) {
+		ProPrintfChar("MEASURE_LENGTH: parameterResult must be an identifier\n");
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	Variable* out = get_symbol(st, out_name);
+	if (!out) {
+		out = (Variable*)calloc(1, sizeof(Variable));
+		if (!out) { free(out_name); return PRO_TK_GENERAL_ERROR; }
+		out->type = TYPE_DOUBLE;
+		out->data.double_value = len;
+		set_symbol(st, out_name, out);
+	}
+	else if (out->type == TYPE_DOUBLE) {
+		out->data.double_value = len;
+	}
+	else if (out->type == TYPE_INTEGER || out->type == TYPE_BOOL) {
+		out->data.int_value = (int)len;  /* permissive numeric coercion */
+	}
+	else {
+		ProPrintfChar("MEASURE_LENGTH: result '%s' exists but is not numeric (type=%d)\n", out_name, out->type);
+		free(out_name);
+		return PRO_TK_BAD_INPUTS;
+	}
+
+	ProPrintfChar("MEASURE_LENGTH: %s = %.6f\n", out_name, len);
+	free(out_name);
+	return PRO_TK_NO_ERROR;
+}
+
+ProError execute_begin_catch_error_ctx(CatchErrorNode* node, ExecContext* ctx)
+{
+	if (!node || !ctx || !ctx->st) return PRO_TK_BAD_INPUTS;
+
+	/* Save old flags */
+	int had_active = 0, old_active = 0;
+	int had_udf = 0, old_udf = 0;
+	int had_comp = 0, old_comp = 0;
+	int had_last = 0, old_last = 0;
+
+	had_active = st_get_int(ctx->st, "__CATCH_ACTIVE", &old_active);
+	had_udf = st_get_int(ctx->st, "__CATCH_FIX_FAIL_UDF", &old_udf);
+	had_comp = st_get_int(ctx->st, "__CATCH_FIX_FAIL_COMPONENT", &old_comp);
+	had_last = st_get_int(ctx->st, "__LAST_ERROR", &old_last);
+
+	/* Arm catch mode for this block */
+	st_put_int(ctx->st, "__CATCH_ACTIVE", 1);
+	st_put_int(ctx->st, "__CATCH_FIX_FAIL_UDF", node->fix_fail_udf ? 1 : 0);
+	st_put_int(ctx->st, "__CATCH_FIX_FAIL_COMPONENT", node->fix_fail_component ? 1 : 0);
+	st_put_int(ctx->st, "__LAST_ERROR", 0);
+
+	/* Run nested commands; swallow runtime errors and continue */
+	ProError agg = PRO_TK_NO_ERROR;
+	for (size_t i = 0; i < node->command_count; ++i)
+	{
+		CommandNode* inner = node->commands[i];
+		ProError rc = exec_command_in_context(inner, ctx);
+		if (rc != PRO_TK_NO_ERROR) {
+			if (rc == PRO_TK_ABORT) {      // <-- make abort uncatchable
+				// restore flags before you leave
+				if (had_active) st_put_int(ctx->st, "__CATCH_ACTIVE", old_active);
+				else            remove_symbol(ctx->st, "__CATCH_ACTIVE");
+				if (had_udf)    st_put_int(ctx->st, "__CATCH_FIX_FAIL_UDF", old_udf);
+				else            remove_symbol(ctx->st, "__CATCH_FIX_FAIL_UDF");
+				if (had_comp)   st_put_int(ctx->st, "__CATCH_FIX_FAIL_COMPONENT", old_comp);
+				else            remove_symbol(ctx->st, "__CATCH_FIX_FAIL_COMPONENT");
+				if (had_last)   st_put_int(ctx->st, "__LAST_ERROR", old_last);
+				else            remove_symbol(ctx->st, "__LAST_ERROR");
+				return PRO_TK_ABORT;
+			}
+			ProPrintfChar("BEGIN_CATCH_ERROR: caught error %d; continuing\n", (int)rc);
+			st_put_int(ctx->st, "__LAST_ERROR", (int)rc);
+			agg = PRO_TK_NO_ERROR; // swallow non-fatal
+		}
+	}
+
+	/* Restore old flags */
+	if (had_active) st_put_int(ctx->st, "__CATCH_ACTIVE", old_active);
+	else            remove_symbol(ctx->st, "__CATCH_ACTIVE");
+
+	if (had_udf)    st_put_int(ctx->st, "__CATCH_FIX_FAIL_UDF", old_udf);
+	else            remove_symbol(ctx->st, "__CATCH_FIX_FAIL_UDF");
+
+	if (had_comp)   st_put_int(ctx->st, "__CATCH_FIX_FAIL_COMPONENT", old_comp);
+	else            remove_symbol(ctx->st, "__CATCH_FIX_FAIL_COMPONENT");
+
+	if (had_last)   st_put_int(ctx->st, "__LAST_ERROR", old_last);
+	else            remove_symbol(ctx->st, "__LAST_ERROR");
+
+	return agg;
+}
+
 // Executor for INVALIDATE_PARAM
 ProError execute_invalidate_param(InvalidateParamNode* node, SymbolTable* st) {
 	if (!node || !st) {
@@ -2797,28 +3416,113 @@ ProError execute_invalidate_param(InvalidateParamNode* node, SymbolTable* st) {
 	return 0;
 }
 
-ProError execute_command(CommandNode* node, SymbolTable* st, BlockList* block_list)
+/* Single source of truth for command dispatch. */
+ProError dispatch_core(CommandNode* node, ExecContext* ctx)
 {
+	int stop = 0; (void)st_get_int(ctx->st, "__GLOBAL_ABORT", &stop);
+	if (stop) return PRO_TK_ABORT;
+
+	if (!node || !ctx || !ctx->st) return PRO_TK_BAD_INPUTS;
+
 	switch (node->type)
 	{
 	case COMMAND_CONFIG_ELEM:
-		execute_config_elem(node->data, st, block_list);
-		break;
-	case COMMAND_DECLARE_VARIABLE:
-		execute_declare_variable((DeclareVariableNode*)node->data, st);
-		break;
-	case COMMAND_INVALIDATE_PARAM:
-		execute_invalidate_param((InvalidateParamNode*)node->data, st);
-		break;
+		return execute_config_elem((CommandData*)node->data, ctx->st, ctx->block_list);
+		
 	case COMMAND_IF:
-		execute_if((IfNode*)node->data, st, block_list, NULL);
-		break;
+		/* execute_if already accepts DialogState* as the last arg */
+		return execute_if((IfNode*)node->data, ctx->st, ctx->block_list, ctx->ui);
+
+	case COMMAND_DECLARE_VARIABLE:
+		return execute_declare_variable((DeclareVariableNode*)node->data, ctx->st);
+
 	case COMMAND_ASSIGNMENT:
-		execute_assignment((AssignmentNode*)node->data, st, block_list);
-		break;
+		return execute_assignment((AssignmentNode*)node->data, ctx->st, ctx->block_list);
+
+	case COMMAND_BEGIN_CATCH_ERROR:
+		return execute_begin_catch_error_ctx((CatchErrorNode*)node->data, ctx);
+
+		/* ----- Commands with “fatal unless caught” semantics ----- */
+	case COMMAND_SEARCH_MDL_REF:
+	{
+		ProError s = execute_search_mdl_ref((SearchMdlRefNode*)node->data, ctx->st);
+		/* Enforce: cancel execution unless wrapped by BEGIN_CATCH_ERROR */
+		return escalate_if_uncaught(ctx, s);
 	}
 
-	return PRO_TK_NO_ERROR;
+	case COMMAND_MEASURE_DISTANCE:
+	{
+		return execute_measure_distance((MeasureDistanceNode*)node->data, ctx->st);
+	}
+	case COMMAND_MEASURE_LENGTH:
+	{
+		return execute_measure_length((MeasureLengthNode*)node->data, ctx->st);
+	}
+
+
+	/* ----- GUI-aware commands (call UI path iff ctx->ui is present) ----- */
+	case COMMAND_SHOW_PARAM:
+		return (ctx->ui)
+			? execute_show_param((ShowParamNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+	case COMMAND_CHECKBOX_PARAM:
+		return (ctx->ui)
+			? execute_checkbox_param((CheckboxParamNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+	case COMMAND_RADIOBUTTON_PARAM:
+		return (ctx->ui)
+			? execute_radiobutton_param((RadioButtonParamNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+	case COMMAND_USER_INPUT_PARAM:
+		return (ctx->ui)
+			? execute_user_input_param((UserInputParamNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+	case COMMAND_USER_SELECT:
+		return (ctx->ui)
+			? execute_user_select_param((UserSelectNode*)node->data, ctx->ui, ctx->st)
+			: execute_user_select_headless((UserSelectNode*)node->data, ctx->st);
+
+	case COMMAND_USER_SELECT_MULTIPLE:
+		return (ctx->ui)
+			? execute_user_select_multiple_param((UserSelectMultipleNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+	case COMMAND_USER_SELECT_OPTIONAL:
+		return (ctx->ui)
+			? execute_user_select_optional_param((UserSelectOptionalNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
+		return (ctx->ui)
+			? execute_user_select_multiple_optional_param((UserSelectMultipleOptionalNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+	case COMMAND_GLOBAL_PICTURE:
+		return (ctx->ui)
+			? execute_global_picture((GlobalPictureNode*)node->data, ctx->ui, ctx->st)
+			: PRO_TK_NO_ERROR;
+
+		/* ----- Add other command cases here as needed ----- */
+
+	default:
+		/* Preserve current behavior for unknown/unsupported commands */
+		return PRO_TK_NO_ERROR;
+	}
+}
+
+ProError execute_command(CommandNode* node, SymbolTable* st, BlockList* block_list)
+{
+	ExecContext tmp;
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.st = st;
+	tmp.block_list = block_list;
+	tmp.ui = NULL;   /* headless path */
+	tmp.reactive = 0;
+	return dispatch_core(node, &tmp);
 }
 
 /* ---------- helpers: symbol-table map access (local-only) ---------- */
@@ -3266,64 +3970,7 @@ static ProError recompute_if_gates_only(Block* blk, ExecContext* ctx)
 
 ProError exec_command_in_context(CommandNode* node, ExecContext* ctx)
 {
-	if (!node || !ctx || !ctx->st) return PRO_TK_BAD_INPUTS;
-
-	switch (node->type)
-	{
-	case COMMAND_IF:
-		return execute_if_ctx((IfNode*)node->data, ctx);
-
-		// --- GUI-aware commands 
-	case COMMAND_SHOW_PARAM:
-		return (ctx->ui ? execute_show_param((ShowParamNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_CHECKBOX_PARAM:
-		return (ctx->ui ? execute_checkbox_param((CheckboxParamNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_USER_INPUT_PARAM:
-		return (ctx->ui ? execute_user_input_param((UserInputParamNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_RADIOBUTTON_PARAM:
-		return (ctx->ui ? execute_radiobutton_param((RadioButtonParamNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_USER_SELECT:
-		return (ctx->ui ? execute_user_select_param((UserSelectNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_USER_SELECT_OPTIONAL:
-		return (ctx->ui ? execute_user_select_optional_param((UserSelectOptionalNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_USER_SELECT_MULTIPLE:
-		return(ctx->ui ? execute_user_select_multiple_param((UserSelectMultipleNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
-		return (ctx->ui ? execute_user_select_multiple_optional_param((UserSelectMultipleOptionalNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_GLOBAL_PICTURE:
-		return (ctx->ui ? execute_global_picture((GlobalPictureNode*)node->data, ctx->ui, ctx->st)
-			: execute_command(node, ctx->st, ctx->block_list));
-
-	case COMMAND_SUB_PICTURE:
-		return execute_sub_picture((SubPictureNode*)node->data, ctx->st);
-
-		// --- non-GUI core commands 
-	case COMMAND_DECLARE_VARIABLE:
-		return execute_declare_variable((DeclareVariableNode*)node->data, ctx->st);
-
-	case COMMAND_ASSIGNMENT:
-		return execute_assignment((AssignmentNode*)node->data, ctx->st, ctx->block_list);
-
-	default:
-		// Fallback to your existing dispatcher so new commands keep working 
-		return execute_command(node, ctx->st, ctx->block_list);
-	}
+	return dispatch_core(node, ctx);
 }
 
 ProError execute_if_ctx(IfNode* node, ExecContext* ctx)
@@ -3453,18 +4100,25 @@ ProError execute_if(IfNode* node, SymbolTable* st, BlockList* block_list, Dialog
 }
 
 // Function to execute all commands in the ASM block
-void execute_asm_block(Block* asm_block, SymbolTable* st, BlockList* block_list)
-{
-	/* NEW: top-level executes outside any IF; make that explicit */
+ProError execute_asm_block(Block* asm_block, SymbolTable* st, BlockList* block_list) {
+	if (!asm_block || !st) return PRO_TK_BAD_INPUTS;
+
+	/* optional: reset per-run markers */
 	st_put_int(st, "__CURRENT_IF_ID", 0);
 
-	for (size_t i = 0; i < asm_block->command_count; i++)
-	{
-		CommandNode* cmd = asm_block->commands[i];
-		execute_command(cmd, st, block_list);
-	}
-}
+	ExecContext ctx = { 0 };
+	ctx.st = st; ctx.block_list = block_list; ctx.ui = NULL;
 
+	for (size_t i = 0; i < asm_block->command_count; ++i) {
+		ProError s = exec_command_in_context(asm_block->commands[i], &ctx);
+		if (s != PRO_TK_NO_ERROR) {
+			ProPrintfChar("Stopping due to error: %s\n", pro_error_to_string(s));
+			st_put_int(st, "__GLOBAL_ABORT", 1);   // <— flip kill-switch
+			return s == PRO_TK_ABORT ? PRO_TK_ABORT : PRO_TK_GENERAL_ERROR;
+		}
+	}
+	return PRO_TK_NO_ERROR;
+}
 
 
 /* -------------------------------------------------------------------------
