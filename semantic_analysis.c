@@ -23,7 +23,13 @@ static const char* command_names[] = {
 	[COMMAND_FOR] = "FOR",
 	[COMMAND_WHILE] = "WHILE",
 	[COMMAND_ASSIGNMENT] = "ASSIGNMENT",
-	[COMMAND_EXPRESSION] = "EXPRESSION"
+	[COMMAND_EXPRESSION] = "EXPRESSION",
+	[COMMAND_MEASURE_DISTANCE] = "MEASURE_DISTANCE",
+	[COMMAND_MEASURE_LENGTH] = "MEASURE_LENGTH",
+	[COMMAND_SEARCH_MDL_REF] = "SEARCH_MDL_REF",
+	[COMMAND_SEARCH_MDL_REFS] = "SEARCH_MDL_REFS",
+	[COMMAND_BEGIN_CATCH_ERROR] = "BEGIN_CATCH_ERROR",
+
 	// Extend this array if additional CommandType values are defined in syntaxanalysis.h.
 };
 
@@ -346,6 +352,10 @@ int evaluate_to_string(ExpressionNode* expr, SymbolTable* st, char** result) {
 			case TYPE_NULL:
 				*result = NULL;
 				return 0;
+			case TYPE_REFERENCE:
+				/* Treat reference variables as identifier-like when stringified */
+				*result = _strdup(expr->data.string_val);
+				return *result ? 0 : -1;
 			case TYPE_ARRAY:
 				/* Treat references to tables (TYPE_ARRAY) as literal identifiers */
 				*result = _strdup(expr->data.string_val);
@@ -4273,6 +4283,482 @@ int check_if_semantics(IfNode* node, SymbolTable* st) {
 	return 0;
 }
 
+int check_measure_distance_semantics(MeasureDistanceNode* node, SymbolTable* st)
+{
+	if (!node || !st) {
+		LogOnlyPrintfChar("Error: Invalid MEASURE_DISTANCE inputs\n");
+		return -1;
+	}
+
+	/* 0) Basic shape: two refs + an identifier result */
+	if (!node->reference1 || !node->reference2) {
+		LogOnlyPrintfChar("Error: MEASURE_DISTANCE requires two references\n");
+		return -1;
+	}
+	if (!node->parameterResult || node->parameterResult->type != EXPR_VARIABLE_REF) {
+		LogOnlyPrintfChar("Error: parameterResult must be an identifier in MEASURE_DISTANCE\n");
+		return -1;
+	}
+	const char* out_name = node->parameterResult->data.string_val;
+	if (!out_name) {
+		LogOnlyPrintfChar("Error: Invalid result identifier in MEASURE_DISTANCE\n");
+		return -1;
+	}
+	if (get_symbol(st, out_name)) {
+		LogOnlyPrintfChar("Error: Result parameter '%s' already exists\n", out_name);
+		return -1;
+	}
+
+	/* 1) Resolve reference expressions to variable names */
+	char* ref1_name = NULL;
+	char* ref2_name = NULL;
+	if (evaluate_to_string(node->reference1, st, &ref1_name) != 0 || !ref1_name || !*ref1_name) {
+		LogOnlyPrintfChar("Error: reference1 must resolve to a variable name\n");
+		free(ref1_name);
+		return -1;
+	}
+	if (evaluate_to_string(node->reference2, st, &ref2_name) != 0 || !ref2_name || !*ref2_name) {
+		LogOnlyPrintfChar("Error: reference2 must resolve to a variable name\n");
+		free(ref1_name); free(ref2_name);
+		return -1;
+	}
+
+	/* 2) Both names must be declared TYPE_REFERENCE */
+	Variable* ref1_var = get_symbol(st, ref1_name);
+	Variable* ref2_var = get_symbol(st, ref2_name);
+	if (!ref1_var || ref1_var->type != TYPE_REFERENCE) {
+		LogOnlyPrintfChar("Error: '%s' is not a reference variable\n", ref1_name);
+		free(ref1_name); free(ref2_name);
+		return -1;
+	}
+	if (!ref2_var || ref2_var->type != TYPE_REFERENCE) {
+		LogOnlyPrintfChar("Error: '%s' is not a reference variable\n", ref2_name);
+		free(ref1_name); free(ref2_name);
+		return -1;
+	}
+
+	/* 3) Read (optional) declared Creo kinds persisted at declare-time */
+	CreoReferenceType ref1_kind = CREO_UNKNOWN, ref2_kind = CREO_UNKNOWN;
+	{
+		char k1[256], k2[256];
+		snprintf(k1, sizeof(k1), "_ref_kind_%s", ref1_name);
+		snprintf(k2, sizeof(k2), "_ref_kind_%s", ref2_name);
+		Variable* k1v = get_symbol(st, k1);
+		Variable* k2v = get_symbol(st, k2);
+		if (k1v && k1v->type == TYPE_INTEGER) ref1_kind = (CreoReferenceType)k1v->data.int_value;
+		if (k2v && k2v->type == TYPE_INTEGER) ref2_kind = (CreoReferenceType)k2v->data.int_value;
+	}
+	if (ref1_kind == CREO_UNKNOWN) LogOnlyPrintfChar("Note: kind of '%s' not known at semantics; will validate at runtime\n", ref1_name);
+	if (ref2_kind == CREO_UNKNOWN) LogOnlyPrintfChar("Note: kind of '%s' not known at semantics; will validate at runtime\n", ref2_name);
+
+	/* 4) Predeclare the output as a DOUBLE so subsequent commands can see it */
+	Variable* out_param = (Variable*)malloc(sizeof(Variable));
+	if (!out_param) { free(ref1_name); free(ref2_name); return -1; }
+	out_param->type = TYPE_DOUBLE;
+	out_param->data.double_value = 0.0;
+	out_param->display_options = NULL;
+	set_symbol(st, out_name, out_param);
+
+	/* 5) Build an execution record for the runtime (options + refs + kinds + out name) */
+	HashTable* md_map = create_hash_table(8);
+	if (!md_map) { free(ref1_name); free(ref2_name); return -1; }
+
+	if (!add_int_to_map(md_map, "enable_cb1", node->enable_cb1 ? 1 : 0)) { free_hash_table(md_map); free(ref1_name); free(ref2_name); return -1; }
+	if (!add_int_to_map(md_map, "enable_cb2", node->enable_cb2 ? 1 : 0)) { free_hash_table(md_map); free(ref1_name); free(ref2_name); return -1; }
+
+	/* Keep raw AST expressions so executor can re-evaluate at runtime */
+	Variable* r1_expr = (Variable*)malloc(sizeof(Variable));
+	Variable* r2_expr = (Variable*)malloc(sizeof(Variable));
+	if (!r1_expr || !r2_expr) { free(r1_expr); free(r2_expr); free_hash_table(md_map); free(ref1_name); free(ref2_name); return -1; }
+	r1_expr->type = TYPE_EXPR; r1_expr->data.expr = node->reference1; r1_expr->display_options = NULL;
+	r2_expr->type = TYPE_EXPR; r2_expr->data.expr = node->reference2; r2_expr->display_options = NULL;
+	hash_table_insert(md_map, "reference1_expr", r1_expr);
+	hash_table_insert(md_map, "reference2_expr", r2_expr);
+
+	/* Persist for logging & downstream use */
+	(void)add_string_to_map(md_map, "reference1_name", ref1_name);
+	(void)add_string_to_map(md_map, "reference2_name", ref2_name);
+	(void)add_string_to_map(md_map, "result_param", (char*)out_name);
+	if (ref1_kind != CREO_UNKNOWN) (void)add_int_to_map(md_map, "ref1_kind", (int)ref1_kind);
+	if (ref2_kind != CREO_UNKNOWN) (void)add_int_to_map(md_map, "ref2_kind", (int)ref2_kind);
+
+	/* 6) Store under a unique key for the executor */
+	Variable* md_var = (Variable*)malloc(sizeof(Variable));
+	if (!md_var) { free_hash_table(md_map); free(ref1_name); free(ref2_name); return -1; }
+	md_var->type = TYPE_MAP;
+	md_var->data.map = md_map;
+	md_var->display_options = NULL;
+
+	static unsigned s_md_counter = 0;
+	char key[64];
+	snprintf(key, sizeof(key), "MEASURE_DISTANCE_%u", ++s_md_counter);
+	set_symbol(st, key, md_var);
+
+	/* 7) Done */
+	free(ref1_name);
+	free(ref2_name);
+	return 0;
+}
+
+/* --- MEASURE_LENGTH semantic analysis --- */
+int check_measure_length_semantics(MeasureLengthNode* node, SymbolTable* st)
+{
+	if (!node || !st) {
+		LogOnlyPrintfChar("Error: Invalid MEASURE_LENGTH inputs\n");
+		return -1;
+	}
+
+	/* 0) parameterResult must be an identifier and must not exist yet */
+	if (!node->parameterResult || node->parameterResult->type != EXPR_VARIABLE_REF) {
+		LogOnlyPrintfChar("Error: parameterResult must be an identifier in MEASURE_LENGTH\n");
+		return -1;
+	}
+	char* out_name = node->parameterResult->data.string_val;
+	if (!out_name || !*out_name) {
+		LogOnlyPrintfChar("Error: Invalid result identifier in MEASURE_LENGTH\n");
+		return -1;
+	}
+	if (get_symbol(st, out_name)) {
+		LogOnlyPrintfChar("Error: Result parameter '%s' already exists\n", out_name);
+		return -1;
+	}
+
+	/* 1) Resolve reference1 to a variable name (same pattern as distance) */
+	char* ref1_name = NULL;
+	if (evaluate_to_string(node->reference1, st, &ref1_name) != 0 || !ref1_name || !*ref1_name) {
+		LogOnlyPrintfChar("Error: reference1 must resolve to a variable name\n");
+		free(ref1_name);
+		return -1;
+	}
+
+	/* 2) That name must refer to a TYPE_REFERENCE variable */
+	Variable* ref1_var = get_symbol(st, ref1_name);
+	if (!ref1_var ||
+		!(ref1_var->type == TYPE_REFERENCE ||
+			ref1_var->type == TYPE_MAP ||
+			ref1_var->type == TYPE_ARRAY)) {
+		LogOnlyPrintfChar("Error: '%s' is not a selectable holder (ref/map/array)\n", ref1_name);
+		free(ref1_name);
+		return -1;
+	}
+
+	/* 3) If a declare-time kind is known, enforce that it's length-capable */
+	/*    Accept EDGE or CURVE; if unknown we allow it and let runtime specialize. */
+	CreoReferenceType ref1_kind = CREO_UNKNOWN;
+	{
+		char k1[256];
+		snprintf(k1, sizeof(k1), "_ref_kind_%s", ref1_name);
+		Variable* k1v = get_symbol(st, k1);
+		if (k1v && k1v->type == TYPE_INTEGER) {
+			ref1_kind = (CreoReferenceType)k1v->data.int_value;
+			if (!(ref1_kind == CREO_EDGE || ref1_kind == CREO_CURVE)) {
+				LogOnlyPrintfChar("Error: MEASURE_LENGTH expects EDGE or CURVE; '%s' has kind=%d\n",
+					ref1_name, (int)ref1_kind);
+				free(ref1_name);
+				return -1;
+			}
+		}
+	}
+
+	/* 4) Build execution record map */
+	HashTable* rec = create_hash_table(16);
+	if (!rec) { free(ref1_name); return -1; }
+
+	/* reference1_expr (store the AST for executor), reference1_name, result_param */
+	{
+		Variable* vexpr = (Variable*)malloc(sizeof(Variable));
+		if (!vexpr) { free_hash_table(rec); free(ref1_name); return -1; }
+		vexpr->type = TYPE_EXPR;
+		vexpr->data.expr = node->reference1;
+		vexpr->display_options = NULL;
+		vexpr->declaration_count = 1;
+		(void)hash_table_insert(rec, "reference1_expr", vexpr);
+
+		(void)add_string_to_map(rec, "reference1_name", ref1_name);
+		(void)add_string_to_map(rec, "result_param", out_name);
+
+		if (ref1_kind != CREO_UNKNOWN) {
+			(void)add_int_to_map(rec, "reference1_kind", (int)ref1_kind);
+		}
+	}
+
+	/* 5) Wrap and publish under MEASURE_LENGTH_#### (mirrors distance) */
+	{
+		Variable* ml_var = (Variable*)malloc(sizeof(Variable));
+		if (!ml_var) { free_hash_table(rec); free(ref1_name); return -1; }
+		ml_var->type = TYPE_MAP;
+		ml_var->data.map = rec;
+		ml_var->display_options = NULL;
+		ml_var->declaration_count = 1;
+
+		static unsigned s_ml_counter = 0;
+		char key[64];
+		snprintf(key, sizeof(key), "MEASURE_LENGTH_%u", ++s_ml_counter);
+		set_symbol(st, key, ml_var);
+	}
+
+	/* done */
+	free(ref1_name);
+	return 0;
+}
+
+int check_search_mdl_ref_semantics(SearchMdlRefNode* node, SymbolTable* st)
+{
+	if (!node) { ProPrintfChar("Error: Invalid SEARCH_MDL_REF node\n"); return -1; }
+
+	/* 0) Validate and reserve the output reference name */
+	if (!node->out_reference || !is_valid_identifier(node->out_reference)) {
+		ProPrintfChar("Error: Invalid result reference identifier in SEARCH_MDL_REF\n");
+		return -1;
+	}
+	if (get_symbol(st, node->out_reference)) {
+		ProPrintfChar("Error: Reference '%s' already exists\n", node->out_reference);
+		return -1;
+	}
+
+	/* 1) Create an execution record map */
+	HashTable* rec = create_hash_table(32);
+	if (!rec) { ProPrintfChar("Error: OOM creating SEARCH_MDL_REF record\n"); return -1; }
+
+	/* 2) Options (flags) */
+	(void)add_bool_to_map(rec, "recursive", node->recursive);
+	(void)add_bool_to_map(rec, "allow_suppressed", node->allow_suppressed);
+	(void)add_bool_to_map(rec, "allow_simprep_suppressed", node->allow_simprep_suppressed);
+	(void)add_bool_to_map(rec, "exclude_inherited", node->exclude_inherited);
+	(void)add_bool_to_map(rec, "exclude_footer", node->exclude_footer);
+	(void)add_bool_to_map(rec, "no_update", node->no_update);
+
+	/* INCLUDE_MULTI_CAD <bool-ish expr> (default FALSE in parser) */
+	long inc_mc_int = 0;
+	if (node->include_multi_cad) {
+		if (evaluate_to_int(node->include_multi_cad, st, &inc_mc_int) != 0) {
+			ProPrintfChar("Error: INCLUDE_MULTI_CAD expects a boolean/int expression\n");
+			free_hash_table(rec); return -1;
+		}
+	}
+	(void)add_bool_to_map(rec, "include_multi_cad", (inc_mc_int != 0));
+
+	/* 3) Required positional arguments: model, "type", "search_string" */
+	char* model_s = NULL, * type_s = NULL, * search_s = NULL;
+
+	if (evaluate_to_string(node->model, st, &model_s) != 0 || !model_s || !*model_s) {
+		ProPrintfChar("Error: Invalid model expression in SEARCH_MDL_REF\n");
+		free_hash_table(rec); free(model_s); return -1;
+	}
+	if (evaluate_to_string(node->type_expr, st, &type_s) != 0 || !type_s || !*type_s) {
+		ProPrintfChar("Error: Invalid \"type\" expression in SEARCH_MDL_REF\n");
+		free_hash_table(rec); free(model_s); free(type_s); return -1;
+	}
+	if (evaluate_to_string(node->search_string, st, &search_s) != 0 || !search_s || !*search_s) {
+		ProPrintfChar("Error: Invalid \"search_string\" expression in SEARCH_MDL_REF\n");
+		free_hash_table(rec); free(model_s); free(type_s); free(search_s); return -1;
+	}
+
+	/* Store both raw exprs and their current string snapshots */
+	{
+		Variable* v;
+
+		v = (Variable*)malloc(sizeof(Variable));
+		v->type = TYPE_EXPR; v->data.expr = node->model; v->display_options = NULL; v->declaration_count = 1;
+		hash_table_insert(rec, "model_expr", v);
+
+		v = (Variable*)malloc(sizeof(Variable));
+		v->type = TYPE_EXPR; v->data.expr = node->type_expr; v->display_options = NULL; v->declaration_count = 1;
+		hash_table_insert(rec, "type_expr", v);
+
+		v = (Variable*)malloc(sizeof(Variable));
+		v->type = TYPE_EXPR; v->data.expr = node->search_string; v->display_options = NULL; v->declaration_count = 1;
+		hash_table_insert(rec, "search_expr", v);
+
+		v = (Variable*)malloc(sizeof(Variable));
+		v->type = TYPE_STRING; v->data.string_value = model_s; v->display_options = NULL; v->declaration_count = 1;
+		hash_table_insert(rec, "model", v);
+
+		v = (Variable*)malloc(sizeof(Variable));
+		v->type = TYPE_STRING; v->data.string_value = type_s; v->display_options = NULL; v->declaration_count = 1;
+		hash_table_insert(rec, "type", v);
+
+		v = (Variable*)malloc(sizeof(Variable));
+		v->type = TYPE_STRING; v->data.string_value = search_s; v->display_options = NULL; v->declaration_count = 1;
+		hash_table_insert(rec, "search_string", v);
+	}
+
+	/* 4) Optional filters (arrays of stringified expressions) */
+	if (node->with_content_count > 0) {
+		char** arr = (char**)calloc(node->with_content_count, sizeof(char*));
+		if (!arr) { free_hash_table(rec); return -1; }
+		for (size_t i = 0; i < node->with_content_count; ++i)
+			arr[i] = expression_to_string(node->with_content[i]);
+		(void)add_string_array_to_map(rec, "with_content", arr, node->with_content_count);
+		for (size_t i = 0; i < node->with_content_count; ++i) free(arr[i]);
+		free(arr);
+	}
+	if (node->with_content_not_count > 0) {
+		char** arr = (char**)calloc(node->with_content_not_count, sizeof(char*));
+		if (!arr) { free_hash_table(rec); return -1; }
+		for (size_t i = 0; i < node->with_content_not_count; ++i)
+			arr[i] = expression_to_string(node->with_content_not[i]);
+		(void)add_string_array_to_map(rec, "with_content_not", arr, node->with_content_not_count);
+		for (size_t i = 0; i < node->with_content_not_count; ++i) free(arr[i]);
+		free(arr);
+	}
+	if (node->with_identifier_count > 0) {
+		char** arr = (char**)calloc(node->with_identifier_count, sizeof(char*));
+		if (!arr) { free_hash_table(rec); return -1; }
+		for (size_t i = 0; i < node->with_identifier_count; ++i)
+			arr[i] = expression_to_string(node->with_identifier[i]);
+		(void)add_string_array_to_map(rec, "with_identifier", arr, node->with_identifier_count);
+		for (size_t i = 0; i < node->with_identifier_count; ++i) free(arr[i]);
+		free(arr);
+	}
+	if (node->with_identifier_not_count > 0) {
+		char** arr = (char**)calloc(node->with_identifier_not_count, sizeof(char*));
+		if (!arr) { free_hash_table(rec); return -1; }
+		for (size_t i = 0; i < node->with_identifier_not_count; ++i)
+			arr[i] = expression_to_string(node->with_identifier_not[i]);
+		(void)add_string_array_to_map(rec, "with_identifier_not", arr, node->with_identifier_not_count);
+		for (size_t i = 0; i < node->with_identifier_not_count; ++i) free(arr[i]);
+		free(arr);
+	}
+
+	/* 5) Infer (optional) expected reference kind from "type" */
+	CreoReferenceType expected = get_creo_ref_type(type_s);  /* unknown is fine */
+	(void)add_int_to_map(rec, "expected_ref_kind", (int)expected);
+
+	Variable* out_ref = (Variable*)calloc(1, sizeof(Variable));  // zero all fields
+	if (!out_ref) { free_hash_table(rec); return -1; }
+
+	out_ref->type = TYPE_REFERENCE;
+	out_ref->data.reference.allowed_types = NULL;  // explicit for clarity
+	out_ref->data.reference.allowed_count = 0;     // explicit for clarity
+	out_ref->data.reference.reference_value = NULL;
+	out_ref->data.reference.model = NULL;
+	out_ref->display_options = NULL;
+	out_ref->declaration_count = 1;
+
+	set_symbol(st, node->out_reference, out_ref);
+	
+
+	/* Persist kind tag under _ref_kind_<name> so later commands (e.g., MEASURE_DISTANCE)
+	   can validate compatible kinds even if this ref is late-bound. */
+	{
+		char kbuf[256]; snprintf(kbuf, sizeof(kbuf), "_ref_kind_%s", node->out_reference);
+		Variable* kindv = (Variable*)malloc(sizeof(Variable));
+		if (!kindv) { free_hash_table(rec); return -1; }
+		kindv->type = TYPE_INTEGER; kindv->data.int_value = (int)expected;
+		kindv->display_options = NULL; kindv->declaration_count = 1;
+		set_symbol(st, kbuf, kindv);
+	}
+
+	/* 7) Namespaced execution record so the runtime can locate/execute this command */
+	{
+		char rkey[256]; snprintf(rkey, sizeof(rkey), "SEARCH_MDL_REF:%s", node->out_reference);
+		Variable* recv = (Variable*)malloc(sizeof(Variable));
+		if (!recv) { free_hash_table(rec); return -1; }
+		recv->type = TYPE_MAP; recv->data.map = rec; recv->display_options = NULL; recv->declaration_count = 1;
+		set_symbol(st, rkey, recv);
+	}
+
+	ProPrintfChar("SEARCH_MDL_REF ok: model=\"%s\", type=\"%s\", search=\"%s\" -> %s\n",
+		model_s, type_s, search_s, node->out_reference);
+	return 0;
+}
+
+/*=================================================*\
+ *
+ * BEGIN_CATCH_ERROR semantic analysis
+ *
+ * Rules:
+ *  - Create or reuse three integer flags in the symbol table:
+ *      __CATCH_ACTIVE, __CATCH_FIX_FAIL_UDF, __CATCH_FIX_FAIL_COMPONENT
+ *  - Set them for the duration of this block, analyze all nested
+ *    commands, then restore previous values.
+ *  - This does not change the static types of nested statements; it
+ *    only exposes context for rules that want to branch on "catch mode".
+ *
+\*=================================================*/
+static int check_begin_catch_error_semantics(CatchErrorNode* node, SymbolTable* st)
+{
+	if (!node) {
+		ProPrintfChar("Error: Invalid BEGIN_CATCH_ERROR node\n");
+		return -1;
+	}
+
+	/* Acquire or create the three context flags as mutable integers. */
+	Variable* v_active = get_symbol(st, "__CATCH_ACTIVE");
+	if (!v_active) {
+		v_active = (Variable*)malloc(sizeof(Variable));
+		if (!v_active) { ProPrintfChar("Error: OOM for __CATCH_ACTIVE\n"); return -1; }
+		v_active->type = TYPE_INTEGER;
+		v_active->data.int_value = 0;
+		v_active->display_options = NULL;
+		v_active->declaration_count = 1;
+		set_symbol(st, "__CATCH_ACTIVE", v_active);
+	}
+	else if (v_active->type != TYPE_INTEGER) {
+		ProPrintfChar("Error: __CATCH_ACTIVE must be integer\n");
+		return -1;
+	}
+
+	Variable* v_udf = get_symbol(st, "__CATCH_FIX_FAIL_UDF");
+	if (!v_udf) {
+		v_udf = (Variable*)malloc(sizeof(Variable));
+		if (!v_udf) { ProPrintfChar("Error: OOM for __CATCH_FIX_FAIL_UDF\n"); return -1; }
+		v_udf->type = TYPE_INTEGER;
+		v_udf->data.int_value = 0;
+		v_udf->display_options = NULL;
+		v_udf->declaration_count = 1;
+		set_symbol(st, "__CATCH_FIX_FAIL_UDF", v_udf);
+	}
+	else if (v_udf->type != TYPE_INTEGER) {
+		ProPrintfChar("Error: __CATCH_FIX_FAIL_UDF must be integer\n");
+		return -1;
+	}
+
+	Variable* v_comp = get_symbol(st, "__CATCH_FIX_FAIL_COMPONENT");
+	if (!v_comp) {
+		v_comp = (Variable*)malloc(sizeof(Variable));
+		if (!v_comp) { ProPrintfChar("Error: OOM for __CATCH_FIX_FAIL_COMPONENT\n"); return -1; }
+		v_comp->type = TYPE_INTEGER;
+		v_comp->data.int_value = 0;
+		v_comp->display_options = NULL;
+		v_comp->declaration_count = 1;
+		set_symbol(st, "__CATCH_FIX_FAIL_COMPONENT", v_comp);
+	}
+	else if (v_comp->type != TYPE_INTEGER) {
+		ProPrintfChar("Error: __CATCH_FIX_FAIL_COMPONENT must be integer\n");
+		return -1;
+	}
+
+	/* Save prior state, then activate catch context. */
+	const int saved_active = v_active->data.int_value;
+	const int saved_udf = v_udf->data.int_value;
+	const int saved_comp = v_comp->data.int_value;
+
+	v_active->data.int_value = 1;
+	v_udf->data.int_value = node->fix_fail_udf ? 1 : 0;
+	v_comp->data.int_value = node->fix_fail_component ? 1 : 0;
+
+	/* Recurse over nested commands in this block. */
+	for (size_t c = 0; c < node->command_count; ++c) {
+		if (analyze_command(node->commands[c], st) != 0) {
+			/* Restore and propagate error so caller can mark invalid. */
+			v_active->data.int_value = saved_active;
+			v_udf->data.int_value = saved_udf;
+			v_comp->data.int_value = saved_comp;
+			return -1;
+		}
+	}
+
+	/* Restore previous context. */
+	v_active->data.int_value = saved_active;
+	v_udf->data.int_value = saved_udf;
+	v_comp->data.int_value = saved_comp;
+
+	return 0;
+}
+
+
 /*=================================================*
  *
  * ASSIGNMENT semantic analysis: validate and register in symbol table
@@ -4541,6 +5027,18 @@ static int analyze_command(CommandNode* cmd, SymbolTable* st) {
 		break;
 	case COMMAND_USER_SELECT_MULTIPLE_OPTIONAL:
 		result = check_user_select_multiple_optional_semantics((UserSelectMultipleOptionalNode*)cmd->data, st);
+		break;
+	case COMMAND_SEARCH_MDL_REF:
+		result = check_search_mdl_ref_semantics((SearchMdlRefNode*)cmd->data, st);
+		break;
+	case COMMAND_MEASURE_DISTANCE:
+		result = check_measure_distance_semantics((MeasureDistanceNode*)cmd->data, st);
+		break;
+	case COMMAND_MEASURE_LENGTH:
+		result = check_measure_length_semantics((MeasureLengthNode*)cmd->data, st);
+		break;
+	case COMMAND_BEGIN_CATCH_ERROR:
+		result = check_begin_catch_error_semantics(&((CommandData*)cmd->data)->begin_catch_error, st);
 		break;
 	case COMMAND_ASSIGNMENT:
 		result = check_assignment_semantics(&((CommandData*)cmd->data)->assignment, st);
