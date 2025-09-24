@@ -1,5 +1,5 @@
 #ifndef SCRIPT_EXECUTOR_H
-#define SCRIPT_EXECUTOR_
+#define SCRIPT_EXECUTOR_H
 
 #include "symboltable.h"
 #include "syntaxanalysis.h"
@@ -66,14 +66,17 @@ typedef struct {
     int reactive;  // 0 for initial execution (build UI + logic), 1 for reactive (logic only, skip UI creation)
 } ExecContext;
 
-
+// COMMAND EXECUTORS
+ProError execute_measure_length(MeasureLengthNode* node, SymbolTable* st);
+ProError execute_measure_distance(MeasureDistanceNode* node, SymbolTable* st);
 
 
 /* Unified walkers */
+ProError execute_asm_block(Block* asm_block, SymbolTable* st, BlockList* block_list);
 ProError exec_command_in_context(CommandNode* node, ExecContext* ctx);
 ProError execute_if_ctx(IfNode* node, ExecContext* ctx);
 /* -------------------------------------------------------------------------- */
-
+const char* pro_error_to_string(ProError e);
 ProError execute_command(CommandNode* node, SymbolTable* st, BlockList* block_list);
 ProError execute_declare_variable(DeclareVariableNode* node, SymbolTable* st);
 ProError execute_assignment(AssignmentNode* node, SymbolTable* st, BlockList* block_list);
